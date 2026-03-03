@@ -1,11 +1,8 @@
 /*
- * test.c - 比特币私钥暴力搜索工具（C语言多线程版本）
- *
  * 依赖库：
  *   - libsecp256k1  (椭圆曲线公钥计算)
  *   - pthread       (多线程)
  *   SHA256 与 RIPEMD160 均已内嵌纯 C 实现，无需 OpenSSL
- *
  * 用法：
  *   ./keysearch <地址文件> [线程数]
  */
@@ -34,10 +31,10 @@
 
 /* ===================== 全局共享数据 ===================== */
 
-/* 哈希表节点（用于O(1)地址查找） */
+/* 哈希表节点（用于O(1)查找） */
 struct hash_node
 {
-    char address[ADDRESS_LEN + 1];
+    uint8_t hash160[20];        /* 20字节RIPEMD160哈希值 */
     struct hash_node *next;
 };
 
@@ -50,43 +47,40 @@ static volatile int found_flag = 0;
 /* secp256k1上下文（只读，多线程安全） */
 secp256k1_context *secp_ctx = NULL;
 
-/* ===================== 线程参数 ===================== */
 struct thread_args
 {
     int thread_id;
 };
 
-/* ===================== 工具函数 ===================== */
-
-/* 简单字符串哈希 */
-static uint32_t str_hash(const char *s)
+/* 基于20字节二进制数据的哈希函数 */
+static uint32_t hash160_hash(const uint8_t *h160)
 {
-    uint32_t h = 5381;
-    while (*s) {
-        h = ((h << 5) + h) ^ (uint8_t)*s++;
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < 20; i++) {
+        h ^= h160[i];
+        h *= 16777619u;
     }
     return h & (HASH_TABLE_SIZE - 1);
 }
 
-/* 向哈希表插入地址 */
-static void ht_insert(const char *addr)
+/* 向哈希表插入hash160 */
+static void ht_insert(const uint8_t *h160)
 {
-    uint32_t idx = str_hash(addr);
+    uint32_t idx = hash160_hash(h160);
     struct hash_node *node = (struct hash_node *)malloc(sizeof(struct hash_node));
 
-    strncpy(node->address, addr, ADDRESS_LEN);
-    node->address[ADDRESS_LEN] = '\0';
+    memcpy(node->hash160, h160, 20);
     node->next = hash_table[idx];
     hash_table[idx] = node;
 }
 
-/* 在哈希表中查找地址，O(1)平均 */
-static int ht_contains(const char *addr)
+/* 在哈希表中查找hash160，O(1)平均 */
+static int ht_contains(const uint8_t *h160)
 {
-    uint32_t idx = str_hash(addr);
+    uint32_t idx = hash160_hash(h160);
     struct hash_node *node = hash_table[idx];
     while (node) {
-        if (strcmp(node->address, addr) == 0)
+        if (memcmp(node->hash160, h160, 20) == 0)
             return 1;
         node = node->next;
     }
@@ -102,6 +96,8 @@ static void *search_key(void *arg)
     uint8_t privkey[32];
     char address_compressed[ADDRESS_LEN + 1];
     char address_uncompressed[ADDRESS_LEN + 1];
+    uint8_t hash160_compressed[20];
+    uint8_t hash160_uncompressed[20];
     char privkey_hex[65];
     uint64_t count = 0;
     rand_key_context rand_ctx;
@@ -120,8 +116,8 @@ static void *search_key(void *arg)
         }
         count++;
 
-        /* 同时计算压缩地址和非压缩地址 */
-        if (privkey_to_address(privkey, address_compressed, address_uncompressed) != 0)
+        /* 只计算到hash160 */
+        if (privkey_to_hash160(privkey, hash160_compressed, hash160_uncompressed) != 0)
             continue;
 
         /* 打印进度 */
@@ -131,14 +127,16 @@ static void *search_key(void *arg)
         }
 
         /* 同时比对压缩地址和非压缩地址 */
-        if (ht_contains(address_compressed) || ht_contains(address_uncompressed)) {
+        if (ht_contains(hash160_compressed) || ht_contains(hash160_uncompressed)) {
             found_flag = 1;
             bytes_to_hex(privkey, 32, privkey_hex);
             fprintf(stdout, "\n[线程-%d] 找到匹配！总尝试次数: %llu\n",
                     thread_id, (unsigned long long)count);
             fprintf(stdout, "私钥(hex): %s\n", privkey_hex);
-            fprintf(stdout, "压缩地址: %s\n", address_compressed);
-            fprintf(stdout, "非压缩地址: %s\n", address_uncompressed);
+            if (privkey_to_address(privkey, address_compressed, address_uncompressed) == 0) {
+                fprintf(stdout, "压缩地址: %s\n", address_compressed);
+                fprintf(stdout, "非压缩地址: %s\n", address_uncompressed);
+            }
             fflush(stdout);
         }
     }
@@ -162,6 +160,7 @@ static int load_target_addresses(const char *filename)
 
     char line[ADDRESS_LEN + 2];
     int count = 0;
+    int skip_count = 0;
     while (fgets(line, sizeof(line), f)) {
         /* 去除换行符 */
         size_t len = strlen(line);
@@ -174,7 +173,16 @@ static int load_target_addresses(const char *filename)
             fprintf(stderr, "警告：地址数量超过上限%d，忽略多余地址\n", MAX_ADDRESSES);
             break;
         }
-        ht_insert(line);
+
+        /* 将地址解码为20字节hash160后存入哈希表 */
+        uint8_t h160[20];
+        int ret = base58check_decode(line, h160);
+        if (ret != 0) {
+            fprintf(stderr, "警告：地址解码失败（ret=%d），跳过：%s\n", ret, line);
+            skip_count++;
+            continue;
+        }
+        ht_insert(h160);
         count++;
     }
     fclose(f);
@@ -184,6 +192,7 @@ static int load_target_addresses(const char *filename)
         return -1;
     }
     address_count = count;
+    fprintf(stdout, "成功加载%d个地址（跳过%d个无效地址）\n", count, skip_count);
     return 0;
 }
 

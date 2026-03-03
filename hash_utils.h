@@ -25,6 +25,16 @@ void base58check_encode(const uint8_t *payload, size_t payload_len, char *out);
 int base58check_decode(const char *b58str, uint8_t *hash160_out);
 
 /*
+ * 从32字节私钥计算压缩与非压缩公钥的hash160（SHA256 -> RIPEMD160），
+ * compressed_hash160   : 压缩公钥hash160输出（20字节），传NULL则跳过
+ * uncompressed_hash160 : 非压缩公钥hash160输出（20字节），传NULL则跳过
+ * 返回值：0成功，-1失败（公钥生成失败）
+ */
+int privkey_to_hash160(const uint8_t *privkey,
+                       uint8_t *compressed_hash160,
+                       uint8_t *uncompressed_hash160);
+
+/*
  * 从32字节私钥同时计算压缩与非压缩两种比特币地址（P2PKH）
  * compressed_out   : 压缩地址输出缓冲区（至少ADDRESS_LEN+1字节）
  * uncompressed_out : 非压缩地址输出缓冲区（至少ADDRESS_LEN+1字节）

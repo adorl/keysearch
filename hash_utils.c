@@ -181,41 +181,68 @@ int base58check_decode(const char *b58str, uint8_t *hash160_out)
 }
 
 /*
- * 从32字节私钥同时计算压缩与非压缩两种比特币地址（P2PKH）
+ * 从32字节私钥计算压缩与非压缩公钥的hash160（SHA256 -> RIPEMD160），
+ * compressed_hash160   : 压缩公钥的hash160输出（20字节），传NULL则跳过
+ * uncompressed_hash160 : 非压缩公钥的hash160输出（20字节），传NULL则跳过
+ * 返回值：0成功，-1失败（公钥生成失败）
  */
-int privkey_to_address(const uint8_t *privkey,
-                       char *compressed_out,
-                       char *uncompressed_out)
+int privkey_to_hash160(const uint8_t *privkey,
+                       uint8_t *compressed_hash160,
+                       uint8_t *uncompressed_hash160)
 {
     uint8_t sha256_result[32];
-    uint8_t hash160[20];
-    uint8_t versioned[21];
 
     /* 一次椭圆曲线运算，得到公钥对象 */
     secp256k1_pubkey pubkey;
     if (!secp256k1_ec_pubkey_create(secp_ctx, &pubkey, privkey))
         return -1;
 
+    /* ---- 压缩公钥 hash160 ---- */
+    if (compressed_hash160 != NULL) {
+        uint8_t pubkey_compressed[33];
+        size_t pubkey_len1 = 33;
+        secp256k1_ec_pubkey_serialize(secp_ctx, pubkey_compressed, &pubkey_len1,
+            &pubkey, SECP256K1_EC_COMPRESSED);
+        sha256(pubkey_compressed, 33, sha256_result);
+        ripemd160(sha256_result, 32, compressed_hash160);
+    }
+
+    /* ---- 非压缩公钥 hash160 ---- */
+    if (uncompressed_hash160 != NULL) {
+        uint8_t pubkey_uncompressed[65];
+        size_t pubkey_len2 = 65;
+        secp256k1_ec_pubkey_serialize(secp_ctx, pubkey_uncompressed, &pubkey_len2,
+            &pubkey, SECP256K1_EC_UNCOMPRESSED);
+        sha256(pubkey_uncompressed, 65, sha256_result);
+        ripemd160(sha256_result, 32, uncompressed_hash160);
+    }
+
+    return 0;
+}
+
+/*
+ * 从32字节私钥同时计算压缩与非压缩两种比特币地址（P2PKH）
+ */
+int privkey_to_address(const uint8_t *privkey,
+                       char *compressed_out,
+                       char *uncompressed_out)
+{
+    uint8_t hash160_compressed[20];
+    uint8_t hash160_uncompressed[20];
+    uint8_t versioned[21];
+
+    /* 复用privkey_to_hash160计算两种hash160 */
+    if (privkey_to_hash160(privkey, hash160_compressed, hash160_uncompressed) != 0)
+        return -1;
+
     /* ---- 压缩地址 ---- */
-    uint8_t pubkey_compressed[33];
-    size_t pubkey_len1 = 33;
-    secp256k1_ec_pubkey_serialize(secp_ctx, pubkey_compressed, &pubkey_len1,
-                                    &pubkey, SECP256K1_EC_COMPRESSED);
-    sha256(pubkey_compressed, 33, sha256_result);
-    ripemd160(sha256_result, 32, hash160);
     versioned[0] = 0x00;
-    memcpy(versioned + 1, hash160, 20);
+    memcpy(versioned + 1, hash160_compressed, 20);
     base58check_encode(versioned, 21, compressed_out);
 
     /* ---- 非压缩地址 ---- */
-    uint8_t pubkey_uncompressed[65];
-    size_t pubkey_len2 = 65;
-    secp256k1_ec_pubkey_serialize(secp_ctx, pubkey_uncompressed, &pubkey_len2,
-                                    &pubkey, SECP256K1_EC_UNCOMPRESSED);
-    sha256(pubkey_uncompressed, 65, sha256_result);
-    ripemd160(sha256_result, 32, hash160);
     versioned[0] = 0x00;
-    memcpy(versioned + 1, hash160, 20);
+    memcpy(versioned + 1, hash160_uncompressed, 20);
     base58check_encode(versioned, 21, uncompressed_out);
 
     return 0;
