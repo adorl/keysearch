@@ -1,86 +1,287 @@
 #include "ripemd160.h"
 
-static const uint32_t RMD_KL[5] = {0x00000000,0x5A827999,0x6ED9EBA1,0x8F1BBCDC,0xA953FD4E};
-static const uint32_t RMD_KR[5] = {0x50A28BE6,0x5C4DD124,0x6D703EF3,0x7A6D76E9,0x00000000};
-static const int RMD_RL[80] = {
-    0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
-    7,4,13,1,10,6,15,3,12,0,9,5,2,14,11,8,
-    3,10,14,4,9,15,8,1,2,7,0,6,13,11,5,12,
-    1,9,11,10,0,8,12,4,13,3,7,15,14,5,6,2,
-    4,0,5,9,7,12,2,10,14,1,3,8,11,6,15,13
-};
-static const int RMD_RR[80] = {
-    5,14,7,0,9,2,11,4,13,6,15,8,1,10,3,12,
-    6,11,3,7,0,13,5,10,14,15,8,12,4,9,1,2,
-    15,5,1,3,7,14,6,9,11,8,12,2,10,0,4,13,
-    8,6,4,1,3,11,15,0,5,12,2,13,9,7,10,14,
-    12,15,10,4,1,5,8,7,6,2,13,14,0,3,9,11
-};
-static const int RMD_SL[80] = {
-    11,14,15,12,5,8,7,9,11,13,14,15,6,7,9,8,
-    7,6,8,13,11,9,7,15,7,12,15,9,11,7,13,12,
-    11,13,6,7,14,9,13,15,14,8,13,6,5,12,7,5,
-    11,12,14,15,14,15,9,8,9,14,5,6,8,6,5,12,
-    9,15,5,11,6,8,13,12,5,12,13,14,11,8,5,6
-};
-static const int RMD_SR[80] = {
-    8,9,9,11,13,15,15,5,7,7,8,11,14,14,12,6,
-    9,13,15,7,12,8,9,11,7,7,12,7,6,15,13,11,
-    9,7,15,11,8,6,6,14,12,13,5,14,13,13,7,5,
-    15,5,8,11,14,14,6,14,6,9,12,9,12,5,15,8,
-    8,5,12,9,12,5,14,6,8,13,6,5,15,13,11,11
-};
+/* 完全展开的RIPEMD160压缩函数：消除循环/数组访问 */
+/* 左链步骤宏：F(b,c,d)=b^c^d */
+#define RL_F(a, b, c, d, e, x, s)                                               \
+    do {                                                                        \
+        uint32_t _t = ROL32((a) + (b ^ c ^ d) + (x) + 0x00000000, (s)) + (e);   \
+        (a) = (e);                                                              \
+        (e) = (d);                                                              \
+        (d) = ROL32((c), 10);                                                   \
+        (c) = (b);                                                              \
+        (b) = _t;                                                               \
+    } while (0)
+/* 左链步骤宏：G(b,c,d)=(b&c)|(~b&d) */
+#define RL_G(a, b, c, d, e, x, s)                                               \
+    do {                                                                        \
+        uint32_t _t = ROL32((a) + ((b & c) | (~(b) & d)) + (x) + 0x5A827999, (s)) + (e); \
+        (a) = (e);                                                              \
+        (e) = (d);                                                              \
+        (d) = ROL32((c), 10);                                                   \
+        (c) = (b);                                                              \
+        (b) = _t;                                                               \
+    } while (0)
+/* 左链步骤宏：H(b,c,d)=(b|~c)^d */
+#define RL_H(a, b, c, d, e, x, s)                                               \
+    do {                                                                        \
+        uint32_t _t = ROL32((a) + ((b | ~(c)) ^ d) + (x) + 0x6ED9EBA1, (s)) + (e); \
+        (a) = (e);                                                              \
+        (e) = (d);                                                              \
+        (d) = ROL32((c), 10);                                                   \
+        (c) = (b);                                                              \
+        (b) = _t;                                                               \
+    } while (0)
+/* 左链步骤宏：I(b,c,d)=(b&d)|(c&~d) */
+#define RL_I(a, b, c, d, e, x, s)                                               \
+    do {                                                                        \
+        uint32_t _t = ROL32((a) + ((b & d) | (c & ~(d))) + (x) + 0x8F1BBCDC, (s)) + (e); \
+        (a) = (e);                                                              \
+        (e) = (d);                                                              \
+        (d) = ROL32((c), 10);                                                   \
+        (c) = (b);                                                              \
+        (b) = _t;                                                               \
+    } while (0)
+/* 左链步骤宏：J(b,c,d)=b^(c|~d) */
+#define RL_J(a, b, c, d, e, x, s)                                               \
+    do {                                                                        \
+        uint32_t _t = ROL32((a) + ((b) ^ (c | ~(d))) + (x) + 0xA953FD4E, (s)) + (e); \
+        (a) = (e);                                                              \
+        (e) = (d);                                                              \
+        (d) = ROL32((c), 10);                                                   \
+        (c) = (b);                                                              \
+        (b) = _t;                                                               \
+    } while (0)
+/* 右链步骤宏 */
+#define RR_J(a, b, c, d, e, x, s)                                               \
+    do {                                                                        \
+        uint32_t _t = ROL32((a) + ((b) ^ (c | ~(d))) + (x) + 0x50A28BE6, (s)) + (e); \
+        (a) = (e);                                                              \
+        (e) = (d);                                                              \
+        (d) = ROL32((c), 10);                                                   \
+        (c) = (b);                                                              \
+        (b) = _t;                                                               \
+    } while (0)
+#define RR_I(a, b, c, d, e, x, s)                                               \
+    do {                                                                        \
+        uint32_t _t = ROL32((a) + ((b & d) | (c & ~(d))) + (x) + 0x5C4DD124, (s)) + (e); \
+        (a) = (e);                                                              \
+        (e) = (d);                                                              \
+        (d) = ROL32((c), 10);                                                   \
+        (c) = (b);                                                              \
+        (b) = _t;                                                               \
+    } while (0)
+#define RR_H(a, b, c, d, e, x, s)                                               \
+    do {                                                                        \
+        uint32_t _t = ROL32((a) + ((b | ~(c)) ^ d) + (x) + 0x6D703EF3, (s)) + (e); \
+        (a) = (e);                                                              \
+        (e) = (d);                                                              \
+        (d) = ROL32((c), 10);                                                   \
+        (c) = (b);                                                              \
+        (b) = _t;                                                               \
+    } while (0)
+#define RR_G(a, b, c, d, e, x, s)                                               \
+    do {                                                                        \
+        uint32_t _t = ROL32((a) + ((b & c) | (~(b) & d)) + (x) + 0x7A6D76E9, (s)) + (e); \
+        (a) = (e);                                                              \
+        (e) = (d);                                                              \
+        (d) = ROL32((c), 10);                                                   \
+        (c) = (b);                                                              \
+        (b) = _t;                                                               \
+    } while (0)
+#define RR_F(a, b, c, d, e, x, s)                                               \
+    do {                                                                        \
+        uint32_t _t = ROL32((a) + (b ^ c ^ d) + (x) + 0x00000000, (s)) + (e);   \
+        (a) = (e);                                                              \
+        (e) = (d);                                                              \
+        (d) = ROL32((c), 10);                                                   \
+        (c) = (b);                                                              \
+        (b) = _t;                                                               \
+    } while (0)
 
 static void ripemd160_compress(uint32_t *state, const uint8_t *block)
 {
-    uint32_t w[16];
-    for (int i = 0; i < 16; i++)
-        w[i] = (uint32_t)block[i*4] | ((uint32_t)block[i*4+1]<<8)
-             | ((uint32_t)block[i*4+2]<<16) | ((uint32_t)block[i*4+3]<<24);
+    /* 加载消息字（小端序） */
+#define W(i) ((uint32_t)block[(i) * 4] | ((uint32_t)block[(i) * 4 + 1] << 8) | ((uint32_t)block[(i) * 4 + 2] << 16) | ((uint32_t)block[(i) * 4 + 3] << 24))
+    uint32_t w0 = W(0), w1 = W(1), w2 = W(2), w3 = W(3), w4 = W(4), w5 = W(5), w6 = W(6), w7 = W(7);
+    uint32_t w8 = W(8), w9 = W(9), w10 = W(10), w11 = W(11), w12 = W(12), w13 = W(13), w14 = W(14), w15 = W(15);
+#undef W
 
-    uint32_t al=state[0],bl=state[1],cl=state[2],dl=state[3],el=state[4];
-    uint32_t ar=state[0],br=state[1],cr=state[2],dr=state[3],er=state[4];
-    uint32_t t;
+    uint32_t al = state[0], bl = state[1], cl = state[2], dl = state[3], el = state[4];
+    uint32_t ar = state[0], br = state[1], cr = state[2], dr = state[3], er = state[4];
 
-/* 辅助宏：左链和右链各执行一步 */
-#define RSTEP_L(F, kl, ri, si) \
-    t = ROL32(al + (F) + w[RMD_RL[ri]] + (kl), RMD_SL[ri]) + el; \
-    al=el; el=dl; dl=ROL32(cl,10); cl=bl; bl=t;
+    /* 左链：轮0-15，F(b,c,d) = b^c^d */
+    RL_F(al, bl, cl, dl, el, w0, 11);
+    RL_F(al, bl, cl, dl, el, w1, 14);
+    RL_F(al, bl, cl, dl, el, w2, 15);
+    RL_F(al, bl, cl, dl, el, w3, 12);
+    RL_F(al, bl, cl, dl, el, w4, 5);
+    RL_F(al, bl, cl, dl, el, w5, 8);
+    RL_F(al, bl, cl, dl, el, w6, 7);
+    RL_F(al, bl, cl, dl, el, w7, 9);
+    RL_F(al, bl, cl, dl, el, w8, 11);
+    RL_F(al, bl, cl, dl, el, w9, 13);
+    RL_F(al, bl, cl, dl, el, w10, 14);
+    RL_F(al, bl, cl, dl, el, w11, 15);
+    RL_F(al, bl, cl, dl, el, w12, 6);
+    RL_F(al, bl, cl, dl, el, w13, 7);
+    RL_F(al, bl, cl, dl, el, w14, 9);
+    RL_F(al, bl, cl, dl, el, w15, 8);
+    /* 左链：轮16-31，G(b,c,d) = (b&c)|(~b&d) */
+    RL_G(al, bl, cl, dl, el, w7, 7);
+    RL_G(al, bl, cl, dl, el, w4, 6);
+    RL_G(al, bl, cl, dl, el, w13, 8);
+    RL_G(al, bl, cl, dl, el, w1, 13);
+    RL_G(al, bl, cl, dl, el, w10, 11);
+    RL_G(al, bl, cl, dl, el, w6, 9);
+    RL_G(al, bl, cl, dl, el, w15, 7);
+    RL_G(al, bl, cl, dl, el, w3, 15);
+    RL_G(al, bl, cl, dl, el, w12, 7);
+    RL_G(al, bl, cl, dl, el, w0, 12);
+    RL_G(al, bl, cl, dl, el, w9, 15);
+    RL_G(al, bl, cl, dl, el, w5, 9);
+    RL_G(al, bl, cl, dl, el, w2, 11);
+    RL_G(al, bl, cl, dl, el, w14, 7);
+    RL_G(al, bl, cl, dl, el, w11, 13);
+    RL_G(al, bl, cl, dl, el, w8, 12);
+    /* 左链：轮32-47，H(b,c,d) = (b|~c)^d */
+    RL_H(al, bl, cl, dl, el, w3, 11);
+    RL_H(al, bl, cl, dl, el, w10, 13);
+    RL_H(al, bl, cl, dl, el, w14, 6);
+    RL_H(al, bl, cl, dl, el, w4, 7);
+    RL_H(al, bl, cl, dl, el, w9, 14);
+    RL_H(al, bl, cl, dl, el, w15, 9);
+    RL_H(al, bl, cl, dl, el, w8, 13);
+    RL_H(al, bl, cl, dl, el, w1, 15);
+    RL_H(al, bl, cl, dl, el, w2, 14);
+    RL_H(al, bl, cl, dl, el, w7, 8);
+    RL_H(al, bl, cl, dl, el, w0, 13);
+    RL_H(al, bl, cl, dl, el, w6, 6);
+    RL_H(al, bl, cl, dl, el, w13, 5);
+    RL_H(al, bl, cl, dl, el, w11, 12);
+    RL_H(al, bl, cl, dl, el, w5, 7);
+    RL_H(al, bl, cl, dl, el, w12, 5);
+    /* 左链：轮48-63，I(b,c,d) = (b&d)|(c&~d) */
+    RL_I(al, bl, cl, dl, el, w1, 11);
+    RL_I(al, bl, cl, dl, el, w9, 12);
+    RL_I(al, bl, cl, dl, el, w11, 14);
+    RL_I(al, bl, cl, dl, el, w10, 15);
+    RL_I(al, bl, cl, dl, el, w0, 14);
+    RL_I(al, bl, cl, dl, el, w8, 15);
+    RL_I(al, bl, cl, dl, el, w12, 9);
+    RL_I(al, bl, cl, dl, el, w4, 8);
+    RL_I(al, bl, cl, dl, el, w13, 9);
+    RL_I(al, bl, cl, dl, el, w3, 14);
+    RL_I(al, bl, cl, dl, el, w7, 5);
+    RL_I(al, bl, cl, dl, el, w15, 6);
+    RL_I(al, bl, cl, dl, el, w14, 8);
+    RL_I(al, bl, cl, dl, el, w5, 6);
+    RL_I(al, bl, cl, dl, el, w6, 5);
+    RL_I(al, bl, cl, dl, el, w2, 12);
+    /* 左链：轮64-79，J(b,c,d) = b^(c|~d) */
+    RL_J(al, bl, cl, dl, el, w4, 9);
+    RL_J(al, bl, cl, dl, el, w0, 15);
+    RL_J(al, bl, cl, dl, el, w5, 5);
+    RL_J(al, bl, cl, dl, el, w9, 11);
+    RL_J(al, bl, cl, dl, el, w7, 6);
+    RL_J(al, bl, cl, dl, el, w12, 8);
+    RL_J(al, bl, cl, dl, el, w2, 13);
+    RL_J(al, bl, cl, dl, el, w10, 12);
+    RL_J(al, bl, cl, dl, el, w14, 5);
+    RL_J(al, bl, cl, dl, el, w1, 12);
+    RL_J(al, bl, cl, dl, el, w3, 13);
+    RL_J(al, bl, cl, dl, el, w8, 14);
+    RL_J(al, bl, cl, dl, el, w11, 11);
+    RL_J(al, bl, cl, dl, el, w6, 8);
+    RL_J(al, bl, cl, dl, el, w15, 5);
+    RL_J(al, bl, cl, dl, el, w13, 6);
 
-#define RSTEP_R(F, kr, ri, si) \
-    t = ROL32(ar + (F) + w[RMD_RR[ri]] + (kr), RMD_SR[ri]) + er; \
-    ar=er; er=dr; dr=ROL32(cr,10); cr=br; br=t;
+    /* 右链：轮0-15，J(b,c,d) = b^(c|~d) */
+    RR_J(ar, br, cr, dr, er, w5, 8);
+    RR_J(ar, br, cr, dr, er, w14, 9);
+    RR_J(ar, br, cr, dr, er, w7, 9);
+    RR_J(ar, br, cr, dr, er, w0, 11);
+    RR_J(ar, br, cr, dr, er, w9, 13);
+    RR_J(ar, br, cr, dr, er, w2, 15);
+    RR_J(ar, br, cr, dr, er, w11, 15);
+    RR_J(ar, br, cr, dr, er, w4, 5);
+    RR_J(ar, br, cr, dr, er, w13, 7);
+    RR_J(ar, br, cr, dr, er, w6, 7);
+    RR_J(ar, br, cr, dr, er, w15, 8);
+    RR_J(ar, br, cr, dr, er, w8, 11);
+    RR_J(ar, br, cr, dr, er, w1, 14);
+    RR_J(ar, br, cr, dr, er, w10, 14);
+    RR_J(ar, br, cr, dr, er, w3, 12);
+    RR_J(ar, br, cr, dr, er, w12, 6);
+    /* 右链：轮16-31，I(b,c,d) = (b&d)|(c&~d) */
+    RR_I(ar, br, cr, dr, er, w6, 9);
+    RR_I(ar, br, cr, dr, er, w11, 13);
+    RR_I(ar, br, cr, dr, er, w3, 15);
+    RR_I(ar, br, cr, dr, er, w7, 7);
+    RR_I(ar, br, cr, dr, er, w0, 12);
+    RR_I(ar, br, cr, dr, er, w13, 8);
+    RR_I(ar, br, cr, dr, er, w5, 9);
+    RR_I(ar, br, cr, dr, er, w10, 11);
+    RR_I(ar, br, cr, dr, er, w14, 7);
+    RR_I(ar, br, cr, dr, er, w15, 7);
+    RR_I(ar, br, cr, dr, er, w8, 12);
+    RR_I(ar, br, cr, dr, er, w12, 7);
+    RR_I(ar, br, cr, dr, er, w4, 6);
+    RR_I(ar, br, cr, dr, er, w9, 15);
+    RR_I(ar, br, cr, dr, er, w1, 13);
+    RR_I(ar, br, cr, dr, er, w2, 11);
+    /* 右链：轮32-47，H(b,c,d) = (b|~c)^d */
+    RR_H(ar, br, cr, dr, er, w15, 9);
+    RR_H(ar, br, cr, dr, er, w5, 7);
+    RR_H(ar, br, cr, dr, er, w1, 15);
+    RR_H(ar, br, cr, dr, er, w3, 11);
+    RR_H(ar, br, cr, dr, er, w7, 8);
+    RR_H(ar, br, cr, dr, er, w14, 6);
+    RR_H(ar, br, cr, dr, er, w6, 6);
+    RR_H(ar, br, cr, dr, er, w9, 14);
+    RR_H(ar, br, cr, dr, er, w11, 12);
+    RR_H(ar, br, cr, dr, er, w8, 13);
+    RR_H(ar, br, cr, dr, er, w12, 5);
+    RR_H(ar, br, cr, dr, er, w2, 14);
+    RR_H(ar, br, cr, dr, er, w10, 13);
+    RR_H(ar, br, cr, dr, er, w0, 13);
+    RR_H(ar, br, cr, dr, er, w4, 7);
+    RR_H(ar, br, cr, dr, er, w13, 5);
+    /* 右链：轮48-63，G(b,c,d) = (b&c)|(~b&d) */
+    RR_G(ar, br, cr, dr, er, w8, 15);
+    RR_G(ar, br, cr, dr, er, w6, 5);
+    RR_G(ar, br, cr, dr, er, w4, 8);
+    RR_G(ar, br, cr, dr, er, w1, 11);
+    RR_G(ar, br, cr, dr, er, w3, 14);
+    RR_G(ar, br, cr, dr, er, w11, 14);
+    RR_G(ar, br, cr, dr, er, w15, 6);
+    RR_G(ar, br, cr, dr, er, w0, 14);
+    RR_G(ar, br, cr, dr, er, w5, 6);
+    RR_G(ar, br, cr, dr, er, w12, 9);
+    RR_G(ar, br, cr, dr, er, w2, 12);
+    RR_G(ar, br, cr, dr, er, w13, 9);
+    RR_G(ar, br, cr, dr, er, w9, 12);
+    RR_G(ar, br, cr, dr, er, w7, 5);
+    RR_G(ar, br, cr, dr, er, w10, 15);
+    RR_G(ar, br, cr, dr, er, w14, 8);
+    /* 右链：轮64-79，F(b,c,d) = b^c^d */
+    RR_F(ar, br, cr, dr, er, w12, 8);
+    RR_F(ar, br, cr, dr, er, w15, 5);
+    RR_F(ar, br, cr, dr, er, w10, 12);
+    RR_F(ar, br, cr, dr, er, w4, 9);
+    RR_F(ar, br, cr, dr, er, w1, 12);
+    RR_F(ar, br, cr, dr, er, w5, 5);
+    RR_F(ar, br, cr, dr, er, w8, 14);
+    RR_F(ar, br, cr, dr, er, w7, 6);
+    RR_F(ar, br, cr, dr, er, w6, 8);
+    RR_F(ar, br, cr, dr, er, w2, 13);
+    RR_F(ar, br, cr, dr, er, w13, 6);
+    RR_F(ar, br, cr, dr, er, w14, 5);
+    RR_F(ar, br, cr, dr, er, w0, 15);
+    RR_F(ar, br, cr, dr, er, w3, 13);
+    RR_F(ar, br, cr, dr, er, w9, 11);
+    RR_F(ar, br, cr, dr, er, w11, 11);
 
-    /* 轮0-15：左链F(b,c,d)，右链J(b,c,d) */
-    for (int i = 0; i < 16; i++) {
-        RSTEP_L(RMD_F(bl,cl,dl), RMD_KL[0], i, i)
-        RSTEP_R(RMD_J(br,cr,dr), RMD_KR[0], i, i)
-    }
-    /* 轮16-31：左链G(b,c,d)，右链I(b,c,d) */
-    for (int i = 16; i < 32; i++) {
-        RSTEP_L(RMD_G(bl,cl,dl), RMD_KL[1], i, i)
-        RSTEP_R(RMD_I(br,cr,dr), RMD_KR[1], i, i)
-    }
-    /* 轮32-47：左链H(b,c,d)，右链H(b,c,d) */
-    for (int i = 32; i < 48; i++) {
-        RSTEP_L(RMD_H(bl,cl,dl), RMD_KL[2], i, i)
-        RSTEP_R(RMD_H(br,cr,dr), RMD_KR[2], i, i)
-    }
-    /* 轮48-63：左链I(b,c,d)，右链G(b,c,d) */
-    for (int i = 48; i < 64; i++) {
-        RSTEP_L(RMD_I(bl,cl,dl), RMD_KL[3], i, i)
-        RSTEP_R(RMD_G(br,cr,dr), RMD_KR[3], i, i)
-    }
-    /* 轮64-79：左链J(b,c,d)，右链F(b,c,d) */
-    for (int i = 64; i < 80; i++) {
-        RSTEP_L(RMD_J(bl,cl,dl), RMD_KL[4], i, i)
-        RSTEP_R(RMD_F(br,cr,dr), RMD_KR[4], i, i)
-    }
-
-#undef RSTEP_L
-#undef RSTEP_R
-
-    t = state[1] + cl + dr;
+    uint32_t t = state[1] + cl + dr;
     state[1] = state[2] + dl + er;
     state[2] = state[3] + el + ar;
     state[3] = state[4] + al + br;
@@ -148,7 +349,6 @@ void ripemd160(const uint8_t *data, size_t len, uint8_t *digest)
 
 /*
  * 针对固定32字节输入的专用RIPEMD160，消除ctx/update/final开销
- * 输入恰好是一个SHA256摘要（32字节），单块处理
  */
 void ripemd160_32(const uint8_t *data32, uint8_t *digest)
 {
