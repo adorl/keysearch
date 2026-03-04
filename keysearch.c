@@ -15,12 +15,18 @@
 #include <pthread.h>
 #include <time.h>
 
-#include <secp256k1.h>
-
 #include "sha256.h"
 #include "ripemd160.h"
 #include "hash_utils.h"
 #include "rand_key.h"
+/* secp256k1_keygen.h在内部模式下已包含secp256k1.h
+ * 回退模式需要系统secp256k1.h，通过条件编译处理 */
+#ifndef USE_PUBKEY_API_ONLY
+#  include "secp256k1_keygen.h"
+#else
+#  include <secp256k1.h>
+#  include "secp256k1_keygen.h"
+#endif
 
 /* ===================== 常量定义 ===================== */
 #define MAX_ATTEMPTS        (1ULL << 63)    /* 每个线程最大尝试次数 */
@@ -47,6 +53,11 @@ static volatile int found_flag = 0;
 
 /* secp256k1上下文（只读，多线程安全） */
 secp256k1_context *secp_ctx = NULL;
+
+#ifndef USE_PUBKEY_API_ONLY
+/* 全局生成元G的仿射坐标（由keygen_init_generator初始化） */
+secp256k1_ge G_affine;
+#endif
 
 struct thread_args
 {
@@ -94,17 +105,14 @@ static void *search_key(void *arg)
     struct thread_args *args = (struct thread_args *)arg;
     int thread_id = args->thread_id;
 
-    uint8_t privkey[32];
-    uint8_t pubkey_compressed[33];      /* 压缩公钥序列化缓冲区 */
-    uint8_t pubkey_uncompressed[65];    /* 非压缩公钥序列化缓冲区 */
+    uint8_t privkey[32];            /* 当前私钥（每批随机生成基准，内层递增） */
+    uint8_t base_privkey[32];       /* 基准私钥备份（用于命中时输出） */
     uint8_t hash160_compressed[20];
     uint8_t hash160_uncompressed[20];
-    secp256k1_pubkey pubkey;        /* 当前公钥（内部表示） */
     uint8_t tweak[32];              /* 标量加法tweak = 1 */
     uint64_t count = 0;
     rand_key_context rand_ctx;
 
-    /* 用于每步私钥+1和公钥点加G */
     memset(tweak, 0, 32);
     tweak[31] = 1;
 
@@ -119,36 +127,72 @@ static void *search_key(void *arg)
     clock_gettime(CLOCK_MONOTONIC, &ts_last);
     uint64_t count_last = 0;
 
+#ifndef USE_PUBKEY_API_ONLY
+    secp256k1_gej gej_batch[BATCH_SIZE];    /* Jacobian坐标批次缓冲区 */
+    secp256k1_ge ge_batch[BATCH_SIZE];      /* 仿射坐标批次缓冲区 */
+    uint8_t pubkey_compressed[33];
+    uint8_t pubkey_uncompressed[65];
+
     while (count < MAX_ATTEMPTS) {
-        /* 生成随机私钥 */
+        /* 生成随机基准私钥 */
         if (gen_random_key(privkey, &rand_ctx) != 0) {
             fprintf(stderr, "[线程-%d] 读取随机数失败\n", thread_id);
             break;
         }
 
-        if (!secp256k1_ec_pubkey_create(secp_ctx, &pubkey, privkey))
+        memcpy(base_privkey, privkey, 32);
+
+        secp256k1_gej cur_gej;
+        secp256k1_gej next_gej;
+
+        /* 从基准私钥生成Jacobian坐标公钥 */
+        if (keygen_privkey_to_gej(secp_ctx, privkey, &cur_gej) != 0)
             continue;
 
-        /* 内层循环：增量推导BATCH_SIZE次 */
-        for (int batch = 0; batch < BATCH_SIZE && count < MAX_ATTEMPTS; batch++) {
-            size_t len_comp = 33;
-            size_t len_uncomp = 65;
+        /* 内层循环：积累BATCH_SIZE个Jacobian点 */
+        int batch_valid = 0;
+        for (int b = 0; b < BATCH_SIZE && count < MAX_ATTEMPTS; b++) {
+            gej_batch[b] = cur_gej;
+            batch_valid++;
 
+            /* 增量推导：私钥+1，公钥点加G（直接点加法，无ecmult） */
+            if (!secp256k1_ec_seckey_tweak_add(secp_ctx, privkey, tweak)) {
+                fprintf(stderr, "警告：私钥推导失败，batch=%d！\n", b);
+                break;
+            }
+            secp256k1_gej_add_ge(&next_gej, &cur_gej, &G_affine);
+            cur_gej = next_gej;
+        }
+
+        /* 批量归一化：1次模逆替代batch_valid次模逆 */
+        keygen_batch_normalize(gej_batch, ge_batch, (size_t)batch_valid);
+
+        /* 遍历仿射坐标数组，计算hash160并查表 */
+        for (int b = 0; b < batch_valid; b++) {
             count++;
 
-            /* 序列化公钥 */
-            secp256k1_ec_pubkey_serialize(secp_ctx, pubkey_compressed, &len_comp,
-                                          &pubkey, SECP256K1_EC_COMPRESSED);
-            secp256k1_ec_pubkey_serialize(secp_ctx, pubkey_uncompressed, &len_uncomp,
-                                          &pubkey, SECP256K1_EC_UNCOMPRESSED);
+            if (ge_batch[b].infinity)
+                continue;
 
-            /* 直接从公钥字节计算hash160 */
+            /* 直接从仿射坐标构造公钥字节，跳过serialize */
+            keygen_ge_to_pubkey_bytes(&ge_batch[b],
+                                      pubkey_compressed,
+                                      pubkey_uncompressed);
+
+            /* 计算hash160 */
             pubkey_bytes_to_hash160(pubkey_compressed, 33, hash160_compressed);
             pubkey_bytes_to_hash160(pubkey_uncompressed, 65, hash160_uncompressed);
 
-            /* 同时比对压缩地址和非压缩地址（字节层面直接比对） */
+            /* 哈希表查找（字节层面直接比对） */
             if (ht_contains(hash160_compressed) || ht_contains(hash160_uncompressed)) {
                 found_flag = 1;
+                /* 命中时重建私钥 */
+                memcpy(privkey, base_privkey, 32);
+                for (int i = 0; i < b; i++) {
+                    if (!secp256k1_ec_seckey_tweak_add(secp_ctx, privkey, tweak)) {
+                        fprintf(stderr, "警告：私钥推导失败，batch=%d, 结果错误！\n", b);
+                    }
+                }
                 /* 仅在命中时才做格式转换 */
                 char privkey_hex[65];
                 char address_compressed[ADDRESS_LEN + 1];
@@ -163,18 +207,73 @@ static void *search_key(void *arg)
                 fflush(stdout);
             }
 
-            /* 性能监控：每 PROGRESS_INTERVAL 次输出 keys/s */
+            /* 性能监控：每PROGRESS_INTERVAL次输出keys/s */
             if (count % PROGRESS_INTERVAL == 0) {
                 clock_gettime(CLOCK_MONOTONIC, &ts_now);
                 double elapsed = (ts_now.tv_sec - ts_last.tv_sec) + (ts_now.tv_nsec - ts_last.tv_nsec) * 1e-9;
                 double kps = (elapsed > 0) ? (double)(count - count_last) / elapsed : 0.0;
-                fprintf(stdout, "[线程-%d] 已尝试: %lu  速度: %.0f keys/s\n", thread_id, count, kps);
+                fprintf(stdout, "[线程-%d] 已尝试: %lu 速度: %.0f keys/s\n", thread_id, count, kps);
+                fflush(stdout);
+                ts_last = ts_now;
+                count_last = count;
+            }
+        }
+    }
+#else
+    secp256k1_pubkey pubkey;
+    uint8_t pubkey_compressed[33];
+    uint8_t pubkey_uncompressed[65];
+
+    while (count < MAX_ATTEMPTS) {
+        /* 生成随机私钥 */
+        if (gen_random_key(privkey, &rand_ctx) != 0) {
+            fprintf(stderr, "[线程-%d] 读取随机数失败\n", thread_id);
+            break;
+        }
+
+        if (!secp256k1_ec_pubkey_create(secp_ctx, &pubkey, privkey))
+            continue;
+
+        /* 内层循环：增量推导 BATCH_SIZE 次 */
+        for (int batch = 0; batch < BATCH_SIZE && count < MAX_ATTEMPTS; batch++) {
+            count++;
+
+            size_t len_comp = 33, len_uncomp = 65;
+            secp256k1_ec_pubkey_serialize(secp_ctx, pubkey_compressed, &len_comp,
+                                          &pubkey, SECP256K1_EC_COMPRESSED);
+            secp256k1_ec_pubkey_serialize(secp_ctx, pubkey_uncompressed, &len_uncomp,
+                                          &pubkey, SECP256K1_EC_UNCOMPRESSED);
+
+            pubkey_bytes_to_hash160(pubkey_compressed,   33, hash160_compressed);
+            pubkey_bytes_to_hash160(pubkey_uncompressed, 65, hash160_uncompressed);
+
+            if (ht_contains(hash160_compressed) || ht_contains(hash160_uncompressed)) {
+                found_flag = 1;
+                char privkey_hex[65];
+                char address_compressed[ADDRESS_LEN + 1];
+                char address_uncompressed[ADDRESS_LEN + 1];
+                bytes_to_hex(privkey, 32, privkey_hex);
+                fprintf(stdout, "\n[线程-%d] 找到匹配！总尝试次数: %lu\n", thread_id, count);
+                fprintf(stdout, "私钥(hex): %s\n", privkey_hex);
+                if (privkey_to_address(privkey, address_compressed, address_uncompressed) == 0) {
+                    fprintf(stdout, "压缩地址: %s\n", address_compressed);
+                    fprintf(stdout, "非压缩地址: %s\n", address_uncompressed);
+                }
+                fflush(stdout);
+            }
+
+            if (count % PROGRESS_INTERVAL == 0) {
+                clock_gettime(CLOCK_MONOTONIC, &ts_now);
+                double elapsed = (ts_now.tv_sec - ts_last.tv_sec)
+                               + (ts_now.tv_nsec - ts_last.tv_nsec) * 1e-9;
+                double kps = (elapsed > 0) ? (double)(count - count_last) / elapsed : 0.0;
+                fprintf(stdout, "[线程-%d] 已尝试: %lu 速度: %.0f keys/s\n",
+                        thread_id, count, kps);
                 fflush(stdout);
                 ts_last = ts_now;
                 count_last = count;
             }
 
-            /* 增量推导：私钥+1，公钥点加G */
             if (!secp256k1_ec_seckey_tweak_add(secp_ctx, privkey, tweak)) {
                 fprintf(stderr, "警告：私钥推导失败，batch=%d！\n", batch);
                 break;
@@ -185,6 +284,7 @@ static void *search_key(void *arg)
             }
         }
     }
+#endif
 
     if (count >= MAX_ATTEMPTS) {
         fprintf(stdout, "[线程-%d] 已达到最大尝试次数，退出。\n", thread_id);
@@ -275,6 +375,15 @@ int main(int argc, char *argv[])
         fprintf(stderr, "错误：初始化secp256k1失败\n");
         return 1;
     }
+
+#ifndef USE_PUBKEY_API_ONLY
+    /* 初始化全局生成元G的仿射坐标 */
+    if (keygen_init_generator(secp_ctx, &G_affine) != 0) {
+        fprintf(stderr, "错误：初始化生成元G失败\n");
+        secp256k1_context_destroy(secp_ctx);
+        return 1;
+    }
+#endif
 
     /* 启动线程 */
     pthread_t *threads = (pthread_t *)malloc(thread_count * sizeof(pthread_t));
