@@ -35,6 +35,15 @@ int privkey_to_hash160(const uint8_t *privkey,
                        uint8_t *uncompressed_hash160);
 
 /*
+ * 直接从已序列化的公钥字节计算hash160（SHA256 -> RIPEMD160）
+ * pubkey_bytes : 已序列化的公钥字节（压缩33字节或非压缩65字节）
+ * len          : 公钥字节长度（33或65）
+ * hash160_out  : 输出缓冲区，至少20字节
+ */
+void pubkey_bytes_to_hash160(const uint8_t *pubkey_bytes, size_t len,
+                              uint8_t *hash160_out);
+
+/*
  * 从32字节私钥同时计算压缩与非压缩两种比特币地址（P2PKH）
  * compressed_out   : 压缩地址输出缓冲区（至少ADDRESS_LEN+1字节）
  * uncompressed_out : 非压缩地址输出缓冲区（至少ADDRESS_LEN+1字节）

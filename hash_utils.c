@@ -181,6 +181,17 @@ int base58check_decode(const char *b58str, uint8_t *hash160_out)
 }
 
 /*
+ * 直接从已序列化的公钥字节计算hash160（SHA256 -> RIPEMD160）
+ */
+void pubkey_bytes_to_hash160(const uint8_t *pubkey_bytes, size_t len,
+                            uint8_t *hash160_out)
+{
+    uint8_t sha256_result[32];
+    sha256(pubkey_bytes, len, sha256_result);
+    ripemd160(sha256_result, 32, hash160_out);
+}
+
+/*
  * 从32字节私钥计算压缩与非压缩公钥的hash160（SHA256 -> RIPEMD160），
  * compressed_hash160   : 压缩公钥的hash160输出（20字节），传NULL则跳过
  * uncompressed_hash160 : 非压缩公钥的hash160输出（20字节），传NULL则跳过

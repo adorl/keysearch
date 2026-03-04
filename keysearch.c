@@ -23,11 +23,12 @@
 #include "rand_key.h"
 
 /* ===================== 常量定义 ===================== */
-#define MAX_ATTEMPTS        (1ULL << 48)    /* 每个线程最大尝试次数 */
+#define MAX_ATTEMPTS        (1ULL << 63)    /* 每个线程最大尝试次数 */
 #define PROGRESS_INTERVAL   (1000000)       /* 进度打印间隔 */
 #define MAX_ADDRESSES       (400000)        /* 最多支持的目标地址数量 */
 #define HASH_TABLE_SIZE     (65536 * 4)     /* 哈希表固定槽位数 */
 #define ADDRESS_LEN         (35)            /* 比特币地址最大长度 */
+#define BATCH_SIZE          (32 * 1024)     /* 增量推导批次大小，每批后重置随机基准私钥 */
 
 /* ===================== 全局共享数据 ===================== */
 
@@ -94,13 +95,19 @@ static void *search_key(void *arg)
     int thread_id = args->thread_id;
 
     uint8_t privkey[32];
-    char address_compressed[ADDRESS_LEN + 1];
-    char address_uncompressed[ADDRESS_LEN + 1];
+    uint8_t pubkey_compressed[33];      /* 压缩公钥序列化缓冲区 */
+    uint8_t pubkey_uncompressed[65];    /* 非压缩公钥序列化缓冲区 */
     uint8_t hash160_compressed[20];
     uint8_t hash160_uncompressed[20];
-    char privkey_hex[65];
+    secp256k1_pubkey pubkey;            /* 当前公钥（内部表示） */
+    uint8_t tweak[32][32];              /* 标量加法tweak = 1 */
     uint64_t count = 0;
     rand_key_context rand_ctx;
+
+    /* 用于每步私钥+1和公钥点加G */
+    memset(tweak, 0, sizeof(tweak));
+    for (int i = 0; i < 32; i++)
+        tweak[i][31 - i] = 1;
 
     /* 初始化真随机上下文（每线程独立fd，无锁竞争） */
     if (rand_ctx_init(&rand_ctx) != 0) {
@@ -108,36 +115,76 @@ static void *search_key(void *arg)
         return NULL;
     }
 
+    /* 性能监控：记录上一次打印时间 */
+    struct timespec ts_last, ts_now;
+    clock_gettime(CLOCK_MONOTONIC, &ts_last);
+    uint64_t count_last = 0;
+
     while (count < MAX_ATTEMPTS) {
         /* 生成随机私钥 */
         if (gen_random_key(privkey, &rand_ctx) != 0) {
             fprintf(stderr, "[线程-%d] 读取随机数失败\n", thread_id);
             break;
         }
-        count++;
 
-        /* 只计算到hash160 */
-        if (privkey_to_hash160(privkey, hash160_compressed, hash160_uncompressed) != 0)
+        if (!secp256k1_ec_pubkey_create(secp_ctx, &pubkey, privkey))
             continue;
 
-        /* 打印进度 */
-        if (count % PROGRESS_INTERVAL == 0) {
-            fprintf(stdout, "[线程-%d] 已尝试次数: %llu\n", thread_id, (unsigned long long)count);
-            fflush(stdout);
-        }
+        /* 内层循环：增量推导BATCH_SIZE次 */
+        for (int batch = 0; batch < BATCH_SIZE && count < MAX_ATTEMPTS; batch++) {
+            size_t len_comp = 33;
+            size_t len_uncomp = 65;
+            int tweak_index = batch / 1024;
 
-        /* 同时比对压缩地址和非压缩地址 */
-        if (ht_contains(hash160_compressed) || ht_contains(hash160_uncompressed)) {
-            found_flag = 1;
-            bytes_to_hex(privkey, 32, privkey_hex);
-            fprintf(stdout, "\n[线程-%d] 找到匹配！总尝试次数: %llu\n",
-                    thread_id, (unsigned long long)count);
-            fprintf(stdout, "私钥(hex): %s\n", privkey_hex);
-            if (privkey_to_address(privkey, address_compressed, address_uncompressed) == 0) {
-                fprintf(stdout, "压缩地址: %s\n", address_compressed);
-                fprintf(stdout, "非压缩地址: %s\n", address_uncompressed);
+            count++;
+
+            /* 序列化公钥 */
+            secp256k1_ec_pubkey_serialize(secp_ctx, pubkey_compressed, &len_comp,
+                                          &pubkey, SECP256K1_EC_COMPRESSED);
+            secp256k1_ec_pubkey_serialize(secp_ctx, pubkey_uncompressed, &len_uncomp,
+                                          &pubkey, SECP256K1_EC_UNCOMPRESSED);
+
+            /* 直接从公钥字节计算hash160 */
+            pubkey_bytes_to_hash160(pubkey_compressed, 33, hash160_compressed);
+            pubkey_bytes_to_hash160(pubkey_uncompressed, 65, hash160_uncompressed);
+
+            /* 同时比对压缩地址和非压缩地址（字节层面直接比对） */
+            if (ht_contains(hash160_compressed) || ht_contains(hash160_uncompressed)) {
+                found_flag = 1;
+                /* 仅在命中时才做格式转换 */
+                char privkey_hex[65];
+                char address_compressed[ADDRESS_LEN + 1];
+                char address_uncompressed[ADDRESS_LEN + 1];
+                bytes_to_hex(privkey, 32, privkey_hex);
+                fprintf(stdout, "\n[线程-%d] 找到匹配！总尝试次数: %lu\n", thread_id, count);
+                fprintf(stdout, "私钥(hex): %s\n", privkey_hex);
+                if (privkey_to_address(privkey, address_compressed, address_uncompressed) == 0) {
+                    fprintf(stdout, "压缩地址: %s\n", address_compressed);
+                    fprintf(stdout, "非压缩地址: %s\n", address_uncompressed);
+                }
+                fflush(stdout);
             }
-            fflush(stdout);
+
+            /* 性能监控：每 PROGRESS_INTERVAL 次输出 keys/s */
+            if (count % PROGRESS_INTERVAL == 0) {
+                clock_gettime(CLOCK_MONOTONIC, &ts_now);
+                double elapsed = (ts_now.tv_sec - ts_last.tv_sec) + (ts_now.tv_nsec - ts_last.tv_nsec) * 1e-9;
+                double kps = (elapsed > 0) ? (double)(count - count_last) / elapsed : 0.0;
+                fprintf(stdout, "[线程-%d] 已尝试: %lu  速度: %.0f keys/s\n", thread_id, count, kps);
+                fflush(stdout);
+                ts_last = ts_now;
+                count_last = count;
+            }
+
+            /* 增量推导：私钥+1，公钥点加G */
+            if (!secp256k1_ec_seckey_tweak_add(secp_ctx, privkey, tweak[tweak_index])) {
+                fprintf(stderr, "警告：私钥推导失败，batch=%d！\n", batch);
+                break;
+            }
+            if (!secp256k1_ec_pubkey_tweak_add(secp_ctx, &pubkey, tweak[tweak_index])) {
+                fprintf(stderr, "警告：公钥推导失败，batch=%d！\n", batch);
+                break;
+            }
         }
     }
 
@@ -185,6 +232,7 @@ static int load_target_addresses(const char *filename)
         ht_insert(h160);
         count++;
     }
+
     fclose(f);
 
     if (count == 0) {
@@ -193,6 +241,8 @@ static int load_target_addresses(const char *filename)
     }
     address_count = count;
     fprintf(stdout, "成功加载%d个地址（跳过%d个无效地址）\n", count, skip_count);
+
+    fflush(stdout);
     return 0;
 }
 
