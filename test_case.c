@@ -1016,6 +1016,226 @@ static void test_hash160_8way(void) {
 
 #endif /* __AVX2__ */
 
+/* ===================== 开放寻址哈希表测试 ===================== */
+
+static void test_ht_openaddr(void) {
+    printf("\n=== 开放寻址哈希表测试 ===\n");
+
+    /* 初始化哈希表（16个槽位，足够测试用） */
+    if (ht_init(16) != 0) {
+        printf("  [FAIL] 8.0 ht_init 失败\n");
+        fail_count++;
+        return;
+    }
+
+    /* 8.1 插入已知 hash160，验证 ht_contains 返回1 */
+    uint8_t h1[20] = {0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,
+                      0x0b,0x0c,0x0d,0x0e,0x0f,0x10,0x11,0x12,0x13,0x14};
+    uint8_t h2[20] = {0xaa,0xbb,0xcc,0xdd,0xee,0xff,0x00,0x11,0x22,0x33,
+                      0x44,0x55,0x66,0x77,0x88,0x99,0xaa,0xbb,0xcc,0xdd};
+    ht_insert(h1);
+    ht_insert(h2);
+
+    if (ht_contains(h1) == 1) {
+        printf("  [PASS] 8.1 ht_contains(h1) 命中\n");
+        pass_count++;
+    } else {
+        printf("  [FAIL] 8.1 ht_contains(h1) 应命中但未命中\n");
+        fail_count++;
+    }
+
+    if (ht_contains(h2) == 1) {
+        printf("  [PASS] 8.2 ht_contains(h2) 命中\n");
+        pass_count++;
+    } else {
+        printf("  [FAIL] 8.2 ht_contains(h2) 应命中但未命中\n");
+        fail_count++;
+    }
+
+    /* 8.3 查找未插入的 hash160，验证返回0 */
+    uint8_t h3[20] = {0xde,0xad,0xbe,0xef,0x00,0x00,0x00,0x00,0x00,0x00,
+                      0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
+    if (ht_contains(h3) == 0) {
+        printf("  [PASS] 8.3 ht_contains(h3) 未命中（正确）\n");
+        pass_count++;
+    } else {
+        printf("  [FAIL] 8.3 ht_contains(h3) 应未命中但命中\n");
+        fail_count++;
+    }
+
+    /* 8.4 fp==0 边界：hash160 前4字节全零 */
+    uint8_t h_fp0[20] = {0x00,0x00,0x00,0x00,0x01,0x02,0x03,0x04,0x05,0x06,
+                         0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x10};
+    ht_insert(h_fp0);
+    if (ht_contains(h_fp0) == 1) {
+        printf("  [PASS] 8.4 fp==0 边界：ht_contains(h_fp0) 命中\n");
+        pass_count++;
+    } else {
+        printf("  [FAIL] 8.4 fp==0 边界：ht_contains(h_fp0) 应命中但未命中\n");
+        fail_count++;
+    }
+
+    /* 8.5 大量插入（负载因子接近0.5），重新初始化更大的表 */
+    ht_free();
+    if (ht_init(256) != 0) {
+        printf("  [FAIL] 8.5 ht_init(256) 失败\n");
+        fail_count++;
+        return;
+    }
+
+    int n = 100; /* 插入100条，负载因子 100/256 ≈ 0.39 */
+    uint8_t keys[100][20];
+    for (int i = 0; i < n; i++) {
+        memset(keys[i], 0, 20);
+        keys[i][0] = (uint8_t)(i >> 8);
+        keys[i][1] = (uint8_t)(i & 0xff);
+        keys[i][19] = (uint8_t)(i * 7 + 3); /* 增加差异性 */
+        ht_insert(keys[i]);
+    }
+
+    int all_found = 1;
+    for (int i = 0; i < n; i++) {
+        if (!ht_contains(keys[i])) {
+            printf("  [FAIL] 8.5 大量插入：第%d条未命中\n", i);
+            all_found = 0;
+            fail_count++;
+            break;
+        }
+    }
+    if (all_found) {
+        printf("  [PASS] 8.5 大量插入（100条）全部命中\n");
+        pass_count++;
+    }
+
+    /* 8.6 验证未插入的 key 不会误命中 */
+    uint8_t h_miss[20] = {0xff,0xfe,0xfd,0xfc,0xfb,0xfa,0xf9,0xf8,0xf7,0xf6,
+                          0xf5,0xf4,0xf3,0xf2,0xf1,0xf0,0xef,0xee,0xed,0xec};
+    if (ht_contains(h_miss) == 0) {
+        printf("  [PASS] 8.6 未插入 key 不误命中\n");
+        pass_count++;
+    } else {
+        printf("  [FAIL] 8.6 未插入 key 误命中\n");
+        fail_count++;
+    }
+
+    ht_free();
+}
+
+#ifdef __AVX2__
+static void test_ht_contains_8way_func(void) {
+    printf("\n=== ht_contains_8way AVX2 批量查表测试 ===\n");
+
+    /* 初始化哈希表 */
+    if (ht_init(64) != 0) {
+        printf("  [FAIL] 9.0 ht_init 失败\n");
+        fail_count++;
+        return;
+    }
+
+    /* 准备8个已知 hash160 */
+    uint8_t known[8][20];
+    for (int i = 0; i < 8; i++) {
+        memset(known[i], 0, 20);
+        known[i][0] = (uint8_t)(0x10 + i);
+        known[i][1] = (uint8_t)(0x20 + i);
+        known[i][2] = (uint8_t)(0x30 + i);
+        known[i][3] = (uint8_t)(0x40 + i);
+        known[i][19] = (uint8_t)(i + 1);
+        ht_insert(known[i]);
+    }
+
+    /* 准备8个未插入的 hash160 */
+    uint8_t unknown[8][20];
+    for (int i = 0; i < 8; i++) {
+        memset(unknown[i], 0, 20);
+        unknown[i][0] = (uint8_t)(0xf0 + i);
+        unknown[i][1] = (uint8_t)(0xe0 + i);
+        unknown[i][2] = (uint8_t)(0xd0 + i);
+        unknown[i][3] = (uint8_t)(0xc0 + i);
+        unknown[i][19] = (uint8_t)(i + 0x80);
+    }
+
+    /* 9.1 8路全命中 */
+    const uint8_t *ptrs_all[8];
+    for (int i = 0; i < 8; i++) ptrs_all[i] = known[i];
+    uint8_t mask = ht_contains_8way(ptrs_all);
+    if (mask == 0xff) {
+        printf("  [PASS] 9.1 8路全命中，掩码=0xff\n");
+        pass_count++;
+    } else {
+        printf("  [FAIL] 9.1 8路全命中，期望掩码=0xff，实际=0x%02x\n", mask);
+        fail_count++;
+    }
+
+    /* 9.2 8路全未命中 */
+    const uint8_t *ptrs_none[8];
+    for (int i = 0; i < 8; i++) ptrs_none[i] = unknown[i];
+    mask = ht_contains_8way(ptrs_none);
+    if (mask == 0x00) {
+        printf("  [PASS] 9.2 8路全未命中，掩码=0x00\n");
+        pass_count++;
+    } else {
+        printf("  [FAIL] 9.2 8路全未命中，期望掩码=0x00，实际=0x%02x\n", mask);
+        fail_count++;
+    }
+
+    /* 9.3 部分命中：偶数 lane 命中（0,2,4,6），期望掩码=0x55 */
+    const uint8_t *ptrs_mix[8];
+    for (int i = 0; i < 8; i++) {
+        ptrs_mix[i] = (i % 2 == 0) ? known[i] : unknown[i];
+    }
+    mask = ht_contains_8way(ptrs_mix);
+    if (mask == 0x55) {
+        printf("  [PASS] 9.3 部分命中（偶数lane），掩码=0x55\n");
+        pass_count++;
+    } else {
+        printf("  [FAIL] 9.3 部分命中（偶数lane），期望掩码=0x55，实际=0x%02x\n", mask);
+        fail_count++;
+    }
+
+    /* 9.4 部分命中：奇数 lane 命中（1,3,5,7），期望掩码=0xaa */
+    for (int i = 0; i < 8; i++) {
+        ptrs_mix[i] = (i % 2 == 1) ? known[i] : unknown[i];
+    }
+    mask = ht_contains_8way(ptrs_mix);
+    if (mask == 0xaa) {
+        printf("  [PASS] 9.4 部分命中（奇数lane），掩码=0xaa\n");
+        pass_count++;
+    } else {
+        printf("  [FAIL] 9.4 部分命中（奇数lane），期望掩码=0xaa，实际=0x%02x\n", mask);
+        fail_count++;
+    }
+
+    /* 9.5 仅 lane0 命中，期望掩码=0x01 */
+    for (int i = 0; i < 8; i++) {
+        ptrs_mix[i] = (i == 0) ? known[0] : unknown[i];
+    }
+    mask = ht_contains_8way(ptrs_mix);
+    if (mask == 0x01) {
+        printf("  [PASS] 9.5 仅 lane0 命中，掩码=0x01\n");
+        pass_count++;
+    } else {
+        printf("  [FAIL] 9.5 仅 lane0 命中，期望掩码=0x01，实际=0x%02x\n", mask);
+        fail_count++;
+    }
+
+    /* 9.6 仅 lane7 命中，期望掩码=0x80 */
+    for (int i = 0; i < 8; i++) {
+        ptrs_mix[i] = (i == 7) ? known[7] : unknown[i];
+    }
+    mask = ht_contains_8way(ptrs_mix);
+    if (mask == 0x80) {
+        printf("  [PASS] 9.6 仅 lane7 命中，掩码=0x80\n");
+        pass_count++;
+    } else {
+        printf("  [FAIL] 9.6 仅 lane7 命中，期望掩码=0x80，实际=0x%02x\n", mask);
+        fail_count++;
+    }
+
+    ht_free();
+}
+#endif /* __AVX2__ */
+
 /* ===================== 专用接口测试：sha256_33 / sha256_65 / ripemd160_32 ===================== */
 
 static void test_specialized_interfaces(void) {
@@ -1497,6 +1717,10 @@ int main(void) {
 #ifdef __AVX2__
     test_avx2_compress();
     test_hash160_8way();
+#endif
+    test_ht_openaddr();
+#ifdef __AVX2__
+    test_ht_contains_8way_func();
 #endif
     test_specialized_interfaces();
 #ifndef USE_PUBKEY_API_ONLY

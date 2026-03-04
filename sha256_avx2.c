@@ -17,7 +17,7 @@
 /* 右旋转 */
 #define V_ROR(x, n) _mm256_or_si256(_mm256_srli_epi32((x), (n)), _mm256_slli_epi32((x), 32 - (n)))
 
-/* SHA256 辅助函数（向量化版本） */
+/* SHA256辅助函数（向量化版本） */
 #define V_CH(x, y, z)   _mm256_xor_si256(_mm256_and_si256((x), (y)), _mm256_andnot_si256((x), (z)))
 #define V_MAJ(x, y, z)  _mm256_xor_si256(_mm256_xor_si256(_mm256_and_si256((x), (y)), \
                             _mm256_and_si256((x), (z))), _mm256_and_si256((y), (z)))
@@ -76,7 +76,8 @@ static inline void store_8way(uint32_t *const states[8], int i, __m256i v)
 /*
  * 同时对8个独立的(state, block)对执行一次SHA256压缩
  */
-__attribute__((target("avx2"))) void sha256_compress_avx2(uint32_t *states[8], const uint8_t *blocks[8])
+__attribute__((target("avx2")))
+void sha256_compress_avx2(uint32_t *states[8], const uint8_t *blocks[8])
 {
     /* 加载 8 路初始状态 */
     __m256i a = _mm256_set_epi32((int)states[7][0], (int)states[6][0], (int)states[5][0], (int)states[4][0], (int)states[3][0], (int)states[2][0], (int)states[1][0], (int)states[0][0]);

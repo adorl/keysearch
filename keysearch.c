@@ -32,20 +32,11 @@
 #define MAX_ATTEMPTS        (1ULL << 63)    /* 每个线程最大尝试次数 */
 #define PROGRESS_INTERVAL   (1000000)       /* 进度打印间隔 */
 #define MAX_ADDRESSES       (400000)        /* 最多支持的目标地址数量 */
-#define HASH_TABLE_SIZE     (65536 * 4)     /* 哈希表固定槽位数 */
 #define ADDRESS_LEN         (35)            /* 比特币地址最大长度 */
 #define BATCH_SIZE          (2048)          /* 增量推导批次大小，每批后重置随机基准私钥 */
 
 /* ===================== 全局共享数据 ===================== */
 
-/* 哈希表节点（用于O(1)查找） */
-struct hash_node
-{
-    uint8_t hash160[20];        /* 20字节RIPEMD160哈希值 */
-    struct hash_node *next;
-};
-
-static struct hash_node *hash_table[HASH_TABLE_SIZE]; /* 地址哈希表 */
 static int address_count = 0;                /* 已加载地址数量 */
 
 /* 跨线程找到标志 */
@@ -63,41 +54,6 @@ struct thread_args
 {
     int thread_id;
 };
-
-/* 基于20字节二进制数据的哈希函数 */
-static uint32_t hash160_hash(const uint8_t *h160)
-{
-    uint32_t h = 2166136261u;
-    for (int i = 0; i < 20; i++) {
-        h ^= h160[i];
-        h *= 16777619u;
-    }
-    return h & (HASH_TABLE_SIZE - 1);
-}
-
-/* 向哈希表插入hash160 */
-static void ht_insert(const uint8_t *h160)
-{
-    uint32_t idx = hash160_hash(h160);
-    struct hash_node *node = (struct hash_node *)malloc(sizeof(struct hash_node));
-
-    memcpy(node->hash160, h160, 20);
-    node->next = hash_table[idx];
-    hash_table[idx] = node;
-}
-
-/* 在哈希表中查找hash160，O(1)平均 */
-static int ht_contains(const uint8_t *h160)
-{
-    uint32_t idx = hash160_hash(h160);
-    struct hash_node *node = hash_table[idx];
-    while (node) {
-        if (memcmp(node->hash160, h160, 20) == 0)
-            return 1;
-        node = node->next;
-    }
-    return 0;
-}
 
 /* ===================== 线程工作函数 ===================== */
 static void *search_key(void *arg)
@@ -203,17 +159,32 @@ static void *search_key(void *arg)
             hash160_8way_compressed(comp_ptrs, hash160_comp_8);
             hash160_8way_uncompressed(uncomp_ptrs, hash160_uncomp_8);
 
-            /* 逐lane查表（仅处理有效lane） */
-            for (int lane = 0; lane < valid_count; lane++) {
-                int b_idx = b + lane;
-                count++;
+            /* 构造8路指针数组用于批量查表 */
+            const uint8_t *comp_h160_ptrs[8];
+            const uint8_t *uncomp_h160_ptrs[8];
+            for (int lane = 0; lane < 8; lane++) {
+                comp_h160_ptrs[lane] = hash160_comp_8[lane];
+                uncomp_h160_ptrs[lane] = hash160_uncomp_8[lane];
+            }
 
-                if (ge_batch[b_idx].infinity) {
-                    continue;
-                }
+            /* 8路批量查表（压缩 + 非压缩各一次，共16路） */
+            uint8_t mask_comp = ht_contains_8way(comp_h160_ptrs);
+            uint8_t mask_uncomp = ht_contains_8way(uncomp_h160_ptrs);
+            uint8_t hit_mask = mask_comp | mask_uncomp;
 
-                /* 哈希表查找 */
-                if (ht_contains(hash160_comp_8[lane]) || ht_contains(hash160_uncomp_8[lane])) {
+            /* 更新计数（仅有效 lane） */
+            count += (uint64_t)valid_count;
+
+            /* 仅当有命中时才进入处理逻辑 */
+            if (hit_mask) {
+                for (int lane = 0; lane < valid_count; lane++) {
+                    if (!(hit_mask & (1 << lane)))
+                        continue;
+
+                    int b_idx = b + lane;
+                    if (ge_batch[b_idx].infinity)
+                        continue;
+
                     found_flag = 1;
                     /* 命中时重建私钥 */
                     memcpy(privkey, base_privkey, 32);
@@ -234,18 +205,19 @@ static void *search_key(void *arg)
                     }
                     fflush(stdout);
                 }
+            }
 
-                /* 性能监控 */
-                if (--progress_counter == 0) {
-                    progress_counter = PROGRESS_INTERVAL;
-                    clock_gettime(CLOCK_MONOTONIC, &ts_now);
-                    double elapsed = (ts_now.tv_sec - ts_last.tv_sec) + (ts_now.tv_nsec - ts_last.tv_nsec) * 1e-9;
-                    double kps = (elapsed > 0) ? (double)(count - count_last) / elapsed : 0.0;
-                    fprintf(stdout, "[线程-%d] 已尝试: %lu 速度: %.0f keys/s\n", thread_id, count, kps);
-                    fflush(stdout);
-                    ts_last = ts_now;
-                    count_last = count;
-                }
+            /* 性能监控（以批次为粒度递减） */
+            progress_counter -= valid_count;
+            if (progress_counter <= 0) {
+                progress_counter = PROGRESS_INTERVAL;
+                clock_gettime(CLOCK_MONOTONIC, &ts_now);
+                double elapsed = (ts_now.tv_sec - ts_last.tv_sec) + (ts_now.tv_nsec - ts_last.tv_nsec) * 1e-9;
+                double kps = (elapsed > 0) ? (double)(count - count_last) / elapsed : 0.0;
+                fprintf(stdout, "[线程-%d] 已尝试: %lu 速度: %.0f keys/s\n", thread_id, count, kps);
+                fflush(stdout);
+                ts_last = ts_now;
+                count_last = count;
             }
         }
 #else
@@ -444,8 +416,15 @@ int main(int argc, char *argv[])
     if (thread_count <= 0)
         thread_count = 4;
 
-    /* 初始化哈希表 */
-    memset(hash_table, 0, sizeof(hash_table));
+    /* 初始化哈希表（开放寻址，负载因子 ≤ 0.5，槽位数为地址数2倍向上取2的幂次） */
+    /* 先用最大容量初始化：MAX_ADDRESSES * 2，向上取2的幂次 */
+    uint32_t ht_capacity = 1;
+    while (ht_capacity < (uint32_t)MAX_ADDRESSES * 2)
+        ht_capacity <<= 1;
+    if (ht_init(ht_capacity) != 0) {
+        fprintf(stderr, "错误：哈希表内存分配失败\n");
+        return 1;
+    }
 
     /* 加载目标地址 */
     if (load_target_addresses(address_file) != 0)
@@ -490,6 +469,7 @@ int main(int argc, char *argv[])
 
     /* 清理资源 */
     secp256k1_context_destroy(secp_ctx);
+    ht_free();
     free(threads);
     free(args);
 

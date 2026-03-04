@@ -79,11 +79,12 @@ static inline void rmd_store_8way(uint32_t *const states[8], int i, __m256i v)
 }
 
 /*
- * ripemd160_compress_avx2 — 8-way 并行 RIPEMD160压缩
+ * ripemd160_compress_avx2 — 8-way并行RIPEMD160压缩
  *
  * 同时对8个独立的(state, block)对执行一次RIPEMD160压缩
  */
-__attribute__((target("avx2"))) void ripemd160_compress_avx2(uint32_t *states[8], const uint8_t *blocks[8])
+__attribute__((target("avx2")))
+void ripemd160_compress_avx2(uint32_t *states[8], const uint8_t *blocks[8])
 {
     /* 加载8路初始状态 */
     __m256i al = _mm256_set_epi32((int)states[7][0], (int)states[6][0], (int)states[5][0], (int)states[4][0], (int)states[3][0], (int)states[2][0], (int)states[1][0], (int)states[0][0]);

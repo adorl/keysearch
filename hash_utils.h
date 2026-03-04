@@ -68,5 +68,49 @@ void hash160_8way_compressed(const uint8_t *pubkeys[8], uint8_t hash160s[8][20])
 void hash160_8way_uncompressed(const uint8_t *pubkeys[8], uint8_t hash160s[8][20]);
 #endif /* __AVX2__ */
 
+/*
+ * 哈希表槽位结构：
+ *   fp     : hash160前4字节指纹，用于快速过滤（0表示空槽）
+ *   h160   : 完整20字节hash160
+ */
+struct ht_slot {
+    uint32_t fp;        /* 前4字节指纹（大端序读取） */
+    uint8_t h160[20];  /* 完整20字节hash160 */
+};
+
+/* 全局哈希表（由 ht_init 分配，ht_free 释放） */
+extern struct ht_slot *ht_slots;
+extern uint32_t ht_mask;   /* 槽位掩码 = 槽位数 - 1（槽位数为2的幂次） */
+
+/*
+ * 初始化哈希表：分配capacity个槽位（capacity必须为2的幂次）
+ * 返回0成功，-1失败
+ */
+int ht_init(uint32_t capacity);
+
+/* 释放哈希表内存 */
+void ht_free(void);
+
+/*
+ * 向哈希表插入hash160（20字节）
+ * 使用线性探测解决冲突
+ */
+void ht_insert(const uint8_t *h160);
+
+/*
+ * 在哈希表中查找hash160（20字节）
+ * 返回1命中，0未命中
+ */
+int ht_contains(const uint8_t *h160);
+
+#ifdef __AVX2__
+/*
+ * 8路并行查表：同时查找8个hash160
+ * h160s[8]: 8个hash160指针（每个20字节）
+ * 返回8位命中掩码：bit i为1表示第i路命中
+ */
+uint8_t ht_contains_8way(const uint8_t *h160s[8]);
+#endif /* __AVX2__ */
+
 #endif /* HASH_UTILS_H */
 

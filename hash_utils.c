@@ -3,6 +3,7 @@
 #include "ripemd160.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #ifdef __AVX2__
 #include <immintrin.h>
 #endif
@@ -273,6 +274,82 @@ int privkey_to_address(const uint8_t *privkey,
     return 0;
 }
 
+struct ht_slot *ht_slots = NULL;
+uint32_t ht_mask = 0;
+
+/* 初始化哈希表：分配capacity个槽位（capacity必须为2的幂次） */
+int ht_init(uint32_t capacity)
+{
+    ht_slots = (struct ht_slot *)calloc(capacity, sizeof(struct ht_slot));
+    if (!ht_slots)
+        return -1;
+    ht_mask = capacity - 1;
+    return 0;
+}
+
+/* 释放哈希表内存 */
+void ht_free(void)
+{
+    free(ht_slots);
+    ht_slots = NULL;
+    ht_mask = 0;
+}
+
+/*
+ * FNV-1a 哈希：将hash160前4字节读为大端uint32_t，再做FNV-1a乘法哈希
+ * 返回槽位索引（已 & ht_mask）
+ */
+static inline uint32_t ht_hash(const uint8_t *h160)
+{
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < 20; i++) {
+        h ^= h160[i];
+        h *= 16777619u;
+    }
+    return h & ht_mask;
+}
+
+/* 向哈希表插入hash160（线性探测） */
+void ht_insert(const uint8_t *h160)
+{
+    /* 提取前4字节指纹（大端序） */
+    uint32_t fp = ((uint32_t)h160[0] << 24) |
+                  ((uint32_t)h160[1] << 16) |
+                  ((uint32_t)h160[2] <<  8) |
+                   (uint32_t)h160[3];
+    /* fp == 0时用1代替，避免与空槽标识冲突 */
+    if (fp == 0)
+        fp = 1;
+
+    uint32_t idx = ht_hash(h160);
+    while (ht_slots[idx].fp != 0) {
+        idx = (idx + 1) & ht_mask;
+    }
+    ht_slots[idx].fp = fp;
+    memcpy(ht_slots[idx].h160, h160, 20);
+}
+
+/* 在哈希表中查找hash160（线性探测） */
+int ht_contains(const uint8_t *h160)
+{
+    uint32_t fp = ((uint32_t)h160[0] << 24) |
+                  ((uint32_t)h160[1] << 16) |
+                  ((uint32_t)h160[2] <<  8) |
+                   (uint32_t)h160[3];
+    if (fp == 0)
+        fp = 1;
+
+    uint32_t idx = ht_hash(h160);
+    while (1) {
+        uint32_t slot_fp = ht_slots[idx].fp;
+        if (slot_fp == 0)
+            return 0; /* 空槽，未命中 */
+        if (slot_fp == fp && memcmp(ht_slots[idx].h160, h160, 20) == 0)
+            return 1; /* 命中 */
+        idx = (idx + 1) & ht_mask;
+    }
+}
+
 #ifdef __AVX2__
 
 /* SHA256初始状态常量 */
@@ -497,6 +574,88 @@ void hash160_8way_uncompressed(const uint8_t *pubkeys[8], uint8_t hash160s[8][20
     for (int i = 0; i < 8; i++) {
         rmd160_state_to_bytes(rmd_states[i], hash160s[i]);
     }
+}
+
+/*
+ * 8路并行查表：同时查找8个hash160
+ *
+ * 策略：
+ *   1. 用标量FNV-1a计算8路槽位索引（与ht_contains完全一致）
+ *   2. 用AVX2 _mm256_set_epi32加载8路指纹，_mm256_cmpeq_epi32同时比较
+ *   3. 对指纹命中的lane执行标量线性探测 + memcmp 20字节确认
+ *   4. 返回8位命中掩码（bit i为1表示第i路命中）
+ */
+__attribute__((target("avx2")))
+uint8_t ht_contains_8way(const uint8_t *h160s[8])
+{
+    /* ---- 步骤1：计算8路指纹和初始槽位索引 ---- */
+    uint32_t fps[8];
+    uint32_t idxs[8];
+
+    for (int i = 0; i < 8; i++) {
+        const uint8_t *h = h160s[i];
+        uint32_t fp = ((uint32_t)h[0] << 24) |
+                      ((uint32_t)h[1] << 16) |
+                      ((uint32_t)h[2] <<  8) |
+                       (uint32_t)h[3];
+        if (fp == 0)
+            fp = 1;
+        fps[i] = fp;
+
+        /* FNV-1a 哈希（与ht_hash完全一致） */
+        uint32_t hv = 2166136261u;
+        for (int j = 0; j < 20; j++) {
+            hv ^= h[j];
+            hv *= 16777619u;
+        }
+        idxs[i] = hv & ht_mask;
+    }
+
+    /* ---- 步骤2：AVX2同时加载8路槽位指纹并比较 ---- */
+
+    /* 加载8路当前槽位的指纹 */
+    __m256i vslot = _mm256_set_epi32(
+        (int32_t)ht_slots[idxs[7]].fp, (int32_t)ht_slots[idxs[6]].fp,
+        (int32_t)ht_slots[idxs[5]].fp, (int32_t)ht_slots[idxs[4]].fp,
+        (int32_t)ht_slots[idxs[3]].fp, (int32_t)ht_slots[idxs[2]].fp,
+        (int32_t)ht_slots[idxs[1]].fp, (int32_t)ht_slots[idxs[0]].fp);
+
+    /* 检测空槽（fp == 0表示空槽，直接未命中） */
+    __m256i vzero = _mm256_setzero_si256();
+    __m256i vempty = _mm256_cmpeq_epi32(vslot, vzero); /* 空槽掩码 */
+
+    int empty_mask = _mm256_movemask_epi8(vempty);
+
+    /* ---- 步骤3：对指纹命中的lane执行标量线性探测+memcmp确认 ---- */
+    uint8_t result = 0;
+
+    for (int i = 0; i < 8; i++) {
+        /* 每个lane对应movemask中的4个连续bit（epi32 -> 4字节） */
+        int lane_bit = 1 << (i * 4);
+
+        if (empty_mask & lane_bit) {
+            /* 初始槽为空，直接未命中 */
+            continue;
+        }
+
+        /* 标量线性探测：从初始槽开始，直到找到匹配或空槽 */
+        uint32_t idx = idxs[i];
+        uint32_t fp  = fps[i];
+        const uint8_t *h = h160s[i];
+
+        while (1) {
+            uint32_t slot_fp = ht_slots[idx].fp;
+            if (slot_fp == 0)
+                break; /* 空槽，未命中 */
+            if (slot_fp == fp && memcmp(ht_slots[idx].h160, h, 20) == 0) {
+                result |= (uint8_t)(1 << i);
+                break;
+            }
+            idx = (idx + 1) & ht_mask;
+        }
+    }
+
+    return result;
 }
 
 #endif /* __AVX2__ */

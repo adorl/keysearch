@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -O3 -g -ggdb -march=native
+CFLAGS = -O1 -g -ggdb -march=native
 LDFLAGS = -lpthread
 
 SECP256K1_SRC ?= ./secp256k1
