@@ -111,6 +111,7 @@ static void *search_key(void *arg)
     uint8_t hash160_uncompressed[20];
     uint8_t tweak[32];              /* 标量加法tweak = 1 */
     uint64_t count = 0;
+    int progress_counter = PROGRESS_INTERVAL; /* 递减计数器，避免取模除法 */
     rand_key_context rand_ctx;
 
     memset(tweak, 0, 32);
@@ -208,7 +209,8 @@ static void *search_key(void *arg)
             }
 
             /* 性能监控：每PROGRESS_INTERVAL次输出keys/s */
-            if (count % PROGRESS_INTERVAL == 0) {
+            if (--progress_counter == 0) {
+                progress_counter = PROGRESS_INTERVAL;
                 clock_gettime(CLOCK_MONOTONIC, &ts_now);
                 double elapsed = (ts_now.tv_sec - ts_last.tv_sec) + (ts_now.tv_nsec - ts_last.tv_nsec) * 1e-9;
                 double kps = (elapsed > 0) ? (double)(count - count_last) / elapsed : 0.0;
@@ -262,7 +264,8 @@ static void *search_key(void *arg)
                 fflush(stdout);
             }
 
-            if (count % PROGRESS_INTERVAL == 0) {
+            if (--progress_counter == 0) {
+                progress_counter = PROGRESS_INTERVAL;
                 clock_gettime(CLOCK_MONOTONIC, &ts_now);
                 double elapsed = (ts_now.tv_sec - ts_last.tv_sec)
                                + (ts_now.tv_nsec - ts_last.tv_nsec) * 1e-9;

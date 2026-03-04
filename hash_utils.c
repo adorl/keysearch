@@ -192,8 +192,14 @@ void pubkey_bytes_to_hash160(const uint8_t *pubkey_bytes, size_t len,
                             uint8_t *hash160_out)
 {
     uint8_t sha256_result[32];
-    sha256(pubkey_bytes, len, sha256_result);
-    ripemd160(sha256_result, 32, hash160_out);
+    if (len == 33) {
+        sha256_33(pubkey_bytes, sha256_result);
+    } else if (len == 65) {
+        sha256_65(pubkey_bytes, sha256_result);
+    } else {
+        sha256(pubkey_bytes, len, sha256_result);
+    }
+    ripemd160_32(sha256_result, hash160_out);
 }
 
 /*

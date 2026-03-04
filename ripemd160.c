@@ -40,23 +40,47 @@ static void ripemd160_compress(uint32_t *state, const uint8_t *block)
 
     uint32_t al=state[0],bl=state[1],cl=state[2],dl=state[3],el=state[4];
     uint32_t ar=state[0],br=state[1],cr=state[2],dr=state[3],er=state[4];
+    uint32_t t;
 
-    for (int i = 0; i < 80; i++) {
-        int r = i / 16;
-        uint32_t fl, fr, t;
-        switch(r) {
-            case 0: fl=RMD_F(bl,cl,dl); fr=RMD_J(br,cr,dr); break;
-            case 1: fl=RMD_G(bl,cl,dl); fr=RMD_I(br,cr,dr); break;
-            case 2: fl=RMD_H(bl,cl,dl); fr=RMD_H(br,cr,dr); break;
-            case 3: fl=RMD_I(bl,cl,dl); fr=RMD_G(br,cr,dr); break;
-            default:fl=RMD_J(bl,cl,dl); fr=RMD_F(br,cr,dr); break;
-        }
-        t = ROL32(al + fl + w[RMD_RL[i]] + RMD_KL[r], RMD_SL[i]) + el;
-        al=el; el=dl; dl=ROL32(cl,10); cl=bl; bl=t;
-        t = ROL32(ar + fr + w[RMD_RR[i]] + RMD_KR[r], RMD_SR[i]) + er;
-        ar=er; er=dr; dr=ROL32(cr,10); cr=br; br=t;
+/* 辅助宏：左链和右链各执行一步 */
+#define RSTEP_L(F, kl, ri, si) \
+    t = ROL32(al + (F) + w[RMD_RL[ri]] + (kl), RMD_SL[ri]) + el; \
+    al=el; el=dl; dl=ROL32(cl,10); cl=bl; bl=t;
+
+#define RSTEP_R(F, kr, ri, si) \
+    t = ROL32(ar + (F) + w[RMD_RR[ri]] + (kr), RMD_SR[ri]) + er; \
+    ar=er; er=dr; dr=ROL32(cr,10); cr=br; br=t;
+
+    /* 轮0-15：左链F(b,c,d)，右链J(b,c,d) */
+    for (int i = 0; i < 16; i++) {
+        RSTEP_L(RMD_F(bl,cl,dl), RMD_KL[0], i, i)
+        RSTEP_R(RMD_J(br,cr,dr), RMD_KR[0], i, i)
     }
-    uint32_t t = state[1] + cl + dr;
+    /* 轮16-31：左链G(b,c,d)，右链I(b,c,d) */
+    for (int i = 16; i < 32; i++) {
+        RSTEP_L(RMD_G(bl,cl,dl), RMD_KL[1], i, i)
+        RSTEP_R(RMD_I(br,cr,dr), RMD_KR[1], i, i)
+    }
+    /* 轮32-47：左链H(b,c,d)，右链H(b,c,d) */
+    for (int i = 32; i < 48; i++) {
+        RSTEP_L(RMD_H(bl,cl,dl), RMD_KL[2], i, i)
+        RSTEP_R(RMD_H(br,cr,dr), RMD_KR[2], i, i)
+    }
+    /* 轮48-63：左链I(b,c,d)，右链G(b,c,d) */
+    for (int i = 48; i < 64; i++) {
+        RSTEP_L(RMD_I(bl,cl,dl), RMD_KL[3], i, i)
+        RSTEP_R(RMD_G(br,cr,dr), RMD_KR[3], i, i)
+    }
+    /* 轮64-79：左链J(b,c,d)，右链F(b,c,d) */
+    for (int i = 64; i < 80; i++) {
+        RSTEP_L(RMD_J(bl,cl,dl), RMD_KL[4], i, i)
+        RSTEP_R(RMD_F(br,cr,dr), RMD_KR[4], i, i)
+    }
+
+#undef RSTEP_L
+#undef RSTEP_R
+
+    t = state[1] + cl + dr;
     state[1] = state[2] + dl + er;
     state[2] = state[3] + el + ar;
     state[3] = state[4] + al + br;
@@ -120,5 +144,38 @@ void ripemd160(const uint8_t *data, size_t len, uint8_t *digest)
     ripemd160_init(&ctx);
     ripemd160_update(&ctx, data, len);
     ripemd160_final(&ctx, digest);
+}
+
+/*
+ * 针对固定32字节输入的专用RIPEMD160，消除ctx/update/final开销
+ * 输入恰好是一个SHA256摘要（32字节），单块处理
+ */
+void ripemd160_32(const uint8_t *data32, uint8_t *digest)
+{
+    /* 初始状态 */
+    uint32_t state[5] = {
+        0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0
+    };
+
+    /* 构造填充块：32字节数据+0x80+零填充+长度(小端，256 bits) */
+    uint8_t block[64];
+    memcpy(block, data32, 32);
+    block[32] = 0x80;
+    memset(block + 33, 0, 64 - 33 - 8);
+    /* 长度字段：256bits = 0x100，小端序写入最后8字节 */
+    block[56] = 0x00; block[57] = 0x01;
+    block[58] = 0x00; block[59] = 0x00;
+    block[60] = 0x00; block[61] = 0x00;
+    block[62] = 0x00; block[63] = 0x00;
+
+    ripemd160_compress(state, block);
+
+    /* 输出（小端序） */
+    for (int i = 0; i < 5; i++) {
+        digest[i * 4] = (state[i]) & 0xFF;
+        digest[i * 4 + 1] = (state[i] >> 8) & 0xFF;
+        digest[i * 4 + 2] = (state[i] >> 16) & 0xFF;
+        digest[i * 4 + 3] = (state[i] >> 24) & 0xFF;
+    }
 }
 

@@ -95,3 +95,76 @@ void sha256(const uint8_t *data, size_t len, uint8_t *digest)
     sha256_final(&ctx, digest);
 }
 
+/*
+ * 针对固定33字节输入（压缩公钥）的专用SHA256，单块处理
+ * 33字节+0x80+22字节零+8字节长度=64字节
+ */
+void sha256_33(const uint8_t *data33, uint8_t *digest)
+{
+    uint32_t state[8] = {
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+    };
+    uint8_t block[64];
+    memcpy(block, data33, 33);
+    block[33] = 0x80;
+    memset(block + 34, 0, 64 - 34 - 8);
+    /* 长度：33*8=264bits=0x108，大端序写入最后8字节 */
+    block[56] = 0x00;
+    block[57] = 0x00;
+    block[58] = 0x00;
+    block[59] = 0x00;
+    block[60] = 0x00;
+    block[61] = 0x00;
+    block[62] = 0x01;
+    block[63] = 0x08;
+
+    sha256_compress(state, block);
+
+    for (int i = 0; i < 8; i++) {
+        digest[i * 4] = (state[i] >> 24) & 0xFF;
+        digest[i * 4 + 1] = (state[i] >> 16) & 0xFF;
+        digest[i * 4 + 2] = (state[i] >> 8) & 0xFF;
+        digest[i * 4 + 3] = (state[i]) & 0xFF;
+    }
+}
+
+/*
+ * 针对固定65字节输入（非压缩公钥）的专用SHA256，两块处理。
+ * 第一块：65字节中的前64字节
+ * 第二块：第65字节+0x80+54字节零+8字节长度
+ */
+void sha256_65(const uint8_t *data65, uint8_t *digest)
+{
+    uint32_t state[8] = {
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+    };
+    /* 第一块：直接使用前64字节 */
+    sha256_compress(state, data65);
+
+    /* 第二块：第65字节 + padding + 长度 */
+    uint8_t block2[64];
+    block2[0] = data65[64];
+    block2[1] = 0x80;
+    memset(block2 + 2, 0, 64 - 2 - 8);
+    /* 长度：65*8=520bits=0x208，大端序 */
+    block2[56] = 0x00;
+    block2[57] = 0x00;
+    block2[58] = 0x00;
+    block2[59] = 0x00;
+    block2[60] = 0x00;
+    block2[61] = 0x00;
+    block2[62] = 0x02;
+    block2[63] = 0x08;
+
+    sha256_compress(state, block2);
+
+    for (int i = 0; i < 8; i++) {
+        digest[i * 4] = (state[i] >> 24) & 0xFF;
+        digest[i * 4 + 1] = (state[i] >> 16) & 0xFF;
+        digest[i * 4 + 2] = (state[i] >> 8) & 0xFF;
+        digest[i * 4 + 3] = (state[i]) & 0xFF;
+    }
+}
+

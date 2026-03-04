@@ -24,6 +24,7 @@ void ripemd160_init(ripemd160_ctx *ctx);
 void ripemd160_update(ripemd160_ctx *ctx, const uint8_t *data, size_t len);
 void ripemd160_final(ripemd160_ctx *ctx, uint8_t *digest);
 void ripemd160(const uint8_t *data, size_t len, uint8_t *digest);
+void ripemd160_32(const uint8_t *data32, uint8_t *digest);
 
 #endif /* RIPEMD160_H */
 

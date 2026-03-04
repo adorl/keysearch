@@ -25,6 +25,8 @@ void sha256_init(sha256_ctx *ctx);
 void sha256_update(sha256_ctx *ctx, const uint8_t *data, size_t len);
 void sha256_final(sha256_ctx *ctx, uint8_t *digest);
 void sha256(const uint8_t *data, size_t len, uint8_t *digest);
+void sha256_33(const uint8_t *data33, uint8_t *digest);   /* 压缩公钥33字节 */
+void sha256_65(const uint8_t *data65, uint8_t *digest);   /* 非压缩公钥65字节 */
 
 #endif /* SHA256_H */
 
