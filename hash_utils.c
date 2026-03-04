@@ -1,9 +1,14 @@
 #include "hash_utils.h"
 #include "sha256.h"
 #include "ripemd160.h"
-#include <secp256k1.h>
 #include <string.h>
 #include <stdio.h>
+#ifndef USE_PUBKEY_API_ONLY
+#  include "secp256k1_keygen.h"
+#else
+#  include <secp256k1.h>
+#  include "secp256k1_keygen.h"
+#endif
 
 /* secp256k1上下文 */
 extern secp256k1_context *secp_ctx;
