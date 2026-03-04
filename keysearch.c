@@ -28,7 +28,7 @@
 #define MAX_ADDRESSES       (400000)        /* 最多支持的目标地址数量 */
 #define HASH_TABLE_SIZE     (65536 * 4)     /* 哈希表固定槽位数 */
 #define ADDRESS_LEN         (35)            /* 比特币地址最大长度 */
-#define BATCH_SIZE          (32 * 1024)     /* 增量推导批次大小，每批后重置随机基准私钥 */
+#define BATCH_SIZE          (2048)          /* 增量推导批次大小，每批后重置随机基准私钥 */
 
 /* ===================== 全局共享数据 ===================== */
 
@@ -99,15 +99,14 @@ static void *search_key(void *arg)
     uint8_t pubkey_uncompressed[65];    /* 非压缩公钥序列化缓冲区 */
     uint8_t hash160_compressed[20];
     uint8_t hash160_uncompressed[20];
-    secp256k1_pubkey pubkey;            /* 当前公钥（内部表示） */
-    uint8_t tweak[32][32];              /* 标量加法tweak = 1 */
+    secp256k1_pubkey pubkey;        /* 当前公钥（内部表示） */
+    uint8_t tweak[32];              /* 标量加法tweak = 1 */
     uint64_t count = 0;
     rand_key_context rand_ctx;
 
     /* 用于每步私钥+1和公钥点加G */
-    memset(tweak, 0, sizeof(tweak));
-    for (int i = 0; i < 32; i++)
-        tweak[i][31 - i] = 1;
+    memset(tweak, 0, 32);
+    tweak[31] = 1;
 
     /* 初始化真随机上下文（每线程独立fd，无锁竞争） */
     if (rand_ctx_init(&rand_ctx) != 0) {
@@ -134,7 +133,6 @@ static void *search_key(void *arg)
         for (int batch = 0; batch < BATCH_SIZE && count < MAX_ATTEMPTS; batch++) {
             size_t len_comp = 33;
             size_t len_uncomp = 65;
-            int tweak_index = batch / 1024;
 
             count++;
 
@@ -177,11 +175,11 @@ static void *search_key(void *arg)
             }
 
             /* 增量推导：私钥+1，公钥点加G */
-            if (!secp256k1_ec_seckey_tweak_add(secp_ctx, privkey, tweak[tweak_index])) {
+            if (!secp256k1_ec_seckey_tweak_add(secp_ctx, privkey, tweak)) {
                 fprintf(stderr, "警告：私钥推导失败，batch=%d！\n", batch);
                 break;
             }
-            if (!secp256k1_ec_pubkey_tweak_add(secp_ctx, &pubkey, tweak[tweak_index])) {
+            if (!secp256k1_ec_pubkey_tweak_add(secp_ctx, &pubkey, tweak)) {
                 fprintf(stderr, "警告：公钥推导失败，batch=%d！\n", batch);
                 break;
             }
