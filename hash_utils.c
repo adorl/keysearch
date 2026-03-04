@@ -3,6 +3,9 @@
 #include "ripemd160.h"
 #include <string.h>
 #include <stdio.h>
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 #ifndef USE_PUBKEY_API_ONLY
 #include "secp256k1_keygen.h"
 #else
@@ -269,4 +272,232 @@ int privkey_to_address(const uint8_t *privkey,
 
     return 0;
 }
+
+#ifdef __AVX2__
+
+/* SHA256初始状态常量 */
+static const uint32_t sha256_init_state[8] = {
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+};
+
+/* RIPEMD160初始状态常量 */
+static const uint32_t rmd160_init_state[5] = {
+    0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0
+};
+
+/*
+ * 构造SHA256 padded block（单块，消息 <= 55 字节）
+ * 消息+0x80+零填充+8字节大端消息位长
+ */
+static void make_sha256_block(const uint8_t *msg, size_t msglen, uint8_t block[64])
+{
+    memset(block, 0, 64);
+    memcpy(block, msg, msglen);
+    block[msglen] = 0x80;
+    uint64_t bitlen = (uint64_t)msglen * 8;
+    block[56] = (uint8_t)(bitlen >> 56);
+    block[57] = (uint8_t)(bitlen >> 48);
+    block[58] = (uint8_t)(bitlen >> 40);
+    block[59] = (uint8_t)(bitlen >> 32);
+    block[60] = (uint8_t)(bitlen >> 24);
+    block[61] = (uint8_t)(bitlen >> 16);
+    block[62] = (uint8_t)(bitlen >> 8);
+    block[63] = (uint8_t)(bitlen);
+}
+
+/*
+ * 构造SHA256第一个block（64字节消息块，无padding）
+ * 用于65字节消息的第一块（取前64字节）
+ */
+static void make_sha256_block_raw(const uint8_t *msg64, uint8_t block[64])
+{
+    memcpy(block, msg64, 64);
+}
+
+/*
+ * 构造SHA256第二个padded block（65字节消息的尾块）
+ * 消息剩余1字节+0x80+零填充+8字节大端消息位长(65*8=520bits)
+ */
+static void make_sha256_block2_65(const uint8_t last_byte, uint8_t block[64])
+{
+    memset(block, 0, 64);
+    block[0] = last_byte;
+    block[1] = 0x80;
+    /* 消息位长 = 65 * 8 = 520 = 0x208 */
+    uint64_t bitlen = 65ULL * 8;
+    block[56] = (uint8_t)(bitlen >> 56);
+    block[57] = (uint8_t)(bitlen >> 48);
+    block[58] = (uint8_t)(bitlen >> 40);
+    block[59] = (uint8_t)(bitlen >> 32);
+    block[60] = (uint8_t)(bitlen >> 24);
+    block[61] = (uint8_t)(bitlen >> 16);
+    block[62] = (uint8_t)(bitlen >> 8);
+    block[63] = (uint8_t)(bitlen);
+}
+
+/*
+ * 将SHA256 state[8]转为32字节大端序摘要
+ */
+static void sha256_state_to_bytes(const uint32_t state[8], uint8_t out[32])
+{
+    for (int i = 0; i < 8; i++) {
+        out[i * 4 + 0] = (uint8_t)(state[i] >> 24);
+        out[i * 4 + 1] = (uint8_t)(state[i] >> 16);
+        out[i * 4 + 2] = (uint8_t)(state[i] >> 8);
+        out[i * 4 + 3] = (uint8_t)(state[i]);
+    }
+}
+
+/*
+ * 构造RIPEMD160 padded block（单块，消息 <= 55字节）
+ * 消息+0x80+零填充+8字节小端消息位长
+ */
+static void make_rmd160_block(const uint8_t *msg, size_t msglen, uint8_t block[64])
+{
+    memset(block, 0, 64);
+    memcpy(block, msg, msglen);
+    block[msglen] = 0x80;
+    uint64_t bitlen = (uint64_t)msglen * 8;
+    block[56] = (uint8_t)(bitlen);
+    block[57] = (uint8_t)(bitlen >> 8);
+    block[58] = (uint8_t)(bitlen >> 16);
+    block[59] = (uint8_t)(bitlen >> 24);
+    block[60] = (uint8_t)(bitlen >> 32);
+    block[61] = (uint8_t)(bitlen >> 40);
+    block[62] = (uint8_t)(bitlen >> 48);
+    block[63] = (uint8_t)(bitlen >> 56);
+}
+
+/*
+ * 将RIPEMD160 state[5]转为20字节小端序摘要
+ */
+static void rmd160_state_to_bytes(const uint32_t state[5], uint8_t out[20])
+{
+    for (int i = 0; i < 5; i++) {
+        out[i * 4 + 0] = (uint8_t)(state[i]);
+        out[i * 4 + 1] = (uint8_t)(state[i] >> 8);
+        out[i * 4 + 2] = (uint8_t)(state[i] >> 16);
+        out[i * 4 + 3] = (uint8_t)(state[i] >> 24);
+    }
+}
+
+/*
+ * 8路并行计算压缩公钥（33字节）的hash160（SHA256->RIPEMD160）
+ *
+ * 压缩公钥33字节<56字节，单块SHA256即可完成
+ * SHA256输出32字节<56字节，单块RIPEMD160即可完成
+ */
+__attribute__((target("avx2")))
+void hash160_8way_compressed(const uint8_t *pubkeys[8], uint8_t hash160s[8][20])
+{
+    /* ---- 步骤1：构造8路SHA256 padded block（33字节消息） ---- */
+    uint8_t sha_blocks[8][64];
+    uint32_t sha_states[8][8];
+    uint32_t *sha_state_ptrs[8];
+    const uint8_t *sha_block_ptrs[8];
+
+    for (int i = 0; i < 8; i++) {
+        make_sha256_block(pubkeys[i], 33, sha_blocks[i]);
+        memcpy(sha_states[i], sha256_init_state, 32);
+        sha_state_ptrs[i] = sha_states[i];
+        sha_block_ptrs[i] = sha_blocks[i];
+    }
+
+    /* ---- 步骤2：8路并行SHA256压缩 ---- */
+    sha256_compress_avx2(sha_state_ptrs, sha_block_ptrs);
+
+    /* ---- 步骤3：提取8路SHA256摘要（32字节大端序） ---- */
+    uint8_t sha_digests[8][32];
+    for (int i = 0; i < 8; i++) {
+        sha256_state_to_bytes(sha_states[i], sha_digests[i]);
+    }
+
+    /* ---- 步骤4：构造8路RIPEMD160 padded block（32字节消息） ---- */
+    uint8_t rmd_blocks[8][64];
+    uint32_t rmd_states[8][5];
+    uint32_t *rmd_state_ptrs[8];
+    const uint8_t *rmd_block_ptrs[8];
+
+    for (int i = 0; i < 8; i++) {
+        make_rmd160_block(sha_digests[i], 32, rmd_blocks[i]);
+        memcpy(rmd_states[i], rmd160_init_state, 20);
+        rmd_state_ptrs[i] = rmd_states[i];
+        rmd_block_ptrs[i] = rmd_blocks[i];
+    }
+
+    /* ---- 步骤5：8路并行RIPEMD160压缩 ---- */
+    ripemd160_compress_avx2(rmd_state_ptrs, rmd_block_ptrs);
+
+    /* ---- 步骤6：提取8路RIPEMD160摘要（20字节小端序） ---- */
+    for (int i = 0; i < 8; i++) {
+        rmd160_state_to_bytes(rmd_states[i], hash160s[i]);
+    }
+}
+
+/*
+ * 8路并行计算非压缩公钥（65字节）的hash160（SHA256 -> RIPEMD160）
+ *
+ * 非压缩公钥65字节需要2个SHA256 block：
+ *   block1：前64字节（原始数据，无 padding）
+ *   block2：第65字节+0x80+零填充+8字节大端位长(520bits)
+ */
+__attribute__((target("avx2")))
+void hash160_8way_uncompressed(const uint8_t *pubkeys[8], uint8_t hash160s[8][20])
+{
+    /* ---- 步骤1：构造8路SHA256第一个block（前64字节） ---- */
+    uint8_t sha_blocks1[8][64];
+    uint32_t sha_states[8][8];
+    uint32_t *sha_state_ptrs[8];
+    const uint8_t *sha_block_ptrs[8];
+
+    for (int i = 0; i < 8; i++) {
+        make_sha256_block_raw(pubkeys[i], sha_blocks1[i]);
+        memcpy(sha_states[i], sha256_init_state, 32);
+        sha_state_ptrs[i] = sha_states[i];
+        sha_block_ptrs[i] = sha_blocks1[i];
+    }
+
+    /* ---- 步骤2：8路并行SHA256第一次压缩 ---- */
+    sha256_compress_avx2(sha_state_ptrs, sha_block_ptrs);
+
+    /* ---- 步骤3：构造8路SHA256第二个padded block（第65字节 + padding） ---- */
+    uint8_t sha_blocks2[8][64];
+    for (int i = 0; i < 8; i++) {
+        make_sha256_block2_65(pubkeys[i][64], sha_blocks2[i]);
+        sha_block_ptrs[i] = sha_blocks2[i];
+    }
+
+    /* ---- 步骤4：8路并行SHA256第二次压缩（state已更新，继续累加） ---- */
+    sha256_compress_avx2(sha_state_ptrs, sha_block_ptrs);
+
+    /* ---- 步骤5：提取8路SHA256摘要（32字节大端序） ---- */
+    uint8_t sha_digests[8][32];
+    for (int i = 0; i < 8; i++) {
+        sha256_state_to_bytes(sha_states[i], sha_digests[i]);
+    }
+
+    /* ---- 步骤6：构造8路RIPEMD160 padded block（32字节消息） ---- */
+    uint8_t rmd_blocks[8][64];
+    uint32_t rmd_states[8][5];
+    uint32_t *rmd_state_ptrs[8];
+    const uint8_t *rmd_block_ptrs[8];
+
+    for (int i = 0; i < 8; i++) {
+        make_rmd160_block(sha_digests[i], 32, rmd_blocks[i]);
+        memcpy(rmd_states[i], rmd160_init_state, 20);
+        rmd_state_ptrs[i] = rmd_states[i];
+        rmd_block_ptrs[i] = rmd_blocks[i];
+    }
+
+    /* ---- 步骤7：8路并行RIPEMD160压缩 ---- */
+    ripemd160_compress_avx2(rmd_state_ptrs, rmd_block_ptrs);
+
+    /* ---- 步骤8：提取8路RIPEMD160摘要（20字节小端序） ---- */
+    for (int i = 0; i < 8; i++) {
+        rmd160_state_to_bytes(rmd_states[i], hash160s[i]);
+    }
+}
+
+#endif /* __AVX2__ */
 

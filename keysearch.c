@@ -169,6 +169,87 @@ static void *search_key(void *arg)
         keygen_batch_normalize(gej_batch, ge_batch, (size_t)batch_valid);
 
         /* 遍历仿射坐标数组，计算hash160并查表 */
+#ifdef __AVX2__
+        /* AVX2路径：以8为步长批量处理 */
+        for (int b = 0; b < batch_valid; b += 8) {
+            /* 计算本组实际有效lane数（不足8时用最后一个有效点填充） */
+            int valid_count = batch_valid - b;
+            if (valid_count > 8)
+                valid_count = 8;
+
+            /* 构造8组公钥字节（不足部分用最后一个有效点填充） */
+            uint8_t comp_bufs[8][33];
+            uint8_t uncomp_bufs[8][65];
+            const uint8_t *comp_ptrs[8];
+            const uint8_t *uncomp_ptrs[8];
+
+            for (int lane = 0; lane < 8; lane++) {
+                int idx = b + (lane < valid_count ? lane : valid_count - 1);
+                if (ge_batch[idx].infinity) {
+                    /* 无穷远点：填充全零（不会命中哈希表） */
+                    memset(comp_bufs[lane], 0, 33);
+                    memset(uncomp_bufs[lane], 0, 65);
+                }
+                else {
+                    keygen_ge_to_pubkey_bytes(&ge_batch[idx], comp_bufs[lane], uncomp_bufs[lane]);
+                }
+                comp_ptrs[lane] = comp_bufs[lane];
+                uncomp_ptrs[lane] = uncomp_bufs[lane];
+            }
+
+            /* 8路并行计算hash160 */
+            uint8_t hash160_comp_8[8][20];
+            uint8_t hash160_uncomp_8[8][20];
+            hash160_8way_compressed(comp_ptrs, hash160_comp_8);
+            hash160_8way_uncompressed(uncomp_ptrs, hash160_uncomp_8);
+
+            /* 逐lane查表（仅处理有效lane） */
+            for (int lane = 0; lane < valid_count; lane++) {
+                int b_idx = b + lane;
+                count++;
+
+                if (ge_batch[b_idx].infinity) {
+                    continue;
+                }
+
+                /* 哈希表查找 */
+                if (ht_contains(hash160_comp_8[lane]) || ht_contains(hash160_uncomp_8[lane])) {
+                    found_flag = 1;
+                    /* 命中时重建私钥 */
+                    memcpy(privkey, base_privkey, 32);
+                    for (int i = 0; i < b_idx; i++) {
+                        if (!secp256k1_ec_seckey_tweak_add(secp_ctx, privkey, tweak)) {
+                            fprintf(stderr, "警告：私钥推导失败，batch=%d, 结果错误！\n", b_idx);
+                        }
+                    }
+                    char privkey_hex[65];
+                    char address_compressed[ADDRESS_LEN + 1];
+                    char address_uncompressed[ADDRESS_LEN + 1];
+                    bytes_to_hex(privkey, 32, privkey_hex);
+                    fprintf(stdout, "\n[线程-%d] 找到匹配！总尝试次数: %lu\n", thread_id, count);
+                    fprintf(stdout, "私钥(hex): %s\n", privkey_hex);
+                    if (privkey_to_address(privkey, address_compressed, address_uncompressed) == 0) {
+                        fprintf(stdout, "压缩地址: %s\n", address_compressed);
+                        fprintf(stdout, "非压缩地址: %s\n", address_uncompressed);
+                    }
+                    fflush(stdout);
+                }
+
+                /* 性能监控 */
+                if (--progress_counter == 0) {
+                    progress_counter = PROGRESS_INTERVAL;
+                    clock_gettime(CLOCK_MONOTONIC, &ts_now);
+                    double elapsed = (ts_now.tv_sec - ts_last.tv_sec) + (ts_now.tv_nsec - ts_last.tv_nsec) * 1e-9;
+                    double kps = (elapsed > 0) ? (double)(count - count_last) / elapsed : 0.0;
+                    fprintf(stdout, "[线程-%d] 已尝试: %lu 速度: %.0f keys/s\n", thread_id, count, kps);
+                    fflush(stdout);
+                    ts_last = ts_now;
+                    count_last = count;
+                }
+            }
+        }
+#else
+        /* 标量路径（非 AVX2 平台） */
         for (int b = 0; b < batch_valid; b++) {
             count++;
 
@@ -220,6 +301,7 @@ static void *search_key(void *arg)
                 count_last = count;
             }
         }
+#endif /* __AVX2__ */
     }
 #else
     secp256k1_pubkey pubkey;

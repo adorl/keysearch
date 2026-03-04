@@ -52,5 +52,21 @@ int privkey_to_address(const uint8_t *privkey,
                        char *compressed_out,
                        char *uncompressed_out);
 
+#ifdef __AVX2__
+/*
+ * 8路并行计算压缩公钥（33字节）的hash160（SHA256->RIPEMD160）
+ * pubkeys[8]    : 8个压缩公钥字节指针（每个33字节）
+ * hash160s[8]   : 8个输出缓冲区（每个20字节）
+ */
+void hash160_8way_compressed(const uint8_t *pubkeys[8], uint8_t hash160s[8][20]);
+
+/*
+ * 8路并行计算非压缩公钥（65字节）的hash160（SHA256->RIPEMD160）
+ * pubkeys[8]    : 8个非压缩公钥字节指针（每个65字节）
+ * hash160s[8]   : 8个输出缓冲区（每个20字节）
+ */
+void hash160_8way_uncompressed(const uint8_t *pubkeys[8], uint8_t hash160s[8][20]);
+#endif /* __AVX2__ */
+
 #endif /* HASH_UTILS_H */
 

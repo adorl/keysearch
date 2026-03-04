@@ -17,9 +17,17 @@ else
     SECP256K1_OBJ = secp256k1_lib.o precomputed_ecmult.o precomputed_ecmult_gen.o
 endif
 
+# 检测 CPU 架构：只在 x86-64 上编译 AVX2 文件
+ARCH := $(shell uname -m)
+ifeq ($(ARCH),x86_64)
+    SIMD_SRCS = sha256_avx2.c ripemd160_avx2.c
+else
+    SIMD_SRCS =
+endif
+
 # 源文件列表
-SRCS_MAIN = keysearch.c hash_utils.c sha256.c ripemd160.c rand_key.c secp256k1_keygen.c
-SRCS_TEST = test_case.c hash_utils.c sha256.c ripemd160.c rand_key.c secp256k1_keygen.c
+SRCS_MAIN = keysearch.c hash_utils.c sha256.c ripemd160.c $(SIMD_SRCS) rand_key.c secp256k1_keygen.c
+SRCS_TEST = test_case.c hash_utils.c sha256.c ripemd160.c $(SIMD_SRCS) rand_key.c secp256k1_keygen.c
 
 OBJS_MAIN = $(SRCS_MAIN:.c=.o) $(SECP256K1_OBJ)
 OBJS_TEST = $(SRCS_TEST:.c=.o) $(SECP256K1_OBJ)
@@ -49,6 +57,15 @@ precomputed_ecmult_gen.o: $(SECP256K1_SRC)/src/precomputed_ecmult_gen.c
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+# AVX2专用文件：使用-mavx2编译（仅x86-64平台）
+ifeq ($(ARCH),x86_64)
+sha256_avx2.o: sha256_avx2.c
+	$(CC) $(CFLAGS) -mavx2 -c -o $@ $<
+
+ripemd160_avx2.o: ripemd160_avx2.c
+	$(CC) $(CFLAGS) -mavx2 -c -o $@ $<
+endif
 
 test: test_case
 	./test_case
