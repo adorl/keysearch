@@ -2298,6 +2298,491 @@ static void test_keygen_internal(void) {
     }
 }
 
+/* ------------------------------------------------------------------
+ * test_search_key_privkey_pubkey
+ *
+ * 专项测试：模拟 search_key 中的私钥迭代与公钥推导流程，
+ * 验证内部路径（scalar 累加 + gej_add_ge_var + batch_normalize_rzr）
+ * 与标准 API（secp256k1_ec_pubkey_create + serialize）结果完全一致。
+ *
+ * 覆盖场景：
+ *   6.1  单批次首尾两端（b=0 和 b=BATCH_SIZE-1）私钥→公钥一致性
+ *   6.2  rzr 路径 batch_normalize_rzr 与 batch_normalize 结果一致
+ *   6.3  命中重建逻辑：hit_scalar = base + b_idx * tweak 对应公钥
+ *        与 ge_batch[b_idx] 一致（验证 b_idx=0/中间/末尾三个位置）
+ *   6.4  完整批次（BATCH_SIZE=4096）每点公钥与标准 API 一致
+ *   6.5  scalar 溢出边界：base 接近曲线阶 n，验证溢出检测正确
+ *   6.6  非压缩公钥路径：ge_batch 的非压缩字节与标准 API 一致
+ * ------------------------------------------------------------------ */
+static void test_search_key_privkey_pubkey(void) {
+    printf("\n=== search_key 私钥迭代与公钥推导一致性测试 ===\n");
+
+    /* tweak_scalar = 1（与 search_key 中一致） */
+    secp256k1_scalar tweak_scalar;
+    secp256k1_scalar_set_int(&tweak_scalar, 1);
+
+    /* 公开 API 用的 tweak 字节（值为 1） */
+    uint8_t tweak_bytes[32] = {0};
+    tweak_bytes[31] = 1;
+
+    /* ------------------------------------------------------------------ */
+    /* 6.1  单批次首尾两端（b=0 和 b=BATCH_SIZE-1）私钥→公钥一致性
+     *
+     *   模拟 search_key 外层循环：
+     *     base_privkey_scalar = k（随机基准，此处取 k=7 便于验证）
+     *     cur_privkey_scalar  = base_privkey_scalar
+     *     gej_batch[0]        = keygen_privkey_to_gej(base)
+     *     gej_batch[b]        = gej_batch[b-1] + G
+     *
+     *   验证：
+     *     ge_batch[0]  对应私钥 base+0 的公钥
+     *     ge_batch[N-1] 对应私钥 base+(N-1) 的公钥
+     * ------------------------------------------------------------------ */
+    {
+        const int N = 16;  /* 小批次，快速验证首尾 */
+        uint8_t base_privkey[32] = {0};
+        base_privkey[31] = 7;  /* base = 7 */
+
+        secp256k1_scalar base_scalar, cur_scalar;
+        int overflow = 0;
+        secp256k1_scalar_set_b32(&base_scalar, base_privkey, &overflow);
+
+        /* 构造 gej_batch 和 rzr_batch（模拟 search_key 内层循环） */
+        secp256k1_gej gej_batch[16];
+        secp256k1_ge  ge_batch[16];
+        secp256k1_fe  rzr_batch[16];
+
+        secp256k1_gej cur_gej;
+        keygen_privkey_to_gej(secp_ctx, base_privkey, &cur_gej);
+        cur_scalar = base_scalar;
+
+        for (int b = 0; b < N; b++) {
+            gej_batch[b] = cur_gej;
+            if (b < N - 1) {
+                secp256k1_scalar_add(&cur_scalar, &cur_scalar, &tweak_scalar);
+                secp256k1_gej next_gej;
+                secp256k1_gej_add_ge_var(&next_gej, &cur_gej, &G_affine, &rzr_batch[b]);
+                cur_gej = next_gej;
+            }
+        }
+
+        /* 批量归一化（rzr 路径） */
+        keygen_batch_normalize_rzr(gej_batch, ge_batch, rzr_batch, (size_t)N);
+
+        /* 验证 b=0：ge_batch[0] 对应私钥 base+0=7 */
+        {
+            uint8_t keygen_comp[33], api_comp[33];
+            keygen_ge_to_pubkey_bytes(&ge_batch[0], keygen_comp, NULL);
+
+            secp256k1_pubkey pubkey;
+            secp256k1_ec_pubkey_create(secp_ctx, &pubkey, base_privkey);
+            size_t len = 33;
+            secp256k1_ec_pubkey_serialize(secp_ctx, api_comp, &len, &pubkey,
+                                          SECP256K1_EC_COMPRESSED);
+            char api_hex[67];
+            bytes_to_hex_helper(api_comp, 33, api_hex);
+            check("6.1a 批次首端 b=0：ge_batch[0] 与标准 API（base=7）一致",
+                  api_hex, keygen_comp, 33);
+        }
+
+        /* 验证 b=N-1：ge_batch[N-1] 对应私钥 base+(N-1)=7+15=22 */
+        {
+            uint8_t privkey_end[32] = {0};
+            privkey_end[31] = 7 + (N - 1);  /* = 22 */
+
+            uint8_t keygen_comp[33], api_comp[33];
+            keygen_ge_to_pubkey_bytes(&ge_batch[N - 1], keygen_comp, NULL);
+
+            secp256k1_pubkey pubkey;
+            secp256k1_ec_pubkey_create(secp_ctx, &pubkey, privkey_end);
+            size_t len = 33;
+            secp256k1_ec_pubkey_serialize(secp_ctx, api_comp, &len, &pubkey,
+                                          SECP256K1_EC_COMPRESSED);
+            char api_hex[67];
+            bytes_to_hex_helper(api_comp, 33, api_hex);
+            check("6.1b 批次末端 b=N-1：ge_batch[N-1] 与标准 API（base+15=22）一致",
+                  api_hex, keygen_comp, 33);
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 6.2  rzr 路径 batch_normalize_rzr 与 batch_normalize 结果一致
+     *
+     *   对同一组 gej_batch，分别用两种归一化方式，
+     *   验证每个点的压缩公钥字节完全相同。
+     * ------------------------------------------------------------------ */
+    {
+        printf("  [rzr 路径 vs 标准路径 batch_normalize 一致性，N=32]\n");
+        const int N = 32;
+        uint8_t base_privkey[32] = {0};
+        base_privkey[31] = 100;  /* base = 100 */
+
+        secp256k1_gej gej_batch[32];
+        secp256k1_ge  ge_rzr[32], ge_std[32];
+        secp256k1_fe  rzr_batch[32];
+
+        secp256k1_gej cur_gej;
+        keygen_privkey_to_gej(secp_ctx, base_privkey, &cur_gej);
+
+        for (int b = 0; b < N; b++) {
+            gej_batch[b] = cur_gej;
+            if (b < N - 1) {
+                secp256k1_gej next_gej;
+                secp256k1_gej_add_ge_var(&next_gej, &cur_gej, &G_affine, &rzr_batch[b]);
+                cur_gej = next_gej;
+            }
+        }
+
+        /* 两种归一化 */
+        keygen_batch_normalize_rzr(gej_batch, ge_rzr, rzr_batch, (size_t)N);
+        keygen_batch_normalize(gej_batch, ge_std, (size_t)N);
+
+        int all_pass = 1;
+        for (int b = 0; b < N; b++) {
+            uint8_t comp_rzr[33], comp_std[33];
+            keygen_ge_to_pubkey_bytes(&ge_rzr[b], comp_rzr, NULL);
+            keygen_ge_to_pubkey_bytes(&ge_std[b], comp_std, NULL);
+            if (memcmp(comp_rzr, comp_std, 33) != 0) {
+                char rzr_hex[67], std_hex[67];
+                bytes_to_hex_helper(comp_rzr, 33, rzr_hex);
+                bytes_to_hex_helper(comp_std, 33, std_hex);
+                printf("  [FAIL] 6.2 b=%d: rzr=%s std=%s\n", b, rzr_hex, std_hex);
+                all_pass = 0;
+                fail_count++;
+            }
+        }
+        if (all_pass) {
+            printf("  [PASS] 6.2 rzr 路径与标准路径 batch_normalize 结果完全一致（N=32）\n");
+            pass_count++;
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 6.3  命中重建逻辑验证
+     *
+     *   模拟 search_key 命中时的私钥重建：
+     *     hit_scalar = base_privkey_scalar
+     *     for i in range(b_idx): hit_scalar += tweak_scalar
+     *     hit_privkey = scalar_get_b32(hit_scalar)
+     *
+     *   验证三个位置（b_idx=0, 中间, 末尾）：
+     *     重建私钥对应的公钥 == ge_batch[b_idx] 的公钥字节
+     * ------------------------------------------------------------------ */
+    {
+        const int N = 64;
+        uint8_t base_privkey[32] = {0};
+        base_privkey[31] = 50;  /* base = 50 */
+
+        secp256k1_scalar base_scalar;
+        int overflow = 0;
+        secp256k1_scalar_set_b32(&base_scalar, base_privkey, &overflow);
+
+        secp256k1_gej gej_batch[64];
+        secp256k1_ge  ge_batch[64];
+        secp256k1_fe  rzr_batch[64];
+
+        secp256k1_gej cur_gej;
+        keygen_privkey_to_gej(secp_ctx, base_privkey, &cur_gej);
+
+        for (int b = 0; b < N; b++) {
+            gej_batch[b] = cur_gej;
+            if (b < N - 1) {
+                secp256k1_gej next_gej;
+                secp256k1_gej_add_ge_var(&next_gej, &cur_gej, &G_affine, &rzr_batch[b]);
+                cur_gej = next_gej;
+            }
+        }
+        keygen_batch_normalize_rzr(gej_batch, ge_batch, rzr_batch, (size_t)N);
+
+        /* 测试三个命中位置 */
+        int test_positions[] = {0, N / 2, N - 1};
+        const char *pos_names[] = {"b_idx=0（首端）", "b_idx=N/2（中间）", "b_idx=N-1（末端）"};
+        int all_pass = 1;
+
+        for (int t = 0; t < 3; t++) {
+            int b_idx = test_positions[t];
+
+            /* 模拟命中重建：hit_scalar = base + b_idx * tweak */
+            secp256k1_scalar hit_scalar = base_scalar;
+            for (int i = 0; i < b_idx; i++) {
+                secp256k1_scalar_add(&hit_scalar, &hit_scalar, &tweak_scalar);
+            }
+            uint8_t hit_privkey[32];
+            secp256k1_scalar_get_b32(hit_privkey, &hit_scalar);
+
+            /* 重建私钥对应的公钥（标准 API） */
+            uint8_t api_comp[33];
+            secp256k1_pubkey pubkey;
+            secp256k1_ec_pubkey_create(secp_ctx, &pubkey, hit_privkey);
+            size_t len = 33;
+            secp256k1_ec_pubkey_serialize(secp_ctx, api_comp, &len, &pubkey,
+                                          SECP256K1_EC_COMPRESSED);
+
+            /* ge_batch[b_idx] 的公钥字节 */
+            uint8_t batch_comp[33];
+            keygen_ge_to_pubkey_bytes(&ge_batch[b_idx], batch_comp, NULL);
+
+            if (memcmp(api_comp, batch_comp, 33) != 0) {
+                char api_hex[67], batch_hex[67];
+                bytes_to_hex_helper(api_comp,   33, api_hex);
+                bytes_to_hex_helper(batch_comp, 33, batch_hex);
+                printf("  [FAIL] 6.3 命中重建 %s:\n"
+                       "         重建私钥公钥: %s\n"
+                       "         ge_batch公钥: %s\n",
+                       pos_names[t], api_hex, batch_hex);
+                all_pass = 0;
+                fail_count++;
+            }
+        }
+        if (all_pass) {
+            printf("  [PASS] 6.3 命中重建逻辑：三个位置（首/中/末）私钥重建公钥与 ge_batch 一致\n");
+            pass_count++;
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 6.4  完整批次（BATCH_SIZE=4096）每点公钥与标准 API 一致
+     *
+     *   模拟 search_key 完整内层循环，验证所有 4096 个点的公钥正确性。
+     *   采样验证策略：验证首点、末点、以及每 256 点采样一次（共 18 点）。
+     * ------------------------------------------------------------------ */
+    {
+        printf("  [完整批次 BATCH_SIZE=4096 采样验证]\n");
+        const int N = 4096;
+
+        secp256k1_gej *gej_batch = (secp256k1_gej *)malloc(N * sizeof(secp256k1_gej));
+        secp256k1_ge  *ge_batch  = (secp256k1_ge  *)malloc(N * sizeof(secp256k1_ge));
+        secp256k1_fe  *rzr_batch = (secp256k1_fe  *)malloc(N * sizeof(secp256k1_fe));
+
+        if (!gej_batch || !ge_batch || !rzr_batch) {
+            printf("  [SKIP] 6.4 内存分配失败，跳过\n");
+            free(gej_batch); free(ge_batch); free(rzr_batch);
+        } else {
+            /* base = 0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20 */
+            uint8_t base_privkey[32];
+            for (int i = 0; i < 32; i++) base_privkey[i] = (uint8_t)(i + 1);
+
+            secp256k1_scalar base_scalar, cur_scalar;
+            int overflow = 0;
+            secp256k1_scalar_set_b32(&base_scalar, base_privkey, &overflow);
+            cur_scalar = base_scalar;
+
+            secp256k1_gej cur_gej;
+            keygen_privkey_to_gej(secp_ctx, base_privkey, &cur_gej);
+
+            /* 构造完整批次（模拟 search_key 内层循环） */
+            for (int b = 0; b < N; b++) {
+                gej_batch[b] = cur_gej;
+                if (b < N - 1) {
+                    secp256k1_scalar_add(&cur_scalar, &cur_scalar, &tweak_scalar);
+                    secp256k1_gej next_gej;
+                    secp256k1_gej_add_ge_var(&next_gej, &cur_gej, &G_affine, &rzr_batch[b]);
+                    cur_gej = next_gej;
+                }
+            }
+
+            /* rzr 路径批量归一化 */
+            keygen_batch_normalize_rzr(gej_batch, ge_batch, rzr_batch, (size_t)N);
+
+            /* 采样验证：首点、末点、每 256 点一次 */
+            int all_pass = 1;
+            uint8_t cur_privkey[32];
+            memcpy(cur_privkey, base_privkey, 32);
+
+            for (int b = 0; b < N; b++) {
+                /* 仅验证采样点 */
+                int do_check = (b == 0) || (b == N - 1) || (b % 256 == 0);
+                if (!do_check) {
+                    /* 非采样点只推进私钥 */
+                    secp256k1_ec_seckey_tweak_add(secp_ctx, cur_privkey, tweak_bytes);
+                    continue;
+                }
+
+                uint8_t batch_comp[33], api_comp[33];
+                keygen_ge_to_pubkey_bytes(&ge_batch[b], batch_comp, NULL);
+
+                secp256k1_pubkey pubkey;
+                secp256k1_ec_pubkey_create(secp_ctx, &pubkey, cur_privkey);
+                size_t len = 33;
+                secp256k1_ec_pubkey_serialize(secp_ctx, api_comp, &len, &pubkey,
+                                              SECP256K1_EC_COMPRESSED);
+
+                if (memcmp(batch_comp, api_comp, 33) != 0) {
+                    char bh[67], ah[67];
+                    bytes_to_hex_helper(batch_comp, 33, bh);
+                    bytes_to_hex_helper(api_comp,   33, ah);
+                    printf("  [FAIL] 6.4 b=%d: batch=%s api=%s\n", b, bh, ah);
+                    all_pass = 0;
+                    fail_count++;
+                    break;
+                }
+
+                if (b < N - 1)
+                    secp256k1_ec_seckey_tweak_add(secp_ctx, cur_privkey, tweak_bytes);
+            }
+            if (all_pass) {
+                printf("  [PASS] 6.4 完整批次 4096 点采样验证（首/末/每256点）全部与标准 API 一致\n");
+                pass_count++;
+            }
+
+            free(gej_batch); free(ge_batch); free(rzr_batch);
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 6.5  scalar 溢出边界检测
+     *
+     *   secp256k1 曲线阶 n（32字节大端）：
+     *     FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+     *
+     *   测试场景：
+     *     a) base = n-1（最大有效私钥），验证 keygen_privkey_to_gej 成功
+     *     b) base = n（等于阶），验证 scalar_set_b32 返回 overflow=1
+     *     c) base = n-2，连续 +1 两步后 scalar 应归零（overflow），
+     *        验证 search_key 中的 inner_overflow 检测逻辑
+     * ------------------------------------------------------------------ */
+    {
+        /* secp256k1 曲线阶 n */
+        static const uint8_t curve_n[32] = {
+            0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+            0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFE,
+            0xBA,0xAE,0xDC,0xE6,0xAF,0x48,0xA0,0x3B,
+            0xBF,0xD2,0x5E,0x8C,0xD0,0x36,0x41,0x41
+        };
+
+        /* 6.5a：base = n-1，keygen_privkey_to_gej 应成功 */
+        {
+            uint8_t privkey_nm1[32];
+            memcpy(privkey_nm1, curve_n, 32);
+            /* n-1：最低字节 -1 */
+            privkey_nm1[31] -= 1;
+
+            secp256k1_gej gej;
+            int ret = keygen_privkey_to_gej(secp_ctx, privkey_nm1, &gej);
+            if (ret == 0) {
+                printf("  [PASS] 6.5a base=n-1：keygen_privkey_to_gej 成功（有效私钥）\n");
+                pass_count++;
+            } else {
+                printf("  [FAIL] 6.5a base=n-1：keygen_privkey_to_gej 意外失败\n");
+                fail_count++;
+            }
+        }
+
+        /* 6.5b：base = n，scalar_set_b32 应返回 overflow=1 */
+        {
+            secp256k1_scalar s;
+            int overflow = 0;
+            secp256k1_scalar_set_b32(&s, curve_n, &overflow);
+            if (overflow) {
+                printf("  [PASS] 6.5b base=n：scalar_set_b32 正确检测 overflow\n");
+                pass_count++;
+            } else {
+                printf("  [FAIL] 6.5b base=n：scalar_set_b32 未检测到 overflow\n");
+                fail_count++;
+            }
+        }
+
+        /* 6.5c：base = n-2，连续 +1 两步后 scalar 应归零
+         *   第1步：n-2 + 1 = n-1（非零，正常）
+         *   第2步：n-1 + 1 = n ≡ 0 (mod n)，scalar_is_zero 应为真
+         *   这对应 search_key 中 inner_overflow 检测的触发条件
+         */
+        {
+            uint8_t privkey_nm2[32];
+            memcpy(privkey_nm2, curve_n, 32);
+            privkey_nm2[31] -= 2;  /* n-2 */
+
+            secp256k1_scalar s;
+            int overflow = 0;
+            secp256k1_scalar_set_b32(&s, privkey_nm2, &overflow);
+
+            /* 第1步：+1，应非零 */
+            secp256k1_scalar_add(&s, &s, &tweak_scalar);
+            int step1_zero = secp256k1_scalar_is_zero(&s);
+
+            /* 第2步：+1，应归零 */
+            secp256k1_scalar_add(&s, &s, &tweak_scalar);
+            int step2_zero = secp256k1_scalar_is_zero(&s);
+
+            if (!overflow && !step1_zero && step2_zero) {
+                printf("  [PASS] 6.5c base=n-2：两步后 scalar 归零，inner_overflow 检测逻辑正确\n");
+                pass_count++;
+            } else {
+                printf("  [FAIL] 6.5c base=n-2：overflow=%d step1_zero=%d step2_zero=%d（期望 0,0,1）\n",
+                       overflow, step1_zero, step2_zero);
+                fail_count++;
+            }
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 6.6  非压缩公钥路径：ge_batch 的非压缩字节与标准 API 一致
+     *
+     *   验证 keygen_ge_to_pubkey_bytes 的非压缩输出（65字节）
+     *   与 secp256k1_ec_pubkey_serialize(UNCOMPRESSED) 完全一致。
+     *   测试 b=0, b=7, b=15 三个位置。
+     * ------------------------------------------------------------------ */
+    {
+        const int N = 16;
+        uint8_t base_privkey[32] = {0};
+        base_privkey[31] = 200;  /* base = 200 */
+
+        secp256k1_gej gej_batch[16];
+        secp256k1_ge  ge_batch[16];
+        secp256k1_fe  rzr_batch[16];
+
+        secp256k1_gej cur_gej;
+        keygen_privkey_to_gej(secp_ctx, base_privkey, &cur_gej);
+
+        for (int b = 0; b < N; b++) {
+            gej_batch[b] = cur_gej;
+            if (b < N - 1) {
+                secp256k1_gej next_gej;
+                secp256k1_gej_add_ge_var(&next_gej, &cur_gej, &G_affine, &rzr_batch[b]);
+                cur_gej = next_gej;
+            }
+        }
+        keygen_batch_normalize_rzr(gej_batch, ge_batch, rzr_batch, (size_t)N);
+
+        int test_positions[] = {0, 7, 15};
+        const char *pos_names[] = {"b=0", "b=7", "b=15"};
+        int all_pass = 1;
+
+        for (int t = 0; t < 3; t++) {
+            int b = test_positions[t];
+
+            /* keygen 路径非压缩公钥 */
+            uint8_t keygen_uncomp[65];
+            keygen_ge_to_pubkey_bytes(&ge_batch[b], NULL, keygen_uncomp);
+
+            /* 标准 API 非压缩公钥（私钥 = base + b） */
+            uint8_t privkey_b[32] = {0};
+            privkey_b[31] = (uint8_t)(200 + b);
+            secp256k1_pubkey pubkey;
+            secp256k1_ec_pubkey_create(secp_ctx, &pubkey, privkey_b);
+            uint8_t api_uncomp[65];
+            size_t len = 65;
+            secp256k1_ec_pubkey_serialize(secp_ctx, api_uncomp, &len, &pubkey,
+                                          SECP256K1_EC_UNCOMPRESSED);
+
+            if (memcmp(keygen_uncomp, api_uncomp, 65) != 0) {
+                char kh[131], ah[131];
+                bytes_to_hex_helper(keygen_uncomp, 65, kh);
+                bytes_to_hex_helper(api_uncomp,    65, ah);
+                printf("  [FAIL] 6.6 非压缩公钥 %s:\n"
+                       "         keygen: %s\n"
+                       "         api:    %s\n",
+                       pos_names[t], kh, ah);
+                all_pass = 0;
+                fail_count++;
+            }
+        }
+        if (all_pass) {
+            printf("  [PASS] 6.6 非压缩公钥路径（b=0/7/15）与标准 API 完全一致\n");
+            pass_count++;
+        }
+    }
+}
 #endif /* USE_PUBKEY_API_ONLY */
 
 /* ===================== main ===================== */
@@ -2321,24 +2806,28 @@ int main(void) {
     test_avx2_compress();
     test_hash160_8way();
 #endif
+#ifdef __AVX512F__
     if (__builtin_cpu_supports("avx512f")) {
         test_avx512_compress();
         test_hash160_16way();
     }
+#endif
     test_ht_openaddr();
 #ifdef __AVX2__
     test_ht_contains_8way_func();
 #endif
+#ifdef __AVX512F__
     if (__builtin_cpu_supports("avx512f")) {
         test_ht_contains_16way_func();
     }
-    test_specialized_interfaces();
+#endif    test_specialized_interfaces();
 #ifndef USE_PUBKEY_API_ONLY
-    /* 初始化全局生成元 G（供 test_keygen_internal 使用） */
+    /* 初始化全局生成元 G（供 test_keygen_internal / test_search_key_privkey_pubkey 使用） */
     if (keygen_init_generator(secp_ctx, &G_affine) != 0) {
         fprintf(stderr, "错误：keygen_init_generator 失败，跳过内部接口测试\n");
     } else {
         test_keygen_internal();
+        test_search_key_privkey_pubkey();
     }
 #endif
 

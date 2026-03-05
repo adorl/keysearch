@@ -76,6 +76,21 @@ void keygen_batch_normalize(const secp256k1_gej *gej_in,
                             size_t n);
 
 /*
+ * 利用rzr增量因子加速的批量归一化（省去前向累积对gej.z的内存读取）
+ * rzr[i] 满足：Z[i+1] = Z[i] * rzr[i]（由secp256k1_gej_add_ge_var的rzr参数提供）
+ * 要求：所有点均非infinity（内层循环保证），rzr数组大小为n-1
+ * 参数：
+ *   gej_in  : 输入Jacobian坐标数组（大小n）
+ *   ge_out  : 输出仿射坐标数组（调用方分配，大小>=n）
+ *   rzr     : Z坐标增量因子数组（大小n-1，rzr[i]对应gej_in[i]→gej_in[i+1]的Z增量）
+ *   n       : 数组元素个数
+ */
+void keygen_batch_normalize_rzr(const secp256k1_gej *gej_in,
+                                secp256k1_ge *ge_out,
+                                const secp256k1_fe *rzr,
+                                size_t n);
+
+/*
  * 从仿射坐标直接构造压缩/非压缩公钥字节，跳过serialize调用
  * 调用前必须确保ge->infinity == 0
  * 参数：

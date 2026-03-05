@@ -91,6 +91,7 @@ static void *search_key(void *arg)
 #ifndef USE_PUBKEY_API_ONLY
     secp256k1_gej gej_batch[BATCH_SIZE];    /* Jacobian坐标批次缓冲区 */
     secp256k1_ge ge_batch[BATCH_SIZE];      /* 仿射坐标批次缓冲区 */
+    secp256k1_fe rzr_batch[BATCH_SIZE];     /* Z坐标增量因子：Z[i+1] = Z[i] * rzr[i] */
     uint8_t pubkey_compressed[33];
     uint8_t pubkey_uncompressed[65];
 
@@ -136,16 +137,16 @@ static void *search_key(void *arg)
                 inner_overflow = 1;
                 break;
             }
-            /* 使用变量时间点加法*/
-            secp256k1_gej_add_ge_var(&next_gej, &cur_gej, &G_affine, NULL);
+            /* 使用变量时间点加法，同时收集Z坐标增量因子rzr[b]，用于加速batch_normalize */
+            secp256k1_gej_add_ge_var(&next_gej, &cur_gej, &G_affine, &rzr_batch[b]);
             cur_gej = next_gej;
         }
 
         if (inner_overflow)
             continue;
 
-        /* 批量归一化：1次模逆替代batch_valid次模逆 */
-        keygen_batch_normalize(gej_batch, ge_batch, (size_t)batch_valid);
+        /* 批量归一化：利用rzr增量因子，省去前向累积对gej.z的内存读取 */
+        keygen_batch_normalize_rzr(gej_batch, ge_batch, rzr_batch, (size_t)batch_valid);
 
         /* 遍历仿射坐标数组，计算hash160并查表 */
 #ifdef __AVX512F__

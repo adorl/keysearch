@@ -178,6 +178,61 @@ void keygen_batch_normalize(const secp256k1_gej *gej_in,
     }
 }
 
+/*
+ * keygen_batch_normalize_rzr：利用rzr增量因子加速的批量归一化
+ * 原理：
+ *   gej_in[i]由gej_in[i-1] + G 得到，secp256k1_gej_add_ge_var输出的rzr[i-1]
+ *   满足Z[i] = Z[i-1] * rzr[i-1]，因此：
+ *     1/Z[i-1] = (1/Z[i]) * rzr[i-1]
+ *
+ *   直接对gej_in[n-1].z求模逆（1次），然后从后往前用rzr链推导每个点的1/Z[i]：
+ *     inv = 1/Z[n-1]
+ *     inv_zi = inv  （第n-1个点）
+ *     inv = inv * rzr[i-1]  →  inv = 1/Z[i-1]  （向前传递）
+ *
+ * 要求：所有点均非infinity（内层循环已保证）
+ * 参数：
+ *   gej_in  : 输入Jacobian坐标数组（大小n）
+ *   ge_out  : 输出仿射坐标数组（大小>=n）
+ *   rzr     : Z坐标增量因子数组（大小n-1，rzr[i]满足Z[i+1]=Z[i]*rzr[i]）
+ *   n       : 数组元素个数
+ */
+void keygen_batch_normalize_rzr(const secp256k1_gej *gej_in,
+                                secp256k1_ge *ge_out,
+                                const secp256k1_fe *rzr,
+                                size_t n)
+{
+    if (n == 0 || n > KEYGEN_BATCH_MAX)
+        return;
+
+    /*
+     * 直接对最后一个点的Z坐标求模逆（1次模逆）
+     * 无需前向累积：gej_in[n-1].z就是所有rzr乘积的终点
+     */
+    secp256k1_fe inv;
+    secp256k1_fe_inv(&inv, &gej_in[n - 1].z);
+
+    /*
+     * 从后往前，利用rzr链逐个推导1/Z[i]，并转换为仿射坐标：
+     *   inv始终持有当前点i的1/Z[i]
+     *   处理完第i点后：inv = inv * rzr[i-1] = 1/Z[i-1]
+     */
+    for (size_t i = n; i-- > 0; ) {
+        /* inv 此时 = 1/Z[i] */
+        secp256k1_fe inv_zi2;
+        secp256k1_fe_sqr(&inv_zi2, &inv);                           /* inv_zi^2 */
+        secp256k1_fe_mul(&ge_out[i].x, &gej_in[i].x, &inv_zi2);     /* X/Z^2 */
+        secp256k1_fe_mul(&inv_zi2, &inv_zi2, &inv);                 /* inv_zi^3 */
+        secp256k1_fe_mul(&ge_out[i].y, &gej_in[i].y, &inv_zi2);     /* Y/Z^3 */
+        ge_out[i].infinity = 0;
+
+        /* 向前传递：inv = 1/Z[i-1] = (1/Z[i]) * rzr[i-1] */
+        if (i > 0) {
+            secp256k1_fe_mul(&inv, &inv, &rzr[i - 1]);
+        }
+    }
+}
+
 void keygen_ge_to_pubkey_bytes(const secp256k1_ge *ge,
                                uint8_t *compressed_out,
                                uint8_t *uncompressed_out)
