@@ -95,36 +95,28 @@ int keygen_privkey_to_gej(const secp256k1_context *ctx,
 }
 
 /* ------------------------------------------------------------------ */
-/* keygen_batch_normalize                                              */
-/* 使用 Montgomery trick 批量归一化：                                  */
+/* 使用Montgomery trick批量归一化：                                     */
 /*   acc[0] = Z[0]                                                     */
 /*   acc[i] = acc[i-1] * Z[i]                                         */
 /*   inv = 1 / acc[n-1]  （1次模逆）                                   */
 /*   从后往前：                                                         */
-/*     inv_zi = inv * acc[i-1]  （Z[i] 的逆）                          */
-/*     inv    = inv * Z[i]      （更新 inv 为 acc[i-1] 的逆）           */
+/*     inv_zi = inv * acc[i-1]  （Z[i]的逆）                           */
+/*     inv    = inv * Z[i]      （更新inv为acc[i-1]的逆）               */
 /* ------------------------------------------------------------------ */
+
+/* 大小与keysearch.c中的BATCH_SIZE保持一致 */
+#define KEYGEN_BATCH_MAX (4096)
+static __thread secp256k1_fe acc_buf[KEYGEN_BATCH_MAX];
+
 void keygen_batch_normalize(const secp256k1_gej *gej_in,
                             secp256k1_ge *ge_out,
                             size_t n)
 {
-    if (n == 0)
+    if (n == 0 || n > KEYGEN_BATCH_MAX)
         return;
 
-    /* 累积乘积数组 */
-    secp256k1_fe *acc = (secp256k1_fe *)malloc(n * sizeof(secp256k1_fe));
-    if (!acc) {
-        /* 内存分配失败，逐个归一化作为回退 */
-        for (size_t i = 0; i < n; i++) {
-            if (gej_in[i].infinity) {
-                ge_out[i].infinity = 1;
-            } else {
-                secp256k1_ge_set_gej(&ge_out[i],
-                                     (secp256k1_gej *)&gej_in[i]);
-            }
-        }
-        return;
-    }
+    /* 优先使用线程局部静态缓冲区，避免堆分配 */
+    secp256k1_fe *acc = acc_buf;
 
     /* 第一步：计算累积乘积，跳过infinity点 */
     int first = 1;
@@ -151,7 +143,6 @@ void keygen_batch_normalize(const secp256k1_gej *gej_in,
 
     if (first) {
         /* 所有点都是infinity */
-        free(acc);
         return;
     }
 
@@ -185,8 +176,6 @@ void keygen_batch_normalize(const secp256k1_gej *gej_in,
         secp256k1_fe_mul(&ge_out[i].y, &gej_in[i].y, &inv_zi2);
         ge_out[i].infinity = 0;
     }
-
-    free(acc);
 }
 
 void keygen_ge_to_pubkey_bytes(const secp256k1_ge *ge,
@@ -196,11 +185,8 @@ void keygen_ge_to_pubkey_bytes(const secp256k1_ge *ge,
     if (ge->infinity)
         return;
 
-    /* 归一化X、Y坐标 */
     secp256k1_fe x = ge->x;
     secp256k1_fe y = ge->y;
-    secp256k1_fe_normalize_var(&x);
-    secp256k1_fe_normalize_var(&y);
 
     uint8_t x_bytes[32];
     uint8_t y_bytes[32];

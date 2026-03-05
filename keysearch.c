@@ -33,7 +33,7 @@
 #define PROGRESS_INTERVAL   (1000000)       /* 进度打印间隔 */
 #define MAX_ADDRESSES       (400000)        /* 最多支持的目标地址数量 */
 #define ADDRESS_LEN         (35)            /* 比特币地址最大长度 */
-#define BATCH_SIZE          (2048)          /* 增量推导批次大小，每批后重置随机基准私钥 */
+#define BATCH_SIZE          (4096)          /* 增量推导批次大小，每批后重置随机基准私钥 */
 
 /* ===================== 全局共享数据 ===================== */
 
@@ -62,16 +62,20 @@ static void *search_key(void *arg)
     int thread_id = args->thread_id;
 
     uint8_t privkey[32];            /* 当前私钥（每批随机生成基准，内层递增） */
-    uint8_t base_privkey[32];       /* 基准私钥备份（用于命中时输出） */
     uint8_t hash160_compressed[20];
     uint8_t hash160_uncompressed[20];
-    uint8_t tweak[32];              /* 标量加法tweak = 1 */
+#ifndef USE_PUBKEY_API_ONLY
+    /* AVX2/标量内部路径：预构造tweak scalar（值为1），外层循环前初始化一次 */
+    secp256k1_scalar tweak_scalar;
+    secp256k1_scalar_set_int(&tweak_scalar, 1);
+#else
+    uint8_t tweak[32];              /* 标量加法tweak = 1（回退路径使用） */
+    memset(tweak, 0, 32);
+    tweak[31] = 1;
+#endif
     uint64_t count = 0;
     int progress_counter = PROGRESS_INTERVAL; /* 递减计数器，避免取模除法 */
     rand_key_context rand_ctx;
-
-    memset(tweak, 0, 32);
-    tweak[31] = 1;
 
     /* 初始化真随机上下文（每线程独立fd，无锁竞争） */
     if (rand_ctx_init(&rand_ctx) != 0) {
@@ -97,7 +101,15 @@ static void *search_key(void *arg)
             break;
         }
 
-        memcpy(base_privkey, privkey, 32);
+        /* 将基准私钥转换为scalar形式，内层循环直接在scalar上累加 */
+        secp256k1_scalar base_privkey_scalar;
+        secp256k1_scalar cur_privkey_scalar;
+        int overflow = 0;
+        secp256k1_scalar_set_b32(&base_privkey_scalar, privkey, &overflow);
+        if (overflow || secp256k1_scalar_is_zero(&base_privkey_scalar))
+            continue;
+    
+        cur_privkey_scalar = base_privkey_scalar;
 
         secp256k1_gej cur_gej;
         secp256k1_gej next_gej;
@@ -108,18 +120,29 @@ static void *search_key(void *arg)
 
         /* 内层循环：积累BATCH_SIZE个Jacobian点 */
         int batch_valid = 0;
+        int inner_overflow = 0; /* 标记内层scalar加法是否溢出 */
         for (int b = 0; b < BATCH_SIZE && count < MAX_ATTEMPTS; b++) {
             gej_batch[b] = cur_gej;
             batch_valid++;
 
-            /* 增量推导：私钥+1，公钥点加G（直接点加法，无ecmult） */
-            if (!secp256k1_ec_seckey_tweak_add(secp_ctx, privkey, tweak)) {
-                fprintf(stderr, "警告：私钥推导失败，batch=%d！\n", b);
+            /* 最后一个点不需要推导下一步 */
+            if (b == BATCH_SIZE - 1)
+                break;
+
+            /* 增量推导：私钥scalar+1，公钥点加G（直接点加法，无ecmult） */
+            secp256k1_scalar_add(&cur_privkey_scalar, &cur_privkey_scalar, &tweak_scalar);
+            if (secp256k1_scalar_is_zero(&cur_privkey_scalar)) {
+                /* 极小概率：scalar溢出归零，跳出内层循环重新生成基准私钥 */
+                inner_overflow = 1;
                 break;
             }
-            secp256k1_gej_add_ge(&next_gej, &cur_gej, &G_affine);
+            /* 使用变量时间点加法*/
+            secp256k1_gej_add_ge_var(&next_gej, &cur_gej, &G_affine, NULL);
             cur_gej = next_gej;
         }
+
+        if (inner_overflow)
+            continue;
 
         /* 批量归一化：1次模逆替代batch_valid次模逆 */
         keygen_batch_normalize(gej_batch, ge_batch, (size_t)batch_valid);
@@ -186,13 +209,12 @@ static void *search_key(void *arg)
                         continue;
 
                     found_flag = 1;
-                    /* 命中时重建私钥 */
-                    memcpy(privkey, base_privkey, 32);
+                    /* 命中时重建私钥：从base_privkey_scalar出发，scalar加法重建命中位置 */
+                    secp256k1_scalar hit_scalar = base_privkey_scalar;
                     for (int i = 0; i < b_idx; i++) {
-                        if (!secp256k1_ec_seckey_tweak_add(secp_ctx, privkey, tweak)) {
-                            fprintf(stderr, "警告：私钥推导失败，batch=%d, 结果错误！\n", b_idx);
-                        }
+                        secp256k1_scalar_add(&hit_scalar, &hit_scalar, &tweak_scalar);
                     }
+                    secp256k1_scalar_get_b32(privkey, &hit_scalar);
                     char privkey_hex[65];
                     char address_compressed[ADDRESS_LEN + 1];
                     char address_uncompressed[ADDRESS_LEN + 1];
@@ -286,13 +308,12 @@ static void *search_key(void *arg)
                         continue;
 
                     found_flag = 1;
-                    /* 命中时重建私钥 */
-                    memcpy(privkey, base_privkey, 32);
+                    /* 命中时重建私钥：从base_privkey_scalar出发，scalar加法重建命中位置 */
+                    secp256k1_scalar hit_scalar = base_privkey_scalar;
                     for (int i = 0; i < b_idx; i++) {
-                        if (!secp256k1_ec_seckey_tweak_add(secp_ctx, privkey, tweak)) {
-                            fprintf(stderr, "警告：私钥推导失败，batch=%d, 结果错误！\n", b_idx);
-                        }
+                        secp256k1_scalar_add(&hit_scalar, &hit_scalar, &tweak_scalar);
                     }
+                    secp256k1_scalar_get_b32(privkey, &hit_scalar);
                     char privkey_hex[65];
                     char address_compressed[ADDRESS_LEN + 1];
                     char address_uncompressed[ADDRESS_LEN + 1];
@@ -340,13 +361,12 @@ static void *search_key(void *arg)
             /* 哈希表查找（字节层面直接比对） */
             if (ht_contains(hash160_compressed) || ht_contains(hash160_uncompressed)) {
                 found_flag = 1;
-                /* 命中时重建私钥 */
-                memcpy(privkey, base_privkey, 32);
+                /* 命中时重建私钥：从base_privkey_scalar出发，scalar加法重建命中位置 */
+                secp256k1_scalar hit_scalar = base_privkey_scalar;
                 for (int i = 0; i < b; i++) {
-                    if (!secp256k1_ec_seckey_tweak_add(secp_ctx, privkey, tweak)) {
-                        fprintf(stderr, "警告：私钥推导失败，batch=%d, 结果错误！\n", b);
-                    }
+                    secp256k1_scalar_add(&hit_scalar, &hit_scalar, &tweak_scalar);
                 }
+                secp256k1_scalar_get_b32(privkey, &hit_scalar);
                 /* 仅在命中时才做格式转换 */
                 char privkey_hex[65];
                 char address_compressed[ADDRESS_LEN + 1];
