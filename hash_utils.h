@@ -112,5 +112,28 @@ int ht_contains(const uint8_t *h160);
 uint8_t ht_contains_8way(const uint8_t *h160s[8]);
 #endif /* __AVX2__ */
 
+#ifdef __AVX512F__
+/*
+ * 16路并行计算压缩公钥（33字节）的hash160（SHA256->RIPEMD160）
+ * pubkeys[16]   : 16个压缩公钥字节指针（每个33字节）
+ * hash160s[16]  : 16个输出缓冲区（每个20字节）
+ */
+void hash160_16way_compressed(const uint8_t *pubkeys[16], uint8_t hash160s[16][20]);
+
+/*
+ * 16路并行计算非压缩公钥（65字节）的hash160（SHA256->RIPEMD160）
+ * pubkeys[16]   : 16个非压缩公钥字节指针（每个65字节）
+ * hash160s[16]  : 16个输出缓冲区（每个20字节）
+ */
+void hash160_16way_uncompressed(const uint8_t *pubkeys[16], uint8_t hash160s[16][20]);
+
+/*
+ * 16路并行查表：同时查找16个hash160
+ * h160s[16]: 16个hash160指针（每个20字节）
+ * 返回16位命中掩码：bit i为1表示第i路命中
+ */
+uint16_t ht_contains_16way(const uint8_t *h160s[16]);
+#endif /* __AVX512F__ */
+
 #endif /* HASH_UTILS_H */
 

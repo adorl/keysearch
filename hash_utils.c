@@ -660,3 +660,4 @@ uint8_t ht_contains_8way(const uint8_t *h160s[8])
 
 #endif /* __AVX2__ */
 
+

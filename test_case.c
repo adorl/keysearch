@@ -1016,6 +1016,609 @@ static void test_hash160_8way(void) {
 
 #endif /* __AVX2__ */
 
+/* ===================== AVX-512 压缩函数测试 ===================== */
+
+#ifdef __AVX512F__
+
+__attribute__((target("avx512f")))
+static void test_avx512_compress(void) {
+    printf("\n=== AVX-512 压缩函数测试（sha256_compress_avx512 / ripemd160_compress_avx512）===\n");
+
+    /* ------------------------------------------------------------------ */
+    /* 10.1  sha256_compress_avx512 — 16路相同消息，结果与标量 sha256() 一致 */
+    {
+        uint8_t block_abc[64];
+        make_sha256_padded_block((const uint8_t *)"abc", 3, block_abc);
+
+        uint32_t states_data[16][8];
+        uint32_t *states[16];
+        const uint8_t *blocks[16];
+        for (int i = 0; i < 16; i++) {
+            memcpy(states_data[i], SHA256_INIT, 32);
+            states[i] = states_data[i];
+            blocks[i] = block_abc;
+        }
+
+        sha256_compress_avx512(states, blocks);
+
+        uint8_t digest_avx512[32];
+        for (int lane = 0; lane < 16; lane++) {
+            sha256_state_to_digest(states_data[lane], digest_avx512);
+            char name[80];
+            snprintf(name, sizeof(name), "10.1 sha256_compress_avx512(\"abc\") lane%d 与标准值一致", lane);
+            check(name,
+                  "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                  digest_avx512, 32);
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 10.2  sha256_compress_avx512 — 16路不同消息，每路结果与标量 sha256() 一致 */
+    {
+        static const struct { const uint8_t *msg; size_t len; } cases[16] = {
+            { (const uint8_t *)"",           0  },
+            { (const uint8_t *)"abc",        3  },
+            { (const uint8_t *)"\x00",       1  },
+            { (const uint8_t *)"\xff",       1  },
+            { (const uint8_t *)"hello",      5  },
+            { (const uint8_t *)"world",      5  },
+            { (const uint8_t *)"\x00\x01\x02\x03\x04\x05\x06\x07", 8 },
+            { (const uint8_t *)"aaaaaaaaaa", 10 },
+            { (const uint8_t *)"bitcoin",    7  },
+            { (const uint8_t *)"secp256k1",  9  },
+            { (const uint8_t *)"ripemd160",  9  },
+            { (const uint8_t *)"sha256",     6  },
+            { (const uint8_t *)"avx512",     6  },
+            { (const uint8_t *)"keysearch",  9  },
+            { (const uint8_t *)"test16way",  9  },
+            { (const uint8_t *)"lane15msg",  9  },
+        };
+
+        uint8_t padded_blocks[16][64];
+        uint32_t states_data[16][8];
+        uint32_t *states[16];
+        const uint8_t *blocks[16];
+
+        for (int i = 0; i < 16; i++) {
+            make_sha256_padded_block(cases[i].msg, cases[i].len, padded_blocks[i]);
+            memcpy(states_data[i], SHA256_INIT, 32);
+            states[i] = states_data[i];
+            blocks[i] = padded_blocks[i];
+        }
+
+        sha256_compress_avx512(states, blocks);
+
+        uint8_t digest_avx512[32];
+        uint8_t digest_ref[32];
+        char ref_hex[65];
+        for (int i = 0; i < 16; i++) {
+            sha256_state_to_digest(states_data[i], digest_avx512);
+            sha256(cases[i].msg, cases[i].len, digest_ref);
+            bytes_to_hex_helper(digest_ref, 32, ref_hex);
+            char name[80];
+            snprintf(name, sizeof(name), "10.2 sha256_compress_avx512 16路不同消息 lane%d 与标量一致", i);
+            check(name, ref_hex, digest_avx512, 32);
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 10.3  sha256_compress_avx512 — 16路33字节公钥，与 sha256_33 交叉验证 */
+    {
+        static const uint8_t msgs[16][33] = {
+            { 0x02,0x79,0xbe,0x66,0x7e,0xf9,0xdc,0xbb,0xac,0x55,0xa0,0x62,0x95,0xce,0x87,0x0b,
+              0x07,0x02,0x9b,0xfc,0xdb,0x2d,0xce,0x28,0xd9,0x59,0xf2,0x81,0x5b,0x16,0xf8,0x17,0x98 },
+            { 0x03,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,
+              0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x1a,0x1b,0x1c,0x1d,0x1e,0x1f,0x20 },
+            { 0x02,0xff,0xfe,0xfd,0xfc,0xfb,0xfa,0xf9,0xf8,0xf7,0xf6,0xf5,0xf4,0xf3,0xf2,0xf1,
+              0xf0,0xef,0xee,0xed,0xec,0xeb,0xea,0xe9,0xe8,0xe7,0xe6,0xe5,0xe4,0xe3,0xe2,0xe1,0xe0 },
+            { 0x03,0xaa,0xbb,0xcc,0xdd,0xee,0xff,0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,
+              0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff,0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99 },
+            { 0x02,0x10,0x20,0x30,0x40,0x50,0x60,0x70,0x80,0x90,0xa0,0xb0,0xc0,0xd0,0xe0,0xf0,
+              0x01,0x11,0x21,0x31,0x41,0x51,0x61,0x71,0x81,0x91,0xa1,0xb1,0xc1,0xd1,0xe1,0xf1,0x01 },
+            { 0x03,0x5a,0x4b,0x3c,0x2d,0x1e,0x0f,0xa0,0xb1,0xc2,0xd3,0xe4,0xf5,0x06,0x17,0x28,
+              0x39,0x4a,0x5b,0x6c,0x7d,0x8e,0x9f,0xa0,0xb1,0xc2,0xd3,0xe4,0xf5,0x06,0x17,0x28,0x39 },
+            { 0x02,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+              0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x01 },
+            { 0x03,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+              0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xfe },
+            { 0x02,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff,
+              0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff,0x00 },
+            { 0x03,0xde,0xad,0xbe,0xef,0xca,0xfe,0xba,0xbe,0x01,0x23,0x45,0x67,0x89,0xab,0xcd,
+              0xef,0xfe,0xdc,0xba,0x98,0x76,0x54,0x32,0x10,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88 },
+            { 0x02,0xa0,0xb1,0xc2,0xd3,0xe4,0xf5,0x06,0x17,0x28,0x39,0x4a,0x5b,0x6c,0x7d,0x8e,
+              0x9f,0xa0,0xb1,0xc2,0xd3,0xe4,0xf5,0x06,0x17,0x28,0x39,0x4a,0x5b,0x6c,0x7d,0x8e,0x9f },
+            { 0x03,0x12,0x34,0x56,0x78,0x9a,0xbc,0xde,0xf0,0x12,0x34,0x56,0x78,0x9a,0xbc,0xde,
+              0xf0,0x12,0x34,0x56,0x78,0x9a,0xbc,0xde,0xf0,0x12,0x34,0x56,0x78,0x9a,0xbc,0xde,0xf0 },
+            { 0x02,0x55,0x44,0x33,0x22,0x11,0x00,0xff,0xee,0xdd,0xcc,0xbb,0xaa,0x99,0x88,0x77,
+              0x66,0x55,0x44,0x33,0x22,0x11,0x00,0xff,0xee,0xdd,0xcc,0xbb,0xaa,0x99,0x88,0x77,0x66 },
+            { 0x03,0x01,0x23,0x45,0x67,0x89,0xab,0xcd,0xef,0x01,0x23,0x45,0x67,0x89,0xab,0xcd,
+              0xef,0x01,0x23,0x45,0x67,0x89,0xab,0xcd,0xef,0x01,0x23,0x45,0x67,0x89,0xab,0xcd,0xef },
+            { 0x02,0xf0,0xe1,0xd2,0xc3,0xb4,0xa5,0x96,0x87,0x78,0x69,0x5a,0x4b,0x3c,0x2d,0x1e,
+              0x0f,0xf0,0xe1,0xd2,0xc3,0xb4,0xa5,0x96,0x87,0x78,0x69,0x5a,0x4b,0x3c,0x2d,0x1e,0x0f },
+            { 0x03,0x80,0x70,0x60,0x50,0x40,0x30,0x20,0x10,0x08,0x07,0x06,0x05,0x04,0x03,0x02,
+              0x01,0x80,0x70,0x60,0x50,0x40,0x30,0x20,0x10,0x08,0x07,0x06,0x05,0x04,0x03,0x02,0x01 },
+        };
+
+        uint8_t padded_blocks[16][64];
+        uint32_t states_data[16][8];
+        uint32_t *states[16];
+        const uint8_t *blocks[16];
+
+        for (int i = 0; i < 16; i++) {
+            make_sha256_padded_block(msgs[i], 33, padded_blocks[i]);
+            memcpy(states_data[i], SHA256_INIT, 32);
+            states[i] = states_data[i];
+            blocks[i] = padded_blocks[i];
+        }
+
+        sha256_compress_avx512(states, blocks);
+
+        uint8_t digest_avx512[32];
+        uint8_t digest_ref[32];
+        char ref_hex[65];
+        for (int i = 0; i < 16; i++) {
+            sha256_state_to_digest(states_data[i], digest_avx512);
+            sha256_33(msgs[i], digest_ref);
+            bytes_to_hex_helper(digest_ref, 32, ref_hex);
+            char name[80];
+            snprintf(name, sizeof(name), "10.3 sha256_compress_avx512 16路33字节公钥 lane%d 与sha256_33一致", i);
+            check(name, ref_hex, digest_avx512, 32);
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 10.4  ripemd160_compress_avx512 — 16路相同消息，结果与标量 ripemd160() 一致 */
+    {
+        uint8_t block_abc[64];
+        make_ripemd160_padded_block((const uint8_t *)"abc", 3, block_abc);
+
+        uint32_t states_data[16][5];
+        uint32_t *states[16];
+        const uint8_t *blocks[16];
+        for (int i = 0; i < 16; i++) {
+            memcpy(states_data[i], RMD160_INIT, 20);
+            states[i] = states_data[i];
+            blocks[i] = block_abc;
+        }
+
+        ripemd160_compress_avx512(states, blocks);
+
+        uint8_t digest_avx512[20];
+        for (int lane = 0; lane < 16; lane++) {
+            rmd160_state_to_digest(states_data[lane], digest_avx512);
+            char name[80];
+            snprintf(name, sizeof(name), "10.4 ripemd160_compress_avx512(\"abc\") lane%d 与标准值一致", lane);
+            check(name,
+                  "8eb208f7e05d987a9b044a8e98c6b087f15a0bfc",
+                  digest_avx512, 20);
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 10.5  ripemd160_compress_avx512 — 16路不同消息，每路结果与标量一致 */
+    {
+        static const struct { const uint8_t *msg; size_t len; } cases[16] = {
+            { (const uint8_t *)"",           0  },
+            { (const uint8_t *)"abc",        3  },
+            { (const uint8_t *)"abcdefghijklmnopqrstuvwxyz", 26 },
+            { (const uint8_t *)"hello",      5  },
+            { (const uint8_t *)"world",      5  },
+            { (const uint8_t *)"\x00",       1  },
+            { (const uint8_t *)"\xff",       1  },
+            { (const uint8_t *)"0123456789", 10 },
+            { (const uint8_t *)"bitcoin",    7  },
+            { (const uint8_t *)"secp256k1",  9  },
+            { (const uint8_t *)"ripemd160",  9  },
+            { (const uint8_t *)"sha256",     6  },
+            { (const uint8_t *)"avx512",     6  },
+            { (const uint8_t *)"keysearch",  9  },
+            { (const uint8_t *)"test16way",  9  },
+            { (const uint8_t *)"lane15msg",  9  },
+        };
+
+        uint8_t padded_blocks[16][64];
+        uint32_t states_data[16][5];
+        uint32_t *states[16];
+        const uint8_t *blocks[16];
+
+        for (int i = 0; i < 16; i++) {
+            make_ripemd160_padded_block(cases[i].msg, cases[i].len, padded_blocks[i]);
+            memcpy(states_data[i], RMD160_INIT, 20);
+            states[i] = states_data[i];
+            blocks[i] = padded_blocks[i];
+        }
+
+        ripemd160_compress_avx512(states, blocks);
+
+        uint8_t digest_avx512[20];
+        uint8_t digest_ref[20];
+        char ref_hex[41];
+        for (int i = 0; i < 16; i++) {
+            rmd160_state_to_digest(states_data[i], digest_avx512);
+            ripemd160(cases[i].msg, cases[i].len, digest_ref);
+            bytes_to_hex_helper(digest_ref, 20, ref_hex);
+            char name[80];
+            snprintf(name, sizeof(name), "10.5 ripemd160_compress_avx512 16路不同消息 lane%d 与通用ripemd160一致", i);
+            check(name, ref_hex, digest_avx512, 20);
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 10.6  ripemd160_compress_avx512 — 16路32字节消息（ripemd160_32 场景） */
+    {
+        static const uint8_t inputs[16][32] = {
+            { 0x0b,0x7c,0x28,0xc9,0xb7,0x29,0x0c,0x98,0xd7,0x43,0x8e,0x70,0xb3,0xd3,0xf7,0xc8,
+              0x48,0xfb,0xd7,0xd1,0xdc,0x19,0x4f,0xf8,0x3f,0x4f,0x7c,0xc9,0xb1,0x37,0x8e,0x98 },
+            { 0 },
+            { 0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+              0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff },
+            { 0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,
+              0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x1a,0x1b,0x1c,0x1d,0x1e,0x1f },
+            { 0xff,0xfe,0xfd,0xfc,0xfb,0xfa,0xf9,0xf8,0xf7,0xf6,0xf5,0xf4,0xf3,0xf2,0xf1,0xf0,
+              0xef,0xee,0xed,0xec,0xeb,0xea,0xe9,0xe8,0xe7,0xe6,0xe5,0xe4,0xe3,0xe2,0xe1,0xe0 },
+            { 0xaa,0x55,0xaa,0x55,0xaa,0x55,0xaa,0x55,0xaa,0x55,0xaa,0x55,0xaa,0x55,0xaa,0x55,
+              0xaa,0x55,0xaa,0x55,0xaa,0x55,0xaa,0x55,0xaa,0x55,0xaa,0x55,0xaa,0x55,0xaa,0x55 },
+            { 0xde,0xad,0xbe,0xef,0xca,0xfe,0xba,0xbe,0x01,0x23,0x45,0x67,0x89,0xab,0xcd,0xef,
+              0xfe,0xdc,0xba,0x98,0x76,0x54,0x32,0x10,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88 },
+            { 0x01,0x23,0x45,0x67,0x89,0xab,0xcd,0xef,0xfe,0xdc,0xba,0x98,0x76,0x54,0x32,0x10,
+              0x00,0xff,0x00,0xff,0x00,0xff,0x00,0xff,0x00,0xff,0x00,0xff,0x00,0xff,0x00,0xff },
+            { 0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff,0x00,
+              0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff,0x00 },
+            { 0xa1,0xb2,0xc3,0xd4,0xe5,0xf6,0x07,0x18,0x29,0x3a,0x4b,0x5c,0x6d,0x7e,0x8f,0x90,
+              0xa1,0xb2,0xc3,0xd4,0xe5,0xf6,0x07,0x18,0x29,0x3a,0x4b,0x5c,0x6d,0x7e,0x8f,0x90 },
+            { 0x10,0x20,0x30,0x40,0x50,0x60,0x70,0x80,0x90,0xa0,0xb0,0xc0,0xd0,0xe0,0xf0,0x01,
+              0x10,0x20,0x30,0x40,0x50,0x60,0x70,0x80,0x90,0xa0,0xb0,0xc0,0xd0,0xe0,0xf0,0x01 },
+            { 0x5a,0x4b,0x3c,0x2d,0x1e,0x0f,0xa0,0xb1,0xc2,0xd3,0xe4,0xf5,0x06,0x17,0x28,0x39,
+              0x5a,0x4b,0x3c,0x2d,0x1e,0x0f,0xa0,0xb1,0xc2,0xd3,0xe4,0xf5,0x06,0x17,0x28,0x39 },
+            { 0x80,0x81,0x82,0x83,0x84,0x85,0x86,0x87,0x88,0x89,0x8a,0x8b,0x8c,0x8d,0x8e,0x8f,
+              0x90,0x91,0x92,0x93,0x94,0x95,0x96,0x97,0x98,0x99,0x9a,0x9b,0x9c,0x9d,0x9e,0x9f },
+            { 0x70,0x71,0x72,0x73,0x74,0x75,0x76,0x77,0x78,0x79,0x7a,0x7b,0x7c,0x7d,0x7e,0x7f,
+              0x60,0x61,0x62,0x63,0x64,0x65,0x66,0x67,0x68,0x69,0x6a,0x6b,0x6c,0x6d,0x6e,0x6f },
+            { 0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,
+              0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80 },
+            { 0xfe,0xfd,0xfb,0xf7,0xef,0xdf,0xbf,0x7f,0xfe,0xfd,0xfb,0xf7,0xef,0xdf,0xbf,0x7f,
+              0xfe,0xfd,0xfb,0xf7,0xef,0xdf,0xbf,0x7f,0xfe,0xfd,0xfb,0xf7,0xef,0xdf,0xbf,0x7f },
+        };
+
+        uint8_t padded_blocks[16][64];
+        uint32_t states_data[16][5];
+        uint32_t *states[16];
+        const uint8_t *blocks[16];
+
+        for (int i = 0; i < 16; i++) {
+            make_ripemd160_padded_block(inputs[i], 32, padded_blocks[i]);
+            memcpy(states_data[i], RMD160_INIT, 20);
+            states[i] = states_data[i];
+            blocks[i] = padded_blocks[i];
+        }
+
+        ripemd160_compress_avx512(states, blocks);
+
+        uint8_t digest_avx512[20];
+        uint8_t digest_ref[20];
+        char ref_hex[41];
+        for (int i = 0; i < 16; i++) {
+            rmd160_state_to_digest(states_data[i], digest_avx512);
+            ripemd160_32(inputs[i], digest_ref);
+            bytes_to_hex_helper(digest_ref, 20, ref_hex);
+            char name[80];
+            snprintf(name, sizeof(name), "10.6 ripemd160_compress_avx512 16路32字节输入 lane%d 与ripemd160_32一致", i);
+            check(name, ref_hex, digest_avx512, 20);
+        }
+    }
+}
+
+/* ===================== hash160_16way 测试 ===================== */
+
+__attribute__((target("avx512f")))
+static void test_hash160_16way(void) {
+    printf("\n=== hash160_16way 16路并行 hash160 测试 ===\n");
+
+    static const uint8_t G_comp[33] = {
+        0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb,
+        0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87, 0x0b,
+        0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28,
+        0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16, 0xf8, 0x17, 0x98
+    };
+    static const uint8_t G_uncomp[65] = {
+        0x04,
+        0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac,
+        0x55, 0xa0, 0x62, 0x95, 0xce, 0x87, 0x0b, 0x07,
+        0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9,
+        0x59, 0xf2, 0x81, 0x5b, 0x16, 0xf8, 0x17, 0x98,
+        0x48, 0x3a, 0xda, 0x77, 0x26, 0xa3, 0xc4, 0x65,
+        0x5d, 0xa4, 0xfb, 0xfc, 0x0e, 0x11, 0x08, 0xa8,
+        0xfd, 0x17, 0xb4, 0x48, 0xa6, 0x85, 0x54, 0x19,
+        0x9c, 0x47, 0xd0, 0x8f, 0xfb, 0x10, 0xd4, 0xb8
+    };
+
+    /* ------------------------------------------------------------------ */
+    /* 11.1  hash160_16way_compressed — 16路相同输入（G点压缩公钥） */
+    {
+        const uint8_t *comp_ptrs[16];
+        for (int i = 0; i < 16; i++) comp_ptrs[i] = G_comp;
+
+        uint8_t hash160s[16][20];
+        hash160_16way_compressed(comp_ptrs, hash160s);
+
+        uint8_t ref[20];
+        pubkey_bytes_to_hash160(G_comp, 33, ref);
+        char ref_hex[41];
+        bytes_to_hex_helper(ref, 20, ref_hex);
+
+        for (int lane = 0; lane < 16; lane++) {
+            char name[80];
+            snprintf(name, sizeof(name),
+                     "11.1 hash160_16way_compressed(G点) lane%d 与标量一致", lane);
+            check(name, ref_hex, hash160s[lane], 20);
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 11.2  hash160_16way_uncompressed — 16路相同输入（G点非压缩公钥） */
+    {
+        const uint8_t *uncomp_ptrs[16];
+        for (int i = 0; i < 16; i++) uncomp_ptrs[i] = G_uncomp;
+
+        uint8_t hash160s[16][20];
+        hash160_16way_uncompressed(uncomp_ptrs, hash160s);
+
+        uint8_t ref[20];
+        pubkey_bytes_to_hash160(G_uncomp, 65, ref);
+        char ref_hex[41];
+        bytes_to_hex_helper(ref, 20, ref_hex);
+
+        for (int lane = 0; lane < 16; lane++) {
+            char name[80];
+            snprintf(name, sizeof(name),
+                     "11.2 hash160_16way_uncompressed(G点) lane%d 与标量一致", lane);
+            check(name, ref_hex, hash160s[lane], 20);
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 11.3  hash160_16way_compressed — 16路不同输入（k=1..16 的压缩公钥） */
+    {
+        uint8_t comp_bufs[16][33];
+        const uint8_t *comp_ptrs[16];
+        uint8_t ref_hash160s[16][20];
+
+        for (int i = 0; i < 16; i++) {
+            uint8_t privkey[32] = {0};
+            privkey[31] = (uint8_t)(i + 1);
+            privkey_to_compressed_bytes(privkey, comp_bufs[i]);
+            comp_ptrs[i] = comp_bufs[i];
+            privkey_to_hash160(privkey, ref_hash160s[i], NULL);
+        }
+
+        uint8_t hash160s[16][20];
+        hash160_16way_compressed(comp_ptrs, hash160s);
+
+        for (int lane = 0; lane < 16; lane++) {
+            char ref_hex[41];
+            bytes_to_hex_helper(ref_hash160s[lane], 20, ref_hex);
+            char name[80];
+            snprintf(name, sizeof(name),
+                     "11.3 hash160_16way_compressed(k=%d) lane%d 与标量一致", lane + 1, lane);
+            check(name, ref_hex, hash160s[lane], 20);
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 11.4  hash160_16way_uncompressed — 16路不同输入（k=1..16 的非压缩公钥） */
+    {
+        uint8_t uncomp_bufs[16][65];
+        const uint8_t *uncomp_ptrs[16];
+        uint8_t ref_hash160s[16][20];
+
+        for (int i = 0; i < 16; i++) {
+            uint8_t privkey[32] = {0};
+            privkey[31] = (uint8_t)(i + 1);
+
+            secp256k1_pubkey pubkey;
+            size_t len = 65;
+            secp256k1_ec_pubkey_create(secp_ctx, &pubkey, privkey);
+            secp256k1_ec_pubkey_serialize(secp_ctx, uncomp_bufs[i], &len,
+                                          &pubkey, SECP256K1_EC_UNCOMPRESSED);
+            uncomp_ptrs[i] = uncomp_bufs[i];
+            privkey_to_hash160(privkey, NULL, ref_hash160s[i]);
+        }
+
+        uint8_t hash160s[16][20];
+        hash160_16way_uncompressed(uncomp_ptrs, hash160s);
+
+        for (int lane = 0; lane < 16; lane++) {
+            char ref_hex[41];
+            bytes_to_hex_helper(ref_hash160s[lane], 20, ref_hex);
+            char name[80];
+            snprintf(name, sizeof(name),
+                     "11.4 hash160_16way_uncompressed(k=%d) lane%d 与标量一致", lane + 1, lane);
+            check(name, ref_hex, hash160s[lane], 20);
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 11.5  已知向量：hash160_16way_compressed(G点) lane0 与已知 hash160 一致 */
+    {
+        const uint8_t *comp_ptrs[16];
+        for (int i = 0; i < 16; i++) comp_ptrs[i] = G_comp;
+
+        uint8_t hash160s[16][20];
+        hash160_16way_compressed(comp_ptrs, hash160s);
+
+        check("11.5 hash160_16way_compressed(G点) 与已知向量一致",
+              "751e76e8199196d454941c45d1b3a323f1433bd6",
+              hash160s[0], 20);
+        check("11.5b hash160_16way_compressed(G点) lane15 与已知向量一致",
+              "751e76e8199196d454941c45d1b3a323f1433bd6",
+              hash160s[15], 20);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 11.6  已知向量：hash160_16way_uncompressed(G点) lane0 与已知 hash160 一致 */
+    {
+        const uint8_t *uncomp_ptrs[16];
+        for (int i = 0; i < 16; i++) uncomp_ptrs[i] = G_uncomp;
+
+        uint8_t hash160s[16][20];
+        hash160_16way_uncompressed(uncomp_ptrs, hash160s);
+
+        check("11.6 hash160_16way_uncompressed(G点) 与已知向量一致",
+              "91b24bf9f5288532960ac687abb035127b1d28a5",
+              hash160s[0], 20);
+        check("11.6b hash160_16way_uncompressed(G点) lane15 与已知向量一致",
+              "91b24bf9f5288532960ac687abb035127b1d28a5",
+              hash160s[15], 20);
+    }
+}
+
+/* ===================== ht_contains_16way 测试 ===================== */
+
+__attribute__((target("avx512f")))
+static void test_ht_contains_16way_func(void) {
+    printf("\n=== ht_contains_16way AVX-512 批量查表测试 ===\n");
+
+    if (ht_init(128) != 0) {
+        printf("  [FAIL] 12.0 ht_init 失败\n");
+        fail_count++;
+        return;
+    }
+
+    /* 准备16个已知 hash160 */
+    uint8_t known[16][20];
+    for (int i = 0; i < 16; i++) {
+        memset(known[i], 0, 20);
+        known[i][0] = (uint8_t)(0x10 + i);
+        known[i][1] = (uint8_t)(0x20 + i);
+        known[i][2] = (uint8_t)(0x30 + i);
+        known[i][3] = (uint8_t)(0x40 + i);
+        known[i][19] = (uint8_t)(i + 1);
+        ht_insert(known[i]);
+    }
+
+    /* 准备16个未插入的 hash160 */
+    uint8_t unknown[16][20];
+    for (int i = 0; i < 16; i++) {
+        memset(unknown[i], 0, 20);
+        unknown[i][0] = (uint8_t)(0xf0 + i);
+        unknown[i][1] = (uint8_t)(0xe0 + i);
+        unknown[i][2] = (uint8_t)(0xd0 + i);
+        unknown[i][3] = (uint8_t)(0xc0 + i);
+        unknown[i][19] = (uint8_t)(i + 0x80);
+    }
+
+    /* 12.1 16路全命中 */
+    const uint8_t *ptrs_all[16];
+    for (int i = 0; i < 16; i++) ptrs_all[i] = known[i];
+    uint16_t mask = ht_contains_16way(ptrs_all);
+    if (mask == 0xffff) {
+        printf("  [PASS] 12.1 16路全命中，掩码=0xffff\n");
+        pass_count++;
+    } else {
+        printf("  [FAIL] 12.1 16路全命中，期望掩码=0xffff，实际=0x%04x\n", mask);
+        fail_count++;
+    }
+
+    /* 12.2 16路全未命中 */
+    const uint8_t *ptrs_none[16];
+    for (int i = 0; i < 16; i++) ptrs_none[i] = unknown[i];
+    mask = ht_contains_16way(ptrs_none);
+    if (mask == 0x0000) {
+        printf("  [PASS] 12.2 16路全未命中，掩码=0x0000\n");
+        pass_count++;
+    } else {
+        printf("  [FAIL] 12.2 16路全未命中，期望掩码=0x0000，实际=0x%04x\n", mask);
+        fail_count++;
+    }
+
+    /* 12.3 部分命中：偶数 lane 命中（0,2,4,6,8,10,12,14），期望掩码=0x5555 */
+    const uint8_t *ptrs_mix[16];
+    for (int i = 0; i < 16; i++) {
+        ptrs_mix[i] = (i % 2 == 0) ? known[i] : unknown[i];
+    }
+    mask = ht_contains_16way(ptrs_mix);
+    if (mask == 0x5555) {
+        printf("  [PASS] 12.3 部分命中（偶数lane），掩码=0x5555\n");
+        pass_count++;
+    } else {
+        printf("  [FAIL] 12.3 部分命中（偶数lane），期望掩码=0x5555，实际=0x%04x\n", mask);
+        fail_count++;
+    }
+
+    /* 12.4 部分命中：奇数 lane 命中（1,3,5,7,9,11,13,15），期望掩码=0xaaaa */
+    for (int i = 0; i < 16; i++) {
+        ptrs_mix[i] = (i % 2 == 1) ? known[i] : unknown[i];
+    }
+    mask = ht_contains_16way(ptrs_mix);
+    if (mask == 0xaaaa) {
+        printf("  [PASS] 12.4 部分命中（奇数lane），掩码=0xaaaa\n");
+        pass_count++;
+    } else {
+        printf("  [FAIL] 12.4 部分命中（奇数lane），期望掩码=0xaaaa，实际=0x%04x\n", mask);
+        fail_count++;
+    }
+
+    /* 12.5 仅 lane0 命中，期望掩码=0x0001 */
+    for (int i = 0; i < 16; i++) {
+        ptrs_mix[i] = (i == 0) ? known[0] : unknown[i];
+    }
+    mask = ht_contains_16way(ptrs_mix);
+    if (mask == 0x0001) {
+        printf("  [PASS] 12.5 仅 lane0 命中，掩码=0x0001\n");
+        pass_count++;
+    } else {
+        printf("  [FAIL] 12.5 仅 lane0 命中，期望掩码=0x0001，实际=0x%04x\n", mask);
+        fail_count++;
+    }
+
+    /* 12.6 仅 lane15 命中，期望掩码=0x8000 */
+    for (int i = 0; i < 16; i++) {
+        ptrs_mix[i] = (i == 15) ? known[15] : unknown[i];
+    }
+    mask = ht_contains_16way(ptrs_mix);
+    if (mask == 0x8000) {
+        printf("  [PASS] 12.6 仅 lane15 命中，掩码=0x8000\n");
+        pass_count++;
+    } else {
+        printf("  [FAIL] 12.6 仅 lane15 命中，期望掩码=0x8000，实际=0x%04x\n", mask);
+        fail_count++;
+    }
+
+    /* 12.7 前8路命中，后8路未命中，期望掩码=0x00ff */
+    for (int i = 0; i < 16; i++) {
+        ptrs_mix[i] = (i < 8) ? known[i] : unknown[i];
+    }
+    mask = ht_contains_16way(ptrs_mix);
+    if (mask == 0x00ff) {
+        printf("  [PASS] 12.7 前8路命中，掩码=0x00ff\n");
+        pass_count++;
+    } else {
+        printf("  [FAIL] 12.7 前8路命中，期望掩码=0x00ff，实际=0x%04x\n", mask);
+        fail_count++;
+    }
+
+    /* 12.8 后8路命中，前8路未命中，期望掩码=0xff00 */
+    for (int i = 0; i < 16; i++) {
+        ptrs_mix[i] = (i >= 8) ? known[i] : unknown[i];
+    }
+    mask = ht_contains_16way(ptrs_mix);
+    if (mask == 0xff00) {
+        printf("  [PASS] 12.8 后8路命中，掩码=0xff00\n");
+        pass_count++;
+    } else {
+        printf("  [FAIL] 12.8 后8路命中，期望掩码=0xff00，实际=0x%04x\n", mask);
+        fail_count++;
+    }
+
+    ht_free();
+}
+
+/* AVX-512 函数前向声明（供测试调用） */
+void sha256_compress_avx512(uint32_t *states[16], const uint8_t *blocks[16]);
+void ripemd160_compress_avx512(uint32_t *states[16], const uint8_t *blocks[16]);
+
+#endif /* __AVX512F__ */
+
 /* ===================== 开放寻址哈希表测试 ===================== */
 
 static void test_ht_openaddr(void) {
@@ -1718,10 +2321,17 @@ int main(void) {
     test_avx2_compress();
     test_hash160_8way();
 #endif
+    if (__builtin_cpu_supports("avx512f")) {
+        test_avx512_compress();
+        test_hash160_16way();
+    }
     test_ht_openaddr();
 #ifdef __AVX2__
     test_ht_contains_8way_func();
 #endif
+    if (__builtin_cpu_supports("avx512f")) {
+        test_ht_contains_16way_func();
+    }
     test_specialized_interfaces();
 #ifndef USE_PUBKEY_API_ONLY
     /* 初始化全局生成元 G（供 test_keygen_internal 使用） */
