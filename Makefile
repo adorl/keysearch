@@ -17,10 +17,10 @@ else
     SECP256K1_OBJ = secp256k1_lib.o precomputed_ecmult.o precomputed_ecmult_gen.o
 endif
 
-# 检测 CPU 架构：只在 x86-64 上编译 AVX2 文件
+# 检测CPU架构：只在x86-64上编译AVX2文件
 ARCH := $(shell uname -m)
 ifeq ($(ARCH),x86_64)
-    SIMD_SRCS = sha256_avx2.c ripemd160_avx2.c
+    SIMD_SRCS = sha256_avx2.c ripemd160_avx2.c sha256_avx512.c ripemd160_avx512.c hash_utils_avx512.c
 else
     SIMD_SRCS =
 endif
@@ -65,6 +65,21 @@ sha256_avx2.o: sha256_avx2.c
 
 ripemd160_avx2.o: ripemd160_avx2.c
 	$(CC) $(CFLAGS) -mavx2 -c -o $@ $<
+
+sha256_avx512.o: sha256_avx512.c
+	$(CC) $(CFLAGS) -mavx512f -c -o $@ $<
+
+ripemd160_avx512.o: ripemd160_avx512.c
+	$(CC) $(CFLAGS) -mavx512f -c -o $@ $<
+
+hash_utils.o: hash_utils.c
+	$(CC) $(CFLAGS) -mavx2 -c -o $@ $<
+
+hash_utils_avx512.o: hash_utils_avx512.c
+	$(CC) $(CFLAGS) -mavx512f -c -o $@ $<
+
+test_case.o: test_case.c
+	$(CC) $(CFLAGS) -mavx2 -D__AVX512F__ -c -o $@ $<
 endif
 
 test: test_case
