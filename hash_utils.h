@@ -61,11 +61,78 @@ int privkey_to_address(const uint8_t *privkey,
 void hash160_8way_compressed(const uint8_t *pubkeys[8], uint8_t hash160s[8][20]);
 
 /*
+ * 8路并行计算压缩公钥的hash160（预填充，零拷贝）
+ * blocks[8]     : 8个已完成SHA256padding的64字节block指针
+ * hash160s[8]   : 8个输出缓冲区（每个20字节）
+ */
+void hash160_8way_compressed_prepadded(const uint8_t *blocks[8], uint8_t hash160s[8][20]);
+
+/*
+ * 将33字节压缩公钥原地构造为SHA256 padded block（64字节）
+ * buf必须至少64字节，公钥数据已写入buf[0..32]，本函数补全padding
+ */
+static inline void sha256_pad_block_33(uint8_t buf[64])
+{
+    /* 消息长度33字节，0x80 padding，位长 = 33*8 = 264 = 0x108 */
+    buf[33] = 0x80;
+    buf[34] = 0x00; buf[35] = 0x00; buf[36] = 0x00; buf[37] = 0x00;
+    buf[38] = 0x00; buf[39] = 0x00; buf[40] = 0x00; buf[41] = 0x00;
+    buf[42] = 0x00; buf[43] = 0x00; buf[44] = 0x00; buf[45] = 0x00;
+    buf[46] = 0x00; buf[47] = 0x00; buf[48] = 0x00; buf[49] = 0x00;
+    buf[50] = 0x00; buf[51] = 0x00; buf[52] = 0x00; buf[53] = 0x00;
+    buf[54] = 0x00; buf[55] = 0x00;
+    /* 大端序位长264 = 0x0000000000000108 */
+    buf[56] = 0x00; buf[57] = 0x00; buf[58] = 0x00; buf[59] = 0x00;
+    buf[60] = 0x00; buf[61] = 0x00; buf[62] = 0x01; buf[63] = 0x08;
+}
+
+/*
  * 8路并行计算非压缩公钥（65字节）的hash160（SHA256->RIPEMD160）
  * pubkeys[8]    : 8个非压缩公钥字节指针（每个65字节）
  * hash160s[8]   : 8个输出缓冲区（每个20字节）
  */
 void hash160_8way_uncompressed(const uint8_t *pubkeys[8], uint8_t hash160s[8][20]);
+
+/*
+ * 8路并行计算非压缩公钥的hash160（预填充，零拷贝）
+ * bufs[8]       : 8个128字节buffer指针，布局如下：
+ *                   buf[0..63] = 公钥前64字节
+ *                   buf[64..127]= SHA256 block2
+ * hash160s[8]   : 8个输出缓冲区（每个20字节）
+ */
+void hash160_8way_uncompressed_prepadded(const uint8_t *bufs[8], uint8_t hash160s[8][20]);
+
+/*
+ * 对65字节非压缩公钥buffer原地构造SHA256 block2（写入buf[64..127]）
+ * buf必须至少128字节，公钥数据已写入buf[0..64]，本函数在buf[64..127]补全block2
+ * 调用前：buf[0..64] = 非压缩公钥（65字节）
+ * 调用后：buf[64..127] = SHA256 block2
+ */
+static inline void sha256_pad_block2_65(uint8_t buf[128])
+{
+    /* 读取公钥第65字节（buf[64]），构造block2 */
+    uint8_t last_byte = buf[64];
+    /* block2：last_byte + 0x80 + 零填充 + 8字节大端位长(65*8=520=0x208) */
+    buf[64]  = last_byte;
+    buf[65]  = 0x80;
+    buf[66]  = 0x00; buf[67]  = 0x00; buf[68]  = 0x00; buf[69]  = 0x00;
+    buf[70]  = 0x00; buf[71]  = 0x00; buf[72]  = 0x00; buf[73]  = 0x00;
+    buf[74]  = 0x00; buf[75]  = 0x00; buf[76]  = 0x00; buf[77]  = 0x00;
+    buf[78]  = 0x00; buf[79]  = 0x00; buf[80]  = 0x00; buf[81]  = 0x00;
+    buf[82]  = 0x00; buf[83]  = 0x00; buf[84]  = 0x00; buf[85]  = 0x00;
+    buf[86]  = 0x00; buf[87]  = 0x00; buf[88]  = 0x00; buf[89]  = 0x00;
+    buf[90]  = 0x00; buf[91]  = 0x00; buf[92]  = 0x00; buf[93]  = 0x00;
+    buf[94]  = 0x00; buf[95]  = 0x00; buf[96]  = 0x00; buf[97]  = 0x00;
+    buf[98]  = 0x00; buf[99]  = 0x00; buf[100] = 0x00; buf[101] = 0x00;
+    buf[102] = 0x00; buf[103] = 0x00; buf[104] = 0x00; buf[105] = 0x00;
+    buf[106] = 0x00; buf[107] = 0x00; buf[108] = 0x00; buf[109] = 0x00;
+    buf[110] = 0x00; buf[111] = 0x00; buf[112] = 0x00; buf[113] = 0x00;
+    buf[114] = 0x00; buf[115] = 0x00; buf[116] = 0x00; buf[117] = 0x00;
+    buf[118] = 0x00; buf[119] = 0x00;
+    /* 大端序位长 520 = 0x0000000000000208 */
+    buf[120] = 0x00; buf[121] = 0x00; buf[122] = 0x00; buf[123] = 0x00;
+    buf[124] = 0x00; buf[125] = 0x00; buf[126] = 0x02; buf[127] = 0x08;
+}
 #endif /* __AVX2__ */
 
 /*
