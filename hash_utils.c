@@ -296,17 +296,12 @@ void ht_free(void)
 }
 
 /*
- * FNV-1a 哈希：将hash160前4字节读为大端uint32_t，再做FNV-1a乘法哈希
+ * Knuth乘法哈希：直接对前4字节指纹fp做一次乘法
  * 返回槽位索引（已 & ht_mask）
  */
-static inline uint32_t ht_hash(const uint8_t *h160)
+static inline uint32_t ht_hash(uint32_t fp)
 {
-    uint32_t h = 2166136261u;
-    for (int i = 0; i < 20; i++) {
-        h ^= h160[i];
-        h *= 16777619u;
-    }
-    return h & ht_mask;
+    return (fp * 2654435761u) & ht_mask;
 }
 
 /* 向哈希表插入hash160（线性探测） */
@@ -321,7 +316,7 @@ void ht_insert(const uint8_t *h160)
     if (fp == 0)
         fp = 1;
 
-    uint32_t idx = ht_hash(h160);
+    uint32_t idx = ht_hash(fp);
     while (ht_slots[idx].fp != 0) {
         idx = (idx + 1) & ht_mask;
     }
@@ -339,7 +334,7 @@ int ht_contains(const uint8_t *h160)
     if (fp == 0)
         fp = 1;
 
-    uint32_t idx = ht_hash(h160);
+    uint32_t idx = ht_hash(fp);
     while (1) {
         uint32_t slot_fp = ht_slots[idx].fp;
         if (slot_fp == 0)
@@ -712,13 +707,8 @@ uint8_t ht_contains_8way(const uint8_t *h160s[8])
             fp = 1;
         fps[i] = fp;
 
-        /* FNV-1a 哈希（与ht_hash完全一致） */
-        uint32_t hv = 2166136261u;
-        for (int j = 0; j < 20; j++) {
-            hv ^= h[j];
-            hv *= 16777619u;
-        }
-        idxs[i] = hv & ht_mask;
+        /* Knuth乘法哈希（与ht_hash完全一致） */
+        idxs[i] = (fp * 2654435761u) & ht_mask;
     }
 
     /* ---- 步骤2：AVX2同时加载8路槽位指纹并比较 ---- */
