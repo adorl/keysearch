@@ -148,6 +148,108 @@ void hash160_16way_compressed(const uint8_t *pubkeys[16], uint8_t hash160s[16][2
 }
 
 /*
+ * 16路并行计算压缩公钥的hash160（预填充，零拷贝）
+ * blocks[16]: 调用者已原地完成SHA256 padding的64字节block指针数组
+ */
+__attribute__((target("avx512f")))
+void hash160_16way_compressed_prepadded(const uint8_t *blocks[16], uint8_t hash160s[16][20])
+{
+    uint32_t sha_states[16][8];
+    uint32_t *sha_state_ptrs[16];
+
+    for (int i = 0; i < 16; i++) {
+        memcpy(sha_states[i], sha256_init_state, 32);
+        sha_state_ptrs[i] = sha_states[i];
+    }
+
+    sha256_compress_avx512(sha_state_ptrs, blocks);
+
+    /* sha_digests扩展为64字节，SHA256摘要写入前32字节，后32字节原地构造RIPEMD160 padding */
+    uint8_t sha_digests[16][64];
+    uint32_t rmd_states[16][5];
+    uint32_t *rmd_state_ptrs[16];
+    const uint8_t *rmd_block_ptrs[16];
+
+    for (int i = 0; i < 16; i++) {
+        sha256_state_to_bytes(sha_states[i], sha_digests[i]);
+        /* 原地构造RIPEMD160 padded block：消息32字节，小端序位长256 */
+        sha_digests[i][32] = 0x80;
+        memset(&sha_digests[i][33], 0, 23);
+        /* 小端序位长 256 = 0x0000000000000100 */
+        sha_digests[i][56] = 0x00; sha_digests[i][57] = 0x01;
+        sha_digests[i][58] = 0x00; sha_digests[i][59] = 0x00;
+        sha_digests[i][60] = 0x00; sha_digests[i][61] = 0x00;
+        sha_digests[i][62] = 0x00; sha_digests[i][63] = 0x00;
+        memcpy(rmd_states[i], rmd160_init_state, 20);
+        rmd_state_ptrs[i] = rmd_states[i];
+        rmd_block_ptrs[i] = sha_digests[i];
+    }
+
+    ripemd160_compress_avx512(rmd_state_ptrs, rmd_block_ptrs);
+
+    for (int i = 0; i < 16; i++) {
+        rmd160_state_to_bytes(rmd_states[i], hash160s[i]);
+    }
+}
+
+/*
+ * 16路并行计算非压缩公钥的hash160（预填充，零拷贝）
+ * bufs[16]: 调用者已原地完成SHA256 padding的128字节buffer指针数组
+ *           buf[0..63]  = SHA256 block1（公钥前64字节，无需padding）
+ *           buf[64..127]= SHA256 block2（已完成padding）
+ */
+__attribute__((target("avx512f")))
+void hash160_16way_uncompressed_prepadded(const uint8_t *bufs[16], uint8_t hash160s[16][20])
+{
+    uint32_t sha_states[16][8];
+    uint32_t *sha_state_ptrs[16];
+    const uint8_t *sha_block_ptrs[16];
+
+    /* 第一轮：处理block1（buf[0..63]） */
+    for (int i = 0; i < 16; i++) {
+        memcpy(sha_states[i], sha256_init_state, 32);
+        sha_state_ptrs[i] = sha_states[i];
+        sha_block_ptrs[i] = bufs[i];
+    }
+
+    sha256_compress_avx512(sha_state_ptrs, sha_block_ptrs);
+
+    /* 第二轮：处理block2（buf[64..127]） */
+    for (int i = 0; i < 16; i++) {
+        sha_block_ptrs[i] = bufs[i] + 64;
+    }
+
+    sha256_compress_avx512(sha_state_ptrs, sha_block_ptrs);
+
+    /* sha_digests扩展为64字节，原地构造RIPEMD160 padding */
+    uint8_t sha_digests[16][64];
+    uint32_t rmd_states[16][5];
+    uint32_t *rmd_state_ptrs[16];
+    const uint8_t *rmd_block_ptrs[16];
+
+    for (int i = 0; i < 16; i++) {
+        sha256_state_to_bytes(sha_states[i], sha_digests[i]);
+        /* 原地构造RIPEMD160 padded block：消息32字节，小端序位长256 */
+        sha_digests[i][32] = 0x80;
+        memset(&sha_digests[i][33], 0, 23);
+        /* 小端序位长256 = 0x0000000000000100 */
+        sha_digests[i][56] = 0x00; sha_digests[i][57] = 0x01;
+        sha_digests[i][58] = 0x00; sha_digests[i][59] = 0x00;
+        sha_digests[i][60] = 0x00; sha_digests[i][61] = 0x00;
+        sha_digests[i][62] = 0x00; sha_digests[i][63] = 0x00;
+        memcpy(rmd_states[i], rmd160_init_state, 20);
+        rmd_state_ptrs[i] = rmd_states[i];
+        rmd_block_ptrs[i] = sha_digests[i];
+    }
+
+    ripemd160_compress_avx512(rmd_state_ptrs, rmd_block_ptrs);
+
+    for (int i = 0; i < 16; i++) {
+        rmd160_state_to_bytes(rmd_states[i], hash160s[i]);
+    }
+}
+
+/*
  * 16路并行计算非压缩公钥（65字节）的hash160（SHA256 -> RIPEMD160）
  */
 __attribute__((target("avx512f")))

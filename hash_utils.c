@@ -580,7 +580,7 @@ void hash160_8way_compressed_prepadded(const uint8_t *blocks[8], uint8_t hash160
  * 8路并行计算非压缩公钥的hash160（预填充，零拷贝）
  *
  * 调用方需提前将65字节公钥写入128字节buffer[0..64]，
- * 并调用 sha256_pad_block2_65() 原地在buffer[64..127]构造block2，
+ * 并调用sha256_pad_block2_65() 原地在buffer[64..127]构造block2，
  * 然后将该128字节buffer指针传入本函数，省去内部的make_sha256_block2_65
  */
 __attribute__((target("avx2")))

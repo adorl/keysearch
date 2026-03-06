@@ -52,7 +52,7 @@ int privkey_to_address(const uint8_t *privkey,
                        char *compressed_out,
                        char *uncompressed_out);
 
-#ifdef __AVX2__
+#if defined(__AVX2__) || defined(__AVX512F__)
 /*
  * 8路并行计算压缩公钥（33字节）的hash160（SHA256->RIPEMD160）
  * pubkeys[8]    : 8个压缩公钥字节指针（每个33字节）
@@ -66,6 +66,13 @@ void hash160_8way_compressed(const uint8_t *pubkeys[8], uint8_t hash160s[8][20])
  * hash160s[8]   : 8个输出缓冲区（每个20字节）
  */
 void hash160_8way_compressed_prepadded(const uint8_t *blocks[8], uint8_t hash160s[8][20]);
+
+/*
+ * 8路并行查表：同时查找8个hash160
+ * h160s[8]: 8个hash160指针（每个20字节）
+ * 返回8位命中掩码：bit i为1表示第i路命中
+ */
+uint8_t ht_contains_8way(const uint8_t *h160s[8]);
 
 /*
  * 将33字节压缩公钥原地构造为SHA256 padded block（64字节）
@@ -133,7 +140,7 @@ static inline void sha256_pad_block2_65(uint8_t buf[128])
     buf[120] = 0x00; buf[121] = 0x00; buf[122] = 0x00; buf[123] = 0x00;
     buf[124] = 0x00; buf[125] = 0x00; buf[126] = 0x02; buf[127] = 0x08;
 }
-#endif /* __AVX2__ */
+#endif /* __AVX2__ || __AVX512F__ */
 
 /*
  * 哈希表槽位结构：
@@ -170,15 +177,6 @@ void ht_insert(const uint8_t *h160);
  */
 int ht_contains(const uint8_t *h160);
 
-#ifdef __AVX2__
-/*
- * 8路并行查表：同时查找8个hash160
- * h160s[8]: 8个hash160指针（每个20字节）
- * 返回8位命中掩码：bit i为1表示第i路命中
- */
-uint8_t ht_contains_8way(const uint8_t *h160s[8]);
-#endif /* __AVX2__ */
-
 #ifdef __AVX512F__
 /*
  * 16路并行计算压缩公钥（33字节）的hash160（SHA256->RIPEMD160）
@@ -193,6 +191,22 @@ void hash160_16way_compressed(const uint8_t *pubkeys[16], uint8_t hash160s[16][2
  * hash160s[16]  : 16个输出缓冲区（每个20字节）
  */
 void hash160_16way_uncompressed(const uint8_t *pubkeys[16], uint8_t hash160s[16][20]);
+
+/*
+ * 16路并行计算压缩公钥的hash160（预填充，零拷贝）
+ * blocks[16]    : 16个已完成SHA256 padding的64字节block指针
+ * hash160s[16]  : 16个输出缓冲区（每个20字节）
+ */
+void hash160_16way_compressed_prepadded(const uint8_t *blocks[16], uint8_t hash160s[16][20]);
+
+/*
+ * 16路并行计算非压缩公钥的hash160（预填充，零拷贝）
+ * bufs[16]      : 16个128字节buffer指针，布局如下：
+ *                   buf[0..63]  = 公钥前64字节（SHA256 block1，无需padding）
+ *                   buf[64..127]= SHA256 block2（已完成padding）
+ * hash160s[16]  : 16个输出缓冲区（每个20字节）
+ */
+void hash160_16way_uncompressed_prepadded(const uint8_t *bufs[16], uint8_t hash160s[16][20]);
 
 /*
  * 16路并行查表：同时查找16个hash160

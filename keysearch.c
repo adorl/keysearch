@@ -160,31 +160,39 @@ static void *search_key(void *arg)
             if (valid_count > 16)
                 valid_count = 16;
 
-            /* 构造16组公钥字节（不足部分用最后一个有效点填充） */
-            uint8_t comp_bufs[16][33];
-            uint8_t uncomp_bufs[16][65];
+            /* 构造16组公钥字节（不足部分用最后一个有效点填充）
+             * comp_bufs: 64字节（前33字节为公钥，后31字节为SHA256 padding）
+             * uncomp_bufs: 128字节（前65字节为公钥，后63字节为SHA256 block2 padding）
+             * 两者均原地构造padded block，避免hash160函数内部拷贝 */
+            uint8_t comp_bufs[16][64];
+            uint8_t uncomp_bufs[16][128];
             const uint8_t *comp_ptrs[16];
             const uint8_t *uncomp_ptrs[16];
 
             for (int lane = 0; lane < 16; lane++) {
                 int idx = b + (lane < valid_count ? lane : valid_count - 1);
                 if (ge_batch[idx].infinity) {
-                    /* 无穷远点：填充全零（不会命中哈希表） */
-                    memset(comp_bufs[lane], 0, 33);
-                    memset(uncomp_bufs[lane], 0, 65);
+                    /* 无穷远点：填充全零公钥并做padding（不会命中哈希表） */
+                    memset(comp_bufs[lane], 0, 64);
+                    memset(uncomp_bufs[lane], 0, 128);
+                    sha256_pad_block_33(comp_bufs[lane]);
+                    sha256_pad_block2_65(uncomp_bufs[lane]);
                 }
                 else {
                     keygen_ge_to_pubkey_bytes(&ge_batch[idx], comp_bufs[lane], uncomp_bufs[lane]);
+                    /* 原地完成SHA256 padding，省去hash160函数内部的memset+memcpy */
+                    sha256_pad_block_33(comp_bufs[lane]);
+                    sha256_pad_block2_65(uncomp_bufs[lane]);
                 }
                 comp_ptrs[lane] = comp_bufs[lane];
                 uncomp_ptrs[lane] = uncomp_bufs[lane];
             }
 
-            /* 16路并行计算hash160 */
+            /* 16路并行计算hash160（压缩/非压缩均使用预填充接口，零拷贝） */
             uint8_t hash160_comp_16[16][20];
             uint8_t hash160_uncomp_16[16][20];
-            hash160_16way_compressed(comp_ptrs, hash160_comp_16);
-            hash160_16way_uncompressed(uncomp_ptrs, hash160_uncomp_16);
+            hash160_16way_compressed_prepadded(comp_ptrs, hash160_comp_16);
+            hash160_16way_uncompressed_prepadded(uncomp_ptrs, hash160_uncomp_16);
 
             /* 构造16路指针数组用于批量查表 */
             const uint8_t *comp_h160_ptrs[16];
