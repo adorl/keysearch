@@ -26,8 +26,8 @@ else
 endif
 
 # 源文件列表
-SRCS_MAIN = keysearch.c hash_utils.c sha256.c ripemd160.c $(SIMD_SRCS) rand_key.c secp256k1_keygen.c
-SRCS_TEST = test_case.c hash_utils.c sha256.c ripemd160.c $(SIMD_SRCS) rand_key.c secp256k1_keygen.c
+SRCS_MAIN = keysearch.c keylog.c hash_utils.c sha256.c ripemd160.c $(SIMD_SRCS) rand_key.c secp256k1_keygen.c
+SRCS_TEST = test_case.c keylog.c hash_utils.c sha256.c ripemd160.c $(SIMD_SRCS) rand_key.c secp256k1_keygen.c
 
 OBJS_MAIN = $(SRCS_MAIN:.c=.o) $(SECP256K1_OBJ)
 OBJS_TEST = $(SRCS_TEST:.c=.o) $(SECP256K1_OBJ)

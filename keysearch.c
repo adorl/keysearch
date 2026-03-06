@@ -4,7 +4,7 @@
  *   - pthread       (多线程)
  *   SHA256 与 RIPEMD160 均已内嵌纯 C 实现，无需 OpenSSL
  * 用法：
- *   ./keysearch <地址文件> [线程数]
+ *   ./keysearch -a <地址文件> [-n 线程数] [-h]
  */
 #define _POSIX_C_SOURCE 200112L
 
@@ -14,7 +14,10 @@
 #include <stdint.h>
 #include <pthread.h>
 #include <time.h>
+#include <fcntl.h>
+#include <unistd.h>
 
+#include "keylog.h"
 #include "sha256.h"
 #include "ripemd160.h"
 #include "hash_utils.h"
@@ -30,7 +33,7 @@
 
 /* ===================== 常量定义 ===================== */
 #define MAX_ATTEMPTS        (1ULL << 63)    /* 每个线程最大尝试次数 */
-#define PROGRESS_INTERVAL   (1000000)       /* 进度打印间隔 */
+#define PROGRESS_INTERVAL   (10000000)      /* 进度打印间隔 */
 #define MAX_ADDRESSES       (400000)        /* 最多支持的目标地址数量 */
 #define ADDRESS_LEN         (35)            /* 比特币地址最大长度 */
 #define BATCH_SIZE          (4096)          /* 增量推导批次大小，每批后重置随机基准私钥 */
@@ -79,7 +82,7 @@ static void *search_key(void *arg)
 
     /* 初始化真随机上下文（每线程独立fd，无锁竞争） */
     if (rand_ctx_init(&rand_ctx) != 0) {
-        fprintf(stderr, "[线程-%d] 打开/dev/urandom失败\n", thread_id);
+        keylog_error("[线程-%d] 打开/dev/urandom失败", thread_id);
         return NULL;
     }
 
@@ -98,7 +101,7 @@ static void *search_key(void *arg)
     while (count < MAX_ATTEMPTS) {
         /* 生成随机基准私钥 */
         if (gen_random_key(privkey, &rand_ctx) != 0) {
-            fprintf(stderr, "[线程-%d] 读取随机数失败\n", thread_id);
+            keylog_error("[线程-%d] 读取随机数失败", thread_id);
             break;
         }
 
@@ -220,13 +223,12 @@ static void *search_key(void *arg)
                     char address_compressed[ADDRESS_LEN + 1];
                     char address_uncompressed[ADDRESS_LEN + 1];
                     bytes_to_hex(privkey, 32, privkey_hex);
-                    fprintf(stdout, "\n[线程-%d] 找到匹配！总尝试次数: %lu\n", thread_id, count);
-                    fprintf(stdout, "私钥(hex): %s\n", privkey_hex);
+                    keylog_info("[线程-%d] 找到匹配！总尝试次数: %lu", thread_id, count);
+                    keylog_info("私钥(hex): %s", privkey_hex);
                     if (privkey_to_address(privkey, address_compressed, address_uncompressed) == 0) {
-                        fprintf(stdout, "压缩地址: %s\n", address_compressed);
-                        fprintf(stdout, "非压缩地址: %s\n", address_uncompressed);
+                        keylog_info("压缩地址: %s", address_compressed);
+                        keylog_info("非压缩地址: %s", address_uncompressed);
                     }
-                    fflush(stdout);
                 }
             }
 
@@ -237,8 +239,7 @@ static void *search_key(void *arg)
                 clock_gettime(CLOCK_MONOTONIC, &ts_now);
                 double elapsed = (ts_now.tv_sec - ts_last.tv_sec) + (ts_now.tv_nsec - ts_last.tv_nsec) * 1e-9;
                 double kps = (elapsed > 0) ? (double)(count - count_last) / elapsed : 0.0;
-                fprintf(stdout, "[线程-%d] 已尝试: %lu 速度: %.0f keys/s\n", thread_id, count, kps);
-                fflush(stdout);
+                keylog_info("[线程-%d] 已尝试: %lu 速度: %.0f keys/s", thread_id, count, kps);
                 ts_last = ts_now;
                 count_last = count;
             }
@@ -319,13 +320,12 @@ static void *search_key(void *arg)
                     char address_compressed[ADDRESS_LEN + 1];
                     char address_uncompressed[ADDRESS_LEN + 1];
                     bytes_to_hex(privkey, 32, privkey_hex);
-                    fprintf(stdout, "\n[线程-%d] 找到匹配！总尝试次数: %lu\n", thread_id, count);
-                    fprintf(stdout, "私钥(hex): %s\n", privkey_hex);
+                    keylog_info("[线程-%d] 找到匹配！总尝试次数: %lu", thread_id, count);
+                    keylog_info("私钥(hex): %s", privkey_hex);
                     if (privkey_to_address(privkey, address_compressed, address_uncompressed) == 0) {
-                        fprintf(stdout, "压缩地址: %s\n", address_compressed);
-                        fprintf(stdout, "非压缩地址: %s\n", address_uncompressed);
+                        keylog_info("压缩地址: %s", address_compressed);
+                        keylog_info("非压缩地址: %s", address_uncompressed);
                     }
-                    fflush(stdout);
                 }
             }
 
@@ -336,8 +336,7 @@ static void *search_key(void *arg)
                 clock_gettime(CLOCK_MONOTONIC, &ts_now);
                 double elapsed = (ts_now.tv_sec - ts_last.tv_sec) + (ts_now.tv_nsec - ts_last.tv_nsec) * 1e-9;
                 double kps = (elapsed > 0) ? (double)(count - count_last) / elapsed : 0.0;
-                fprintf(stdout, "[线程-%d] 已尝试: %lu 速度: %.0f keys/s\n", thread_id, count, kps);
-                fflush(stdout);
+                keylog_info("[线程-%d] 已尝试: %lu 速度: %.0f keys/s", thread_id, count, kps);
                 ts_last = ts_now;
                 count_last = count;
             }
@@ -373,13 +372,12 @@ static void *search_key(void *arg)
                 char address_compressed[ADDRESS_LEN + 1];
                 char address_uncompressed[ADDRESS_LEN + 1];
                 bytes_to_hex(privkey, 32, privkey_hex);
-                fprintf(stdout, "\n[线程-%d] 找到匹配！总尝试次数: %lu\n", thread_id, count);
-                fprintf(stdout, "私钥(hex): %s\n", privkey_hex);
+                keylog_info("[线程-%d] 找到匹配！总尝试次数: %lu", thread_id, count);
+                keylog_info("私钥(hex): %s", privkey_hex);
                 if (privkey_to_address(privkey, address_compressed, address_uncompressed) == 0) {
-                    fprintf(stdout, "压缩地址: %s\n", address_compressed);
-                    fprintf(stdout, "非压缩地址: %s\n", address_uncompressed);
+                    keylog_info("压缩地址: %s", address_compressed);
+                    keylog_info("非压缩地址: %s", address_uncompressed);
                 }
-                fflush(stdout);
             }
 
             /* 性能监控：每PROGRESS_INTERVAL次输出keys/s */
@@ -388,8 +386,7 @@ static void *search_key(void *arg)
                 clock_gettime(CLOCK_MONOTONIC, &ts_now);
                 double elapsed = (ts_now.tv_sec - ts_last.tv_sec) + (ts_now.tv_nsec - ts_last.tv_nsec) * 1e-9;
                 double kps = (elapsed > 0) ? (double)(count - count_last) / elapsed : 0.0;
-                fprintf(stdout, "[线程-%d] 已尝试: %lu 速度: %.0f keys/s\n", thread_id, count, kps);
-                fflush(stdout);
+                keylog_info("[线程-%d] 已尝试: %lu 速度: %.0f keys/s", thread_id, count, kps);
                 ts_last = ts_now;
                 count_last = count;
             }
@@ -404,7 +401,7 @@ static void *search_key(void *arg)
     while (count < MAX_ATTEMPTS) {
         /* 生成随机私钥 */
         if (gen_random_key(privkey, &rand_ctx) != 0) {
-            fprintf(stderr, "[线程-%d] 读取随机数失败\n", thread_id);
+            keylog_error("[线程-%d] 读取随机数失败", thread_id);
             break;
         }
 
@@ -430,13 +427,12 @@ static void *search_key(void *arg)
                 char address_compressed[ADDRESS_LEN + 1];
                 char address_uncompressed[ADDRESS_LEN + 1];
                 bytes_to_hex(privkey, 32, privkey_hex);
-                fprintf(stdout, "\n[线程-%d] 找到匹配！总尝试次数: %lu\n", thread_id, count);
-                fprintf(stdout, "私钥(hex): %s\n", privkey_hex);
+                keylog_info("[线程-%d] 找到匹配！总尝试次数: %lu", thread_id, count);
+                keylog_info("私钥(hex): %s", privkey_hex);
                 if (privkey_to_address(privkey, address_compressed, address_uncompressed) == 0) {
-                    fprintf(stdout, "压缩地址: %s\n", address_compressed);
-                    fprintf(stdout, "非压缩地址: %s\n", address_uncompressed);
+                    keylog_info("压缩地址: %s", address_compressed);
+                    keylog_info("非压缩地址: %s", address_uncompressed);
                 }
-                fflush(stdout);
             }
 
             if (--progress_counter == 0) {
@@ -445,19 +441,18 @@ static void *search_key(void *arg)
                 double elapsed = (ts_now.tv_sec - ts_last.tv_sec)
                                + (ts_now.tv_nsec - ts_last.tv_nsec) * 1e-9;
                 double kps = (elapsed > 0) ? (double)(count - count_last) / elapsed : 0.0;
-                fprintf(stdout, "[线程-%d] 已尝试: %lu 速度: %.0f keys/s\n",
+                keylog_info("[线程-%d] 已尝试: %lu 速度: %.0f keys/s",
                         thread_id, count, kps);
-                fflush(stdout);
                 ts_last = ts_now;
                 count_last = count;
             }
 
             if (!secp256k1_ec_seckey_tweak_add(secp_ctx, privkey, tweak)) {
-                fprintf(stderr, "警告：私钥推导失败，batch=%d！\n", batch);
+                keylog_warn("私钥推导失败，batch=%d！", batch);
                 break;
             }
             if (!secp256k1_ec_pubkey_tweak_add(secp_ctx, &pubkey, tweak)) {
-                fprintf(stderr, "警告：公钥推导失败，batch=%d！\n", batch);
+                keylog_warn("公钥推导失败，batch=%d！", batch);
                 break;
             }
         }
@@ -465,10 +460,9 @@ static void *search_key(void *arg)
 #endif
 
     if (count >= MAX_ATTEMPTS) {
-        fprintf(stdout, "[线程-%d] 已达到最大尝试次数，退出。\n", thread_id);
+        keylog_info("[线程-%d] 已达到最大尝试次数，退出。", thread_id);
     }
 
-    fflush(stdout);
     return NULL;
 }
 
@@ -477,7 +471,7 @@ static int load_target_addresses(const char *filename)
 {
     FILE *f = fopen(filename, "r");
     if (!f) {
-        fprintf(stderr, "错误：文件%s不存在！\n", filename);
+        keylog_error("文件%s不存在！", filename);
         return -1;
     }
 
@@ -493,7 +487,7 @@ static int load_target_addresses(const char *filename)
         if (len == 0)
             continue;
         if (count >= MAX_ADDRESSES) {
-            fprintf(stderr, "警告：地址数量超过上限%d，忽略多余地址\n", MAX_ADDRESSES);
+            keylog_warn("地址数量超过上限%d，忽略多余地址", MAX_ADDRESSES);
             break;
         }
 
@@ -501,7 +495,7 @@ static int load_target_addresses(const char *filename)
         uint8_t h160[20];
         int ret = base58check_decode(line, h160);
         if (ret != 0) {
-            fprintf(stderr, "警告：地址解码失败（ret=%d），跳过：%s\n", ret, line);
+            keylog_warn("地址解码失败（ret=%d），跳过：%s", ret, line);
             skip_count++;
             continue;
         }
@@ -512,30 +506,57 @@ static int load_target_addresses(const char *filename)
     fclose(f);
 
     if (count == 0) {
-        fprintf(stderr, "错误：文件%s中没有有效地址！\n", filename);
+        keylog_error("文件%s中没有有效地址！", filename);
         return -1;
     }
     address_count = count;
-    fprintf(stdout, "成功加载%d个地址（跳过%d个无效地址）\n", count, skip_count);
+    keylog_info("成功加载%d个地址（跳过%d个无效地址）", count, skip_count);
 
-    fflush(stdout);
     return 0;
 }
 
 /* ===================== 主函数 ===================== */
 int main(int argc, char *argv[])
 {
-    if (argc < 2) {
-        printf("用法: ./test <地址文件> [线程数]\n");
-        printf("  地址文件: 每行一个目标比特币地址\n");
-        printf("  线程数:   可选，默认为 4\n");
+    const char *address_file = NULL;
+    int thread_count = 4;   /* 默认线程数 */
+    int opt;
+
+    while ((opt = getopt(argc, argv, "a:n:h")) != -1) {
+        switch (opt) {
+        case 'a':
+            address_file = optarg;
+            break;
+        case 'n': {
+            int n = atoi(optarg);
+            if (n <= 0) {
+                fprintf(stderr, "警告：-n参数值无效（%s），使用默认线程数4\n", optarg); /* log_init前，只能用stderr */
+                thread_count = 4;
+            } else {
+                thread_count = n;
+            }
+            break;
+        }
+        case 'h':
+            fprintf(stdout, "用法: ./keysearch -a <地址文件> [-n <线程数>] [-h]\n");
+            fprintf(stdout, "  -a <地址文件>  每行一个目标比特币地址（必填）\n");
+            fprintf(stdout, "  -n <线程数>    工作线程数量，默认为 4\n");
+            fprintf(stdout, "  -h             显示此帮助信息\n");
+            return 0;
+        default:
+            fprintf(stderr, "错误：未知参数，使用-h查看帮助\n"); /* log_init前，只能用stderr */
+            return 1;
+        }
+    }
+
+    if (!address_file) {
+        fprintf(stderr, "错误：必须通过-a指定地址文件，使用-h查看帮助\n"); /* log_init前，只能用stderr */
         return 1;
     }
 
-    const char *address_file = argv[1];
-    int thread_count = (argc >= 3) ? atoi(argv[2]) : 4;
-    if (thread_count <= 0)
-        thread_count = 4;
+    /* 初始化日志文件 */
+    if (log_init() != 0)
+        return 1;
 
     /* 初始化哈希表（开放寻址，负载因子 ≤ 0.5，槽位数为地址数2倍向上取2的幂次） */
     /* 先用最大容量初始化：MAX_ADDRESSES * 2，向上取2的幂次 */
@@ -543,29 +564,34 @@ int main(int argc, char *argv[])
     while (ht_capacity < (uint32_t)MAX_ADDRESSES * 2)
         ht_capacity <<= 1;
     if (ht_init(ht_capacity) != 0) {
-        fprintf(stderr, "错误：哈希表内存分配失败\n");
+        keylog_error("哈希表内存分配失败");
+        log_close();
         return 1;
     }
 
     /* 加载目标地址 */
-    if (load_target_addresses(address_file) != 0)
+    if (load_target_addresses(address_file) != 0) {
+        log_close();
         return 1;
+    }
 
-    fprintf(stdout, "已加载%d个目标地址，启动%d个线程开始查找...\n",
-           address_count, thread_count);
+    keylog_info("已加载%d个目标地址，启动%d个线程开始查找...",
+                address_count, thread_count);
 
     /* 初始化secp256k1上下文（SIGN用于创建公钥） */
     secp_ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
     if (!secp_ctx) {
-        fprintf(stderr, "错误：初始化secp256k1失败\n");
+        keylog_error("初始化secp256k1失败");
+        log_close();
         return 1;
     }
 
 #ifndef USE_PUBKEY_API_ONLY
     /* 初始化全局生成元G的仿射坐标 */
     if (keygen_init_generator(secp_ctx, &G_affine) != 0) {
-        fprintf(stderr, "错误：初始化生成元G失败\n");
+        keylog_error("初始化生成元G失败");
         secp256k1_context_destroy(secp_ctx);
+        log_close();
         return 1;
     }
 #endif
@@ -585,7 +611,7 @@ int main(int argc, char *argv[])
     }
 
     if (!found_flag) {
-        fprintf(stdout, "所有线程均已达到最大尝试次数，未找到匹配地址。\n");
+        keylog_info("所有线程均已达到最大尝试次数，未找到匹配地址。");
     }
 
     /* 清理资源 */
@@ -594,7 +620,7 @@ int main(int argc, char *argv[])
     free(threads);
     free(args);
 
-    fflush(stdout);
+    log_close();
     return 0;
 }
 
