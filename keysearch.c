@@ -92,6 +92,186 @@ static void *search_key(void *arg)
     uint64_t count_last = 0;
 
 #ifndef USE_PUBKEY_API_ONLY
+
+#ifdef __AVX512IFMA__
+    /*
+     * AVX-512 IFMA 16链缓冲区：每条链积累BATCH_SIZE步的Jacobian点和rzr因子
+     * 三个缓冲区合计约24MB，必须堆分配
+     * 在最外层循环前分配一次，线程退出时统一释放
+     */
+    secp256k1_gej (*gej_buf)[BATCH_SIZE] = malloc(16 * BATCH_SIZE * sizeof(secp256k1_gej));
+    secp256k1_fe (*rzr_buf)[BATCH_SIZE] = malloc(16 * BATCH_SIZE * sizeof(secp256k1_fe));
+    secp256k1_ge (*ge_buf)[BATCH_SIZE]  = malloc(16 * BATCH_SIZE * sizeof(secp256k1_ge));
+    if (!gej_buf || !rzr_buf || !ge_buf) {
+        keylog_error("[线程-%d] AVX-512 批次缓冲区内存分配失败", thread_id);
+        free(gej_buf); free(rzr_buf); free(ge_buf);
+        goto avx512_thread_exit;
+    }
+
+    while (count < MAX_ATTEMPTS) {
+        /* 16条独立链的当前Jacobian坐标和私钥scalar */
+        secp256k1_gej chain_gej[16];
+        secp256k1_scalar chain_scalar[16];
+        secp256k1_scalar chain_base_scalar[16];
+        /* chain_valid_steps[ch]：该链本批次实际积累的有效步数 */
+        int chain_valid_steps[16];
+
+        /* 初始化16条链：全部独立随机生成 */
+        for (int ch = 0; ch < 16; ch++) {
+            uint8_t ch_privkey[32];
+            int ch_ok = 0;
+            while (!ch_ok) {
+                if (gen_random_key(ch_privkey, &rand_ctx) != 0) {
+                    keylog_error("[线程-%d] 读取随机数失败", thread_id);
+                    continue;
+                }
+
+                int overflow = 0;
+                secp256k1_scalar_set_b32(&chain_base_scalar[ch], ch_privkey, &overflow);
+                if (overflow || secp256k1_scalar_is_zero(&chain_base_scalar[ch]))
+                    continue;
+                if (keygen_privkey_to_gej(secp_ctx, ch_privkey, &chain_gej[ch]) != 0)
+                    continue;
+
+                chain_scalar[ch] = chain_base_scalar[ch];
+                ch_ok = 1;
+            }
+
+            chain_valid_steps[ch] = BATCH_SIZE;
+        }
+
+        /* 内层循环：每次推进16条链各一步，共BATCH_SIZE步，只积累不归一化 */
+        for (int step = 0; step < BATCH_SIZE; step++) {
+            secp256k1_fe step_rzr[16];
+            secp256k1_gej next_gej_16[16];
+            if (step == 0)
+                gej_add_ge_var_16way(next_gej_16, chain_gej, &G_affine, step_rzr, 0);
+            else
+                gej_add_ge_var_16way(next_gej_16, chain_gej, &G_affine, step_rzr, 1);
+
+            for (int ch = 0; ch < 16; ch++) {
+                /* 链已经溢出归零 */
+                if (step >= chain_valid_steps[ch]) {
+                    continue;
+                }
+
+                gej_buf[ch][step] = next_gej_16[ch];
+                rzr_buf[ch][step] = step_rzr[ch];
+
+                /* 更新各链状态（scalar+1，检测溢出归零） */
+                secp256k1_scalar_add(&chain_scalar[ch], &chain_scalar[ch], &tweak_scalar);
+                if (secp256k1_scalar_is_zero(&chain_scalar[ch])) {
+                    chain_valid_steps[ch] = step + 1;
+                } else {
+                    chain_gej[ch] = next_gej_16[ch];
+                }
+            }
+        }
+
+        /* 批量归一化：对每条链调用keygen_batch_normalize_rzr */
+        for (int ch = 0; ch < 16; ch++) {
+            keygen_batch_normalize_rzr(gej_buf[ch], ge_buf[ch], rzr_buf[ch],
+                                       (size_t)chain_valid_steps[ch]);
+        }
+
+        /* 遍历所有步骤，以16路为单位批量计算 hash160 并查表 */
+        for (int step = 0; step < BATCH_SIZE && count < MAX_ATTEMPTS; step++) {
+            uint8_t comp_bufs[16][64];
+            uint8_t uncomp_bufs[16][128];
+            const uint8_t *comp_ptrs[16];
+            const uint8_t *uncomp_ptrs[16];
+
+            for (int lane = 0; lane < 16; lane++) {
+                if (step >= chain_valid_steps[lane] || ge_buf[lane][step].infinity) {
+                    memset(comp_bufs[lane], 0, 64);
+                    memset(uncomp_bufs[lane], 0, 128);
+                    sha256_pad_block_33(comp_bufs[lane]);
+                    sha256_pad_block2_65(uncomp_bufs[lane]);
+                } else {
+                    keygen_ge_to_pubkey_bytes(&ge_buf[lane][step],
+                                             comp_bufs[lane], uncomp_bufs[lane]);
+                    sha256_pad_block_33(comp_bufs[lane]);
+                    sha256_pad_block2_65(uncomp_bufs[lane]);
+                }
+                comp_ptrs[lane] = comp_bufs[lane];
+                uncomp_ptrs[lane] = uncomp_bufs[lane];
+            }
+
+            /* 16路并行计算 hash160 */
+            uint8_t hash160_comp_16[16][20];
+            uint8_t hash160_uncomp_16[16][20];
+            hash160_16way_compressed_prepadded(comp_ptrs, hash160_comp_16);
+            hash160_16way_uncompressed_prepadded(uncomp_ptrs, hash160_uncomp_16);
+
+            const uint8_t *comp_h160_ptrs[16];
+            const uint8_t *uncomp_h160_ptrs[16];
+            for (int lane = 0; lane < 16; lane++) {
+                comp_h160_ptrs[lane] = hash160_comp_16[lane];
+                uncomp_h160_ptrs[lane] = hash160_uncomp_16[lane];
+            }
+
+            /* 16路批量查表 */
+            uint16_t mask_comp = ht_contains_16way(comp_h160_ptrs);
+            uint16_t mask_uncomp = ht_contains_16way(uncomp_h160_ptrs);
+            uint16_t hit_mask = mask_comp | mask_uncomp;
+
+            /* 统计本步有效 lane 数 */
+            int valid_lanes = 0;
+            for (int lane = 0; lane < 16; lane++) {
+                if (step < chain_valid_steps[lane])
+                    valid_lanes++;
+            }
+            count += (uint64_t)valid_lanes;
+
+            if (hit_mask) {
+                for (int lane = 0; lane < 16; lane++) {
+                    if (!(hit_mask & (1u << lane)))
+                        continue;
+                    if (step >= chain_valid_steps[lane])
+                        continue;
+                    if (ge_buf[lane][step].infinity)
+                        continue;
+
+                    found_flag = 1;
+                    secp256k1_scalar hit_scalar = chain_base_scalar[lane];
+                    for (int i = 0; i < step; i++) {
+                        secp256k1_scalar_add(&hit_scalar, &hit_scalar, &tweak_scalar);
+                    }
+                    secp256k1_scalar_get_b32(privkey, &hit_scalar);
+                    char privkey_hex[65];
+                    char address_compressed[ADDRESS_LEN + 1];
+                    char address_uncompressed[ADDRESS_LEN + 1];
+                    bytes_to_hex(privkey, 32, privkey_hex);
+                    keylog_info("[线程-%d] 找到匹配！总尝试次数: %lu", thread_id, count);
+                    keylog_info("私钥(hex): %s", privkey_hex);
+                    if (privkey_to_address(privkey, address_compressed, address_uncompressed) == 0) {
+                        keylog_info("压缩地址: %s", address_compressed);
+                        keylog_info("非压缩地址: %s", address_uncompressed);
+                    }
+                }
+            }
+
+            /* 性能监控 */
+            progress_counter -= valid_lanes;
+            if (progress_counter <= 0) {
+                progress_counter = PROGRESS_INTERVAL;
+                clock_gettime(CLOCK_MONOTONIC, &ts_now);
+                double elapsed = (ts_now.tv_sec - ts_last.tv_sec) + (ts_now.tv_nsec - ts_last.tv_nsec) * 1e-9;
+                double kps = (elapsed > 0) ? (double)(count - count_last) / elapsed : 0.0;
+                keylog_info("[线程-%d] 已尝试: %lu 速度: %.0f keys/s", thread_id, count, kps);
+                ts_last = ts_now;
+                count_last = count;
+            }
+        }
+    }
+
+avx512_thread_exit:
+    free(gej_buf);
+    free(rzr_buf);
+    free(ge_buf);
+
+#else /* !__AVX512IFMA__ */
+
     secp256k1_gej gej_batch[BATCH_SIZE];    /* Jacobian坐标批次缓冲区 */
     secp256k1_ge ge_batch[BATCH_SIZE];      /* 仿射坐标批次缓冲区 */
     secp256k1_fe rzr_batch[BATCH_SIZE];     /* Z坐标增量因子：Z[i+1] = Z[i] * rzr[i] */
@@ -112,7 +292,7 @@ static void *search_key(void *arg)
         secp256k1_scalar_set_b32(&base_privkey_scalar, privkey, &overflow);
         if (overflow || secp256k1_scalar_is_zero(&base_privkey_scalar))
             continue;
-    
+
         cur_privkey_scalar = base_privkey_scalar;
 
         secp256k1_gej cur_gej;
@@ -151,19 +331,15 @@ static void *search_key(void *arg)
         /* 批量归一化：利用rzr增量因子，省去前向累积对gej.z的内存读取 */
         keygen_batch_normalize_rzr(gej_batch, ge_batch, rzr_batch, (size_t)batch_valid);
 
-        /* 遍历仿射坐标数组，计算hash160并查表 */
 #ifdef __AVX512F__
-        /* AVX-512路径：以16为步长批量处理 */
+
+        /* 以16为步长批量处理（AVX-512F 16路并发SHA256+RIPEMD160） */
         for (int b = 0; b < batch_valid; b += 16) {
             /* 计算本组实际有效lane数（不足16时用最后一个有效点填充） */
             int valid_count = batch_valid - b;
             if (valid_count > 16)
                 valid_count = 16;
 
-            /* 构造16组公钥字节（不足部分用最后一个有效点填充）
-             * comp_bufs: 64字节（前33字节为公钥，后31字节为SHA256 padding）
-             * uncomp_bufs: 128字节（前65字节为公钥，后63字节为SHA256 block2 padding）
-             * 两者均原地构造padded block，避免hash160函数内部拷贝 */
             uint8_t comp_bufs[16][64];
             uint8_t uncomp_bufs[16][128];
             const uint8_t *comp_ptrs[16];
@@ -172,7 +348,6 @@ static void *search_key(void *arg)
             for (int lane = 0; lane < 16; lane++) {
                 int idx = b + (lane < valid_count ? lane : valid_count - 1);
                 if (ge_batch[idx].infinity) {
-                    /* 无穷远点：填充全零公钥并做padding（不会命中哈希表） */
                     memset(comp_bufs[lane], 0, 64);
                     memset(uncomp_bufs[lane], 0, 128);
                     sha256_pad_block_33(comp_bufs[lane]);
@@ -180,7 +355,6 @@ static void *search_key(void *arg)
                 }
                 else {
                     keygen_ge_to_pubkey_bytes(&ge_batch[idx], comp_bufs[lane], uncomp_bufs[lane]);
-                    /* 原地完成SHA256 padding，省去hash160函数内部的memset+memcpy */
                     sha256_pad_block_33(comp_bufs[lane]);
                     sha256_pad_block2_65(uncomp_bufs[lane]);
                 }
@@ -193,8 +367,6 @@ static void *search_key(void *arg)
             uint8_t hash160_uncomp_16[16][20];
             hash160_16way_compressed_prepadded(comp_ptrs, hash160_comp_16);
             hash160_16way_uncompressed_prepadded(uncomp_ptrs, hash160_uncomp_16);
-
-            /* 构造16路指针数组用于批量查表 */
             const uint8_t *comp_h160_ptrs[16];
             const uint8_t *uncomp_h160_ptrs[16];
             for (int lane = 0; lane < 16; lane++) {
@@ -202,7 +374,7 @@ static void *search_key(void *arg)
                 uncomp_h160_ptrs[lane] = hash160_uncomp_16[lane];
             }
 
-            /* 16路批量查表（压缩+非压缩各一次，共32路） */
+            /* 16路批量查表（压缩+非压缩各一次） */
             uint16_t mask_comp = ht_contains_16way(comp_h160_ptrs);
             uint16_t mask_uncomp = ht_contains_16way(uncomp_h160_ptrs);
             uint16_t hit_mask = mask_comp | mask_uncomp;
@@ -221,7 +393,6 @@ static void *search_key(void *arg)
                         continue;
 
                     found_flag = 1;
-                    /* 命中时重建私钥：从base_privkey_scalar出发，scalar加法重建命中位置 */
                     secp256k1_scalar hit_scalar = base_privkey_scalar;
                     for (int i = 0; i < b_idx; i++) {
                         secp256k1_scalar_add(&hit_scalar, &hit_scalar, &tweak_scalar);
@@ -253,7 +424,8 @@ static void *search_key(void *arg)
             }
         }
 #elif defined(__AVX2__)
-        /* AVX2路径：以8为步长批量处理 */
+
+        /* 以8为步长批量处理 */
         for (int b = 0; b < batch_valid; b += 8) {
             /* 计算本组实际有效lane数（不足8时用最后一个有效点填充） */
             int valid_count = batch_valid - b;
@@ -350,7 +522,7 @@ static void *search_key(void *arg)
             }
         }
 #else
-        /* 标量路径（非 AVX2 平台） */
+        /* 标量路径（非 AVX512F/AVX2 平台） */
         for (int b = 0; b < batch_valid; b++) {
             count++;
 
@@ -401,7 +573,11 @@ static void *search_key(void *arg)
         }
 #endif /* __AVX512F__ / __AVX2__ */
     }
-#else
+
+#endif /* __AVX512IFMA__ */
+
+#else /* USE_PUBKEY_API_ONLY */
+
     secp256k1_pubkey pubkey;
     uint8_t pubkey_compressed[33];
     uint8_t pubkey_uncompressed[65];
@@ -465,7 +641,7 @@ static void *search_key(void *arg)
             }
         }
     }
-#endif
+#endif /* USE_PUBKEY_API_ONLY */
 
     if (count >= MAX_ATTEMPTS) {
         keylog_info("[线程-%d] 已达到最大尝试次数，退出。", thread_id);

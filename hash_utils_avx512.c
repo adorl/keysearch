@@ -321,12 +321,7 @@ uint16_t ht_contains_16way(const uint8_t *h160s[16])
             fp = 1;
         fps[i] = fp;
 
-        uint32_t hv = 2166136261u;
-        for (int j = 0; j < 20; j++) {
-            hv ^= h[j];
-            hv *= 16777619u;
-        }
-        idxs[i] = hv & ht_mask;
+        idxs[i] = (fp * 2654435761u) & ht_mask;
     }
 
     uint16_t result = 0;

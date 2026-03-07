@@ -20,7 +20,7 @@ endif
 # 检测CPU架构：只在x86-64上编译AVX2文件
 ARCH := $(shell uname -m)
 ifeq ($(ARCH),x86_64)
-    SIMD_SRCS = sha256_avx2.c ripemd160_avx2.c sha256_avx512.c ripemd160_avx512.c hash_utils_avx512.c
+    SIMD_SRCS = sha256_avx2.c ripemd160_avx2.c sha256_avx512.c ripemd160_avx512.c hash_utils_avx512.c secp256k1_keygen_avx512.c
 else
     SIMD_SRCS =
 endif
@@ -78,8 +78,14 @@ hash_utils.o: hash_utils.c
 hash_utils_avx512.o: hash_utils_avx512.c
 	$(CC) $(CFLAGS) -mavx512f -c -o $@ $<
 
+secp256k1_keygen_avx512.o: secp256k1_keygen_avx512.c
+	$(CC) $(CFLAGS) -mavx512f -mavx512ifma -c -o $@ $<
+
+keysearch.o: keysearch.c
+	$(CC) $(CFLAGS) -mavx512f -mavx512ifma -c -o $@ $<
+
 test_case.o: test_case.c
-	$(CC) $(CFLAGS) -mavx2 -D__AVX512F__ -c -o $@ $<
+	$(CC) $(CFLAGS) -mavx2 -mavx512f -mavx512ifma -c -o $@ $<
 endif
 
 test: test_case
@@ -87,4 +93,5 @@ test: test_case
 
 clean:
 	rm -f *.o keysearch test_case
+
 

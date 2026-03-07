@@ -102,6 +102,19 @@ void keygen_ge_to_pubkey_bytes(const secp256k1_ge *ge,
                                uint8_t *compressed_out,
                                uint8_t *uncompressed_out);
 
+#ifdef __AVX512IFMA__
+/* AVX-512 IFMA 16路并行点加法
+ * normed=0：对输入坐标做normalize_weak（首步使用）
+ * normed=1：跳过normalize_weak（调用方保证 magnitude=1，后续步使用）
+ */
+void gej_add_ge_var_16way(secp256k1_gej r[16],
+                          const secp256k1_gej a[16],
+                          const secp256k1_ge *b,
+                          secp256k1_fe rzr[16],
+                          int normed);
+
+#endif /* __AVX512IFMA__ */
+
 #else
 
 /* 回退模式下使用系统安装的secp256k1.h提供公开类型 */
