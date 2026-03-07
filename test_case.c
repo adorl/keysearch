@@ -2783,6 +2783,745 @@ static void test_search_key_privkey_pubkey(void) {
         }
     }
 }
+
+
+#if defined(__AVX512IFMA__) && !defined(USE_PUBKEY_API_ONLY)
+/* ------------------------------------------------------------------
+ * test_gej_add_ge_var_16way
+ *
+ * 验证 search_key 中 gej_add_ge_var_16way / gej_add_ge_var_16way_normed
+ * 的功能正确性：16路并行点加结果与标准 secp256k1_gej_add_ge_var 逐条一致。
+ *
+ * 覆盖场景：
+ *   8.1  单步验证：16条链各推进1步，AVX-512 结果与标量逐条对比
+ *   8.2  多步连续推进（模拟 search_key 内层循环，交替使用
+ *        gej_add_ge_var_16way / gej_add_ge_var_16way_normed）：
+ *        N 步后归一化，每点公钥与标准 API 完全一致
+ *   8.3  边界情况：a=b（点倍）和 a=infinity 的处理
+ * ------------------------------------------------------------------ */
+static void test_gej_add_ge_var_16way(void) {
+    printf("\n=== gej_add_ge_var_16way 功能正确性测试 ===\n");
+
+    /* ------------------------------------------------------------------ */
+    /* 8.1  单步验证：16条链各推进1步                                       */
+    /* ------------------------------------------------------------------ */
+    {
+        printf("  [8.1 单步验证：16路并行点加与标量逐条对比]\n");
+        int all_pass = 1;
+
+        int base_vals[16] = {3, 7, 11, 17, 23, 31, 37, 41,
+                             43, 47, 53, 59, 61, 67, 71, 73};
+        secp256k1_gej chain_gej[16];
+
+        for (int ch = 0; ch < 16; ch++) {
+            uint8_t pk[32] = {0};
+            pk[31] = (uint8_t)base_vals[ch];
+            keygen_privkey_to_gej(secp_ctx, pk, &chain_gej[ch]);
+        }
+
+        secp256k1_gej avx512_next[16];
+        secp256k1_fe  avx512_rzr[16];
+        gej_add_ge_var_16way(avx512_next, chain_gej, &G_affine, avx512_rzr, 0);
+
+        secp256k1_gej ref_next[16];
+        secp256k1_fe  ref_rzr[16];
+        for (int ch = 0; ch < 16; ch++)
+            secp256k1_gej_add_ge_var(&ref_next[ch], &chain_gej[ch], &G_affine, &ref_rzr[ch]);
+
+        secp256k1_ge avx512_ge[16], ref_ge[16];
+        keygen_batch_normalize(avx512_next, avx512_ge, 16);
+        keygen_batch_normalize(ref_next,    ref_ge,    16);
+
+        for (int ch = 0; ch < 16; ch++) {
+            uint8_t avx512_comp[33], ref_comp[33];
+            keygen_ge_to_pubkey_bytes(&avx512_ge[ch], avx512_comp, NULL);
+            keygen_ge_to_pubkey_bytes(&ref_ge[ch],    ref_comp,    NULL);
+            if (memcmp(avx512_comp, ref_comp, 33) != 0) {
+                char avx512_hex[67], ref_hex[67];
+                bytes_to_hex_helper(avx512_comp, 33, avx512_hex);
+                bytes_to_hex_helper(ref_comp,    33, ref_hex);
+                printf("  [FAIL] 8.1 lane%d（base=%d+1）: AVX512=%s REF=%s\n",
+                       ch, base_vals[ch], avx512_hex, ref_hex);
+                all_pass = 0;
+                fail_count++;
+            }
+        }
+        if (all_pass) {
+            printf("  [PASS] 8.1 单步验证：16路并行点加与标量结果完全一致\n");
+            pass_count++;
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 8.2  多步连续推进（交替使用 16way / 16way_normed）                   */
+    /* ------------------------------------------------------------------ */
+    {
+        const int STEPS = 200;
+        printf("  [8.2 多步连续推进：%d 步后与标准 API 对比（交替 16way/16way_normed）]\n", STEPS);
+        int all_pass = 1;
+
+        uint32_t base_vals[16] = {
+            1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000,
+            9000,10000,11000,12000,13000,14000,15000,16000
+        };
+        secp256k1_gej chain_gej[16];
+
+        for (int ch = 0; ch < 16; ch++) {
+            uint8_t pk[32] = {0};
+            pk[29] = (uint8_t)(base_vals[ch] >> 16);
+            pk[30] = (uint8_t)(base_vals[ch] >> 8);
+            pk[31] = (uint8_t)(base_vals[ch]);
+            keygen_privkey_to_gej(secp_ctx, pk, &chain_gej[ch]);
+        }
+
+        /* 模拟 search_key：step=0 用 normed=0，step>0 用 normed=1 */
+        for (int step = 0; step < STEPS; step++) {
+            secp256k1_gej next_gej[16];
+            secp256k1_fe  rzr[16];
+            gej_add_ge_var_16way(next_gej, chain_gej, &G_affine, rzr,
+                                 step == 0 ? 0 : 1);
+            for (int ch = 0; ch < 16; ch++)
+                chain_gej[ch] = next_gej[ch];
+        }
+
+        secp256k1_ge chain_ge[16];
+        keygen_batch_normalize(chain_gej, chain_ge, 16);
+
+        for (int ch = 0; ch < 16; ch++) {
+            uint32_t expected_k = base_vals[ch] + (uint32_t)STEPS;
+            uint8_t  expected_privkey[32] = {0};
+            expected_privkey[29] = (uint8_t)(expected_k >> 16);
+            expected_privkey[30] = (uint8_t)(expected_k >> 8);
+            expected_privkey[31] = (uint8_t)(expected_k);
+
+            secp256k1_pubkey api_pubkey;
+            secp256k1_ec_pubkey_create(secp_ctx, &api_pubkey, expected_privkey);
+            uint8_t api_comp[33];
+            size_t  api_len = 33;
+            secp256k1_ec_pubkey_serialize(secp_ctx, api_comp, &api_len,
+                                          &api_pubkey, SECP256K1_EC_COMPRESSED);
+
+            uint8_t avx512_comp[33];
+            keygen_ge_to_pubkey_bytes(&chain_ge[ch], avx512_comp, NULL);
+
+            if (memcmp(avx512_comp, api_comp, 33) != 0) {
+                char avx512_hex[67], api_hex[67];
+                bytes_to_hex_helper(avx512_comp, 33, avx512_hex);
+                bytes_to_hex_helper(api_comp,    33, api_hex);
+                printf("  [FAIL] 8.2 lane%d（base=%u + %d步）: AVX512=%s API=%s\n",
+                       ch, base_vals[ch], STEPS, avx512_hex, api_hex);
+                all_pass = 0;
+                fail_count++;
+            }
+        }
+        if (all_pass) {
+            printf("  [PASS] 8.2 多步连续推进：%d 步后 16 条链与标准 API 完全一致\n", STEPS);
+            pass_count++;
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 8.3  边界情况：a=b（点倍）和 a=infinity                             */
+    /* ------------------------------------------------------------------ */
+    {
+        printf("  [8.3 边界情况：点倍（a=b）和无穷远点（a=infinity）]\n");
+        int all_pass = 1;
+
+        /* 8.3a：lane0 = 1*G = b，期望结果 = 2*G */
+        {
+            secp256k1_gej chain_gej[16];
+            uint8_t privkey_1[32] = {0}; privkey_1[31] = 1;
+            keygen_privkey_to_gej(secp_ctx, privkey_1, &chain_gej[0]);
+            for (int ch = 1; ch < 16; ch++) {
+                uint8_t pk[32] = {0};
+                pk[31] = (uint8_t)(10 + ch);
+                keygen_privkey_to_gej(secp_ctx, pk, &chain_gej[ch]);
+            }
+
+            secp256k1_gej next_gej[16];
+            secp256k1_fe  rzr[16];
+            gej_add_ge_var_16way(next_gej, chain_gej, &G_affine, rzr, 0);
+
+            secp256k1_ge next_ge[16];
+            keygen_batch_normalize(next_gej, next_ge, 16);
+
+            uint8_t privkey_2[32] = {0}; privkey_2[31] = 2;
+            secp256k1_pubkey api_pubkey;
+            secp256k1_ec_pubkey_create(secp_ctx, &api_pubkey, privkey_2);
+            uint8_t api_comp[33];
+            size_t  api_len = 33;
+            secp256k1_ec_pubkey_serialize(secp_ctx, api_comp, &api_len,
+                                          &api_pubkey, SECP256K1_EC_COMPRESSED);
+
+            uint8_t avx512_comp[33];
+            keygen_ge_to_pubkey_bytes(&next_ge[0], avx512_comp, NULL);
+
+            if (memcmp(avx512_comp, api_comp, 33) != 0) {
+                char avx512_hex[67], api_hex[67];
+                bytes_to_hex_helper(avx512_comp, 33, avx512_hex);
+                bytes_to_hex_helper(api_comp,    33, api_hex);
+                printf("  [FAIL] 8.3a 点倍（a=1*G, b=G）: AVX512=%s 期望=%s\n",
+                       avx512_hex, api_hex);
+                all_pass = 0;
+                fail_count++;
+            }
+        }
+
+        /* 8.3b：lane0 = infinity，期望结果 = G（私钥=1） */
+        {
+            secp256k1_gej chain_gej[16];
+            secp256k1_gej_set_infinity(&chain_gej[0]);
+            for (int ch = 1; ch < 16; ch++) {
+                uint8_t pk[32] = {0};
+                pk[31] = (uint8_t)(20 + ch);
+                keygen_privkey_to_gej(secp_ctx, pk, &chain_gej[ch]);
+            }
+
+            secp256k1_gej next_gej[16];
+            secp256k1_fe  rzr[16];
+            gej_add_ge_var_16way(next_gej, chain_gej, &G_affine, rzr, 0);
+
+            secp256k1_ge next_ge[16];
+            keygen_batch_normalize(next_gej, next_ge, 16);
+
+            uint8_t privkey_1[32] = {0}; privkey_1[31] = 1;
+            secp256k1_pubkey api_pubkey;
+            secp256k1_ec_pubkey_create(secp_ctx, &api_pubkey, privkey_1);
+            uint8_t api_comp[33];
+            size_t  api_len = 33;
+            secp256k1_ec_pubkey_serialize(secp_ctx, api_comp, &api_len,
+                                          &api_pubkey, SECP256K1_EC_COMPRESSED);
+
+            uint8_t avx512_comp[33];
+            keygen_ge_to_pubkey_bytes(&next_ge[0], avx512_comp, NULL);
+
+            if (memcmp(avx512_comp, api_comp, 33) != 0) {
+                char avx512_hex[67], api_hex[67];
+                bytes_to_hex_helper(avx512_comp, 33, avx512_hex);
+                bytes_to_hex_helper(api_comp,    33, api_hex);
+                printf("  [FAIL] 8.3b 无穷远点（a=infinity, b=G）: AVX512=%s 期望=%s\n",
+                       avx512_hex, api_hex);
+                all_pass = 0;
+                fail_count++;
+            }
+        }
+
+        if (all_pass) {
+            printf("  [PASS] 8.3 边界情况：点倍和无穷远点处理正确\n");
+            pass_count++;
+        }
+    }
+}
+
+/* ------------------------------------------------------------------
+ * test_avx512ifma_16way_full_pipeline
+ *
+ * 验证 __AVX512IFMA__ 路径下整个 16way 并发流程的端到端正确性：
+ *   gej_add_ge_var_16way  →  keygen_batch_normalize
+ *   →  keygen_ge_to_pubkey_bytes  →  hash160_16way_compressed_prepadded
+ *   →  hash160_16way_uncompressed_prepadded
+ *
+ * 最终 hash160（压缩/非压缩）与 secp256k1 API 逐条对比。
+ *
+ * 覆盖场景：
+ *   9.1  单批次（BATCH_SIZE=16步）：16条链各推进16步，
+ *        每步用 gej_add_ge_var_16way（step0 normed=0，其余 normed=1），
+ *        批次结束后 keygen_batch_normalize 归一化，
+ *        hash160 与 API 逐条逐步对比。
+ *   9.2  多批次（3批次）：每批次独立随机基准私钥，
+ *        验证批次间状态不互相污染。
+ * ------------------------------------------------------------------ */
+static void test_avx512ifma_16way_full_pipeline(void) {
+    printf("\n=== AVX512IFMA 16way 完整流程端到端测试 ===\n");
+
+#define PIPE_STEPS 16   /* 每批次步数 */
+#define PIPE_BATCH 3    /* 批次数 */
+
+    int all_pass = 1;
+
+    /* 用于存储每批次每条链每步的 gej */
+    secp256k1_gej gej_buf[16][PIPE_STEPS];
+    secp256k1_ge  ge_buf[16][PIPE_STEPS];
+
+    secp256k1_scalar tweak;
+    secp256k1_scalar_set_int(&tweak, 1);
+
+    /* 固定16条链的基准私钥（小整数，便于复现） */
+    static const int base_vals[16][PIPE_BATCH] = {
+        { 100,  500, 1000 }, { 200,  600, 1100 }, { 300,  700, 1200 },
+        { 400,  800, 1300 }, { 101,  501, 1001 }, { 201,  601, 1101 },
+        { 301,  701, 1201 }, { 401,  801, 1301 }, { 103,  503, 1003 },
+        { 203,  603, 1103 }, { 303,  703, 1203 }, { 403,  803, 1303 },
+        { 107,  507, 1007 }, { 207,  607, 1107 }, { 307,  707, 1207 },
+        { 407,  807, 1307 },
+    };
+
+    for (int batch = 0; batch < PIPE_BATCH; batch++) {
+        /* 初始化16条链的起始 gej 和 scalar */
+        secp256k1_gej chain_gej[16];
+        secp256k1_scalar chain_scalar[16];
+
+        for (int ch = 0; ch < 16; ch++) {
+            uint8_t pk[32] = {0};
+            int bv = base_vals[ch][batch];
+            pk[30] = (uint8_t)(bv >> 8);
+            pk[31] = (uint8_t)(bv & 0xff);
+            int overflow = 0;
+            secp256k1_scalar_set_b32(&chain_scalar[ch], pk, &overflow);
+            keygen_privkey_to_gej(secp_ctx, pk, &chain_gej[ch]);
+        }
+
+        /* 推进 PIPE_STEPS 步，积累 gej_buf */
+        for (int step = 0; step < PIPE_STEPS; step++) {
+            secp256k1_gej next_gej[16];
+            gej_add_ge_var_16way(next_gej, chain_gej, &G_affine, NULL,
+                                 (step == 0) ? 0 : 1);
+            for (int ch = 0; ch < 16; ch++) {
+                gej_buf[ch][step] = next_gej[ch];
+                chain_gej[ch] = next_gej[ch];
+                secp256k1_scalar_add(&chain_scalar[ch], &chain_scalar[ch], &tweak);
+            }
+        }
+
+        /* 批量归一化：对每条链调用 keygen_batch_normalize */
+        for (int ch = 0; ch < 16; ch++) {
+            keygen_batch_normalize(gej_buf[ch], ge_buf[ch], (size_t)PIPE_STEPS);
+        }
+
+        /* 逐步逐 lane 验证 hash160 */
+        for (int step = 0; step < PIPE_STEPS; step++) {
+            /* 构造16路预填充公钥缓冲区 */
+            uint8_t comp_bufs[16][64];
+            uint8_t uncomp_bufs[16][128];
+            const uint8_t *comp_ptrs[16];
+            const uint8_t *uncomp_ptrs[16];
+
+            for (int lane = 0; lane < 16; lane++) {
+                keygen_ge_to_pubkey_bytes(&ge_buf[lane][step],
+                                         comp_bufs[lane], uncomp_bufs[lane]);
+                sha256_pad_block_33(comp_bufs[lane]);
+                sha256_pad_block2_65(uncomp_bufs[lane]);
+                comp_ptrs[lane]   = comp_bufs[lane];
+                uncomp_ptrs[lane] = uncomp_bufs[lane];
+            }
+
+            /* 16路并行 hash160 */
+            uint8_t avx_h160_comp[16][20];
+            uint8_t avx_h160_uncomp[16][20];
+            hash160_16way_compressed_prepadded(comp_ptrs,   avx_h160_comp);
+            hash160_16way_uncompressed_prepadded(uncomp_ptrs, avx_h160_uncomp);
+
+            /* 逐 lane 与 API 对比 */
+            for (int lane = 0; lane < 16; lane++) {
+                /* 用 API 计算参考 hash160：私钥 = base + step + 1 */
+                int bv = base_vals[lane][batch] + step + 1;
+                uint8_t ref_pk[32] = {0};
+                ref_pk[30] = (uint8_t)(bv >> 8);
+                ref_pk[31] = (uint8_t)(bv & 0xff);
+
+                secp256k1_pubkey api_pubkey;
+                secp256k1_ec_pubkey_create(secp_ctx, &api_pubkey, ref_pk);
+
+                uint8_t api_comp[33], api_uncomp[65];
+                size_t  len_c = 33, len_u = 65;
+                secp256k1_ec_pubkey_serialize(secp_ctx, api_comp,   &len_c,
+                                              &api_pubkey, SECP256K1_EC_COMPRESSED);
+                secp256k1_ec_pubkey_serialize(secp_ctx, api_uncomp, &len_u,
+                                              &api_pubkey, SECP256K1_EC_UNCOMPRESSED);
+
+                uint8_t ref_h160_comp[20], ref_h160_uncomp[20];
+                pubkey_bytes_to_hash160(api_comp,   33, ref_h160_comp);
+                pubkey_bytes_to_hash160(api_uncomp, 65, ref_h160_uncomp);
+
+                /* 比较压缩 hash160 */
+                if (memcmp(avx_h160_comp[lane], ref_h160_comp, 20) != 0) {
+                    char avx_hex[41], ref_hex[41];
+                    bytes_to_hex_helper(avx_h160_comp[lane], 20, avx_hex);
+                    bytes_to_hex_helper(ref_h160_comp,       20, ref_hex);
+                    printf("  [FAIL] 9 batch%d step%d lane%d 压缩hash160: "
+                           "AVX512=%s API=%s\n",
+                           batch, step, lane, avx_hex, ref_hex);
+                    all_pass = 0;
+                    fail_count++;
+                }
+
+                /* 比较非压缩 hash160 */
+                if (memcmp(avx_h160_uncomp[lane], ref_h160_uncomp, 20) != 0) {
+                    char avx_hex[41], ref_hex[41];
+                    bytes_to_hex_helper(avx_h160_uncomp[lane], 20, avx_hex);
+                    bytes_to_hex_helper(ref_h160_uncomp,        20, ref_hex);
+                    printf("  [FAIL] 9 batch%d step%d lane%d 非压缩hash160: "
+                           "AVX512=%s API=%s\n",
+                           batch, step, lane, avx_hex, ref_hex);
+                    all_pass = 0;
+                    fail_count++;
+                }
+            }
+        }
+    }
+
+    if (all_pass) {
+        printf("  [PASS] 9 AVX512IFMA 16way 完整流程（%d批次×%d步×16lane×压缩+非压缩）全部通过\n",
+               PIPE_BATCH, PIPE_STEPS);
+        pass_count++;
+    }
+
+#undef PIPE_STEPS
+#undef PIPE_BATCH
+}
+#endif /* __AVX512IFMA__ && !USE_PUBKEY_API_ONLY */
+
+/* ------------------------------------------------------------------
+ * test_avx512f_16way_full_pipeline
+ *
+ * 验证 !__AVX512IFMA__ && __AVX512F__ 路径下整个 16way 并发流程的
+ * 端到端正确性，完整模拟 keysearch.c 中 __AVX512F__ 分支的执行逻辑：
+ *
+ *   keygen_privkey_to_gej  →  secp256k1_gej_add_ge_var（收集 rzr）
+ *   →  keygen_batch_normalize_rzr
+ *   →  keygen_ge_to_pubkey_bytes  →  sha256_pad_block_33/sha256_pad_block2_65
+ *   →  hash160_16way_compressed_prepadded
+ *   →  hash160_16way_uncompressed_prepadded
+ *
+ * 最终 hash160（压缩/非压缩）与 secp256k1 API 逐条对比。
+ *
+ * 覆盖场景：
+ *   10.1  单批次（BATCH_SIZE=64步）：1条链推进64步，
+ *         以16为步长分组，每组16路并行 hash160，与 API 逐条对比。
+ *   10.2  多批次（3批次）：每批次独立随机基准私钥，
+ *         验证批次间状态不互相污染。
+ * ------------------------------------------------------------------ */
+#if defined(__AVX512F__) && !defined(__AVX512IFMA__) && !defined(USE_PUBKEY_API_ONLY)
+static void test_avx512f_16way_full_pipeline(void) {
+    printf("\n=== AVX512F 16way 完整流程端到端测试（!IFMA 路径）===\n");
+
+#define AVX512F_BATCH_STEPS 64   /* 每批次步数，必须是16的倍数 */
+#define AVX512F_BATCHES     3    /* 批次数 */
+
+    int all_pass = 1;
+
+    secp256k1_scalar tweak;
+    secp256k1_scalar_set_int(&tweak, 1);
+
+    /* 固定3批次的基准私钥（小整数，便于复现） */
+    static const int base_vals[AVX512F_BATCHES] = { 500, 2000, 9999 };
+
+    for (int batch = 0; batch < AVX512F_BATCHES; batch++) {
+        int bv = base_vals[batch];
+
+        /* 构造基准私钥 */
+        uint8_t base_pk[32] = {0};
+        base_pk[29] = (uint8_t)(bv >> 16);
+        base_pk[30] = (uint8_t)(bv >> 8);
+        base_pk[31] = (uint8_t)(bv & 0xff);
+
+        secp256k1_scalar base_scalar, cur_scalar;
+        int overflow = 0;
+        secp256k1_scalar_set_b32(&base_scalar, base_pk, &overflow);
+        cur_scalar = base_scalar;
+
+        /* 从基准私钥生成起始 Jacobian 点 */
+        secp256k1_gej cur_gej;
+        if (keygen_privkey_to_gej(secp_ctx, base_pk, &cur_gej) != 0) {
+            printf("  [FAIL] 10 batch%d: keygen_privkey_to_gej 失败\n", batch);
+            all_pass = 0;
+            fail_count++;
+            continue;
+        }
+
+        /* 积累 AVX512F_BATCH_STEPS 个 Jacobian 点，同时收集 rzr */
+        secp256k1_gej gej_batch[AVX512F_BATCH_STEPS];
+        secp256k1_ge  ge_batch[AVX512F_BATCH_STEPS];
+        secp256k1_fe  rzr_batch[AVX512F_BATCH_STEPS];
+
+        secp256k1_gej next_gej;
+        for (int b = 0; b < AVX512F_BATCH_STEPS; b++) {
+            gej_batch[b] = cur_gej;
+
+            if (b < AVX512F_BATCH_STEPS - 1) {
+                secp256k1_gej_add_ge_var(&next_gej, &cur_gej, &G_affine, &rzr_batch[b]);
+                cur_gej = next_gej;
+                secp256k1_scalar_add(&cur_scalar, &cur_scalar, &tweak);
+            }
+        }
+
+        /* 批量归一化（使用 rzr 增量因子，与 __AVX512F__ 分支完全一致） */
+        keygen_batch_normalize_rzr(gej_batch, ge_batch, rzr_batch,
+                                   (size_t)AVX512F_BATCH_STEPS);
+
+        /* 以16为步长分组，16路并行 hash160，与 API 逐条对比 */
+        for (int b = 0; b < AVX512F_BATCH_STEPS; b += 16) {
+            int valid_count = AVX512F_BATCH_STEPS - b;
+            if (valid_count > 16) valid_count = 16;
+
+            uint8_t comp_bufs[16][64];
+            uint8_t uncomp_bufs[16][128];
+            const uint8_t *comp_ptrs[16];
+            const uint8_t *uncomp_ptrs[16];
+
+            for (int lane = 0; lane < 16; lane++) {
+                /* 不足16时用最后一个有效点填充（与 keysearch.c 逻辑一致） */
+                int idx = b + (lane < valid_count ? lane : valid_count - 1);
+                if (ge_batch[idx].infinity) {
+                    memset(comp_bufs[lane], 0, 64);
+                    memset(uncomp_bufs[lane], 0, 128);
+                    sha256_pad_block_33(comp_bufs[lane]);
+                    sha256_pad_block2_65(uncomp_bufs[lane]);
+                } else {
+                    keygen_ge_to_pubkey_bytes(&ge_batch[idx],
+                                             comp_bufs[lane], uncomp_bufs[lane]);
+                    sha256_pad_block_33(comp_bufs[lane]);
+                    sha256_pad_block2_65(uncomp_bufs[lane]);
+                }
+                comp_ptrs[lane]   = comp_bufs[lane];
+                uncomp_ptrs[lane] = uncomp_bufs[lane];
+            }
+
+            /* 16路并行 hash160 */
+            uint8_t avx_h160_comp[16][20];
+            uint8_t avx_h160_uncomp[16][20];
+            hash160_16way_compressed_prepadded(comp_ptrs,   avx_h160_comp);
+            hash160_16way_uncompressed_prepadded(uncomp_ptrs, avx_h160_uncomp);
+
+            /* 逐 lane 与 API 对比（仅有效 lane） */
+            for (int lane = 0; lane < valid_count; lane++) {
+                int step = b + lane;
+                /* 私钥 = base + step（gej_batch[step] 对应 base_scalar + step * 1） */
+                secp256k1_scalar ref_scalar = base_scalar;
+                for (int i = 0; i < step; i++)
+                    secp256k1_scalar_add(&ref_scalar, &ref_scalar, &tweak);
+
+                uint8_t ref_pk[32];
+                secp256k1_scalar_get_b32(ref_pk, &ref_scalar);
+
+                secp256k1_pubkey api_pubkey;
+                secp256k1_ec_pubkey_create(secp_ctx, &api_pubkey, ref_pk);
+
+                uint8_t api_comp[33], api_uncomp[65];
+                size_t len_c = 33, len_u = 65;
+                secp256k1_ec_pubkey_serialize(secp_ctx, api_comp,   &len_c,
+                                              &api_pubkey, SECP256K1_EC_COMPRESSED);
+                secp256k1_ec_pubkey_serialize(secp_ctx, api_uncomp, &len_u,
+                                              &api_pubkey, SECP256K1_EC_UNCOMPRESSED);
+
+                uint8_t ref_h160_comp[20], ref_h160_uncomp[20];
+                pubkey_bytes_to_hash160(api_comp,   33, ref_h160_comp);
+                pubkey_bytes_to_hash160(api_uncomp, 65, ref_h160_uncomp);
+
+                /* 比较压缩 hash160 */
+                if (memcmp(avx_h160_comp[lane], ref_h160_comp, 20) != 0) {
+                    char avx_hex[41], ref_hex[41];
+                    bytes_to_hex_helper(avx_h160_comp[lane], 20, avx_hex);
+                    bytes_to_hex_helper(ref_h160_comp,       20, ref_hex);
+                    printf("  [FAIL] 10 batch%d step%d lane%d 压缩hash160: "
+                           "AVX512F=%s API=%s\n",
+                           batch, step, lane, avx_hex, ref_hex);
+                    all_pass = 0;
+                    fail_count++;
+                }
+
+                /* 比较非压缩 hash160 */
+                if (memcmp(avx_h160_uncomp[lane], ref_h160_uncomp, 20) != 0) {
+                    char avx_hex[41], ref_hex[41];
+                    bytes_to_hex_helper(avx_h160_uncomp[lane], 20, avx_hex);
+                    bytes_to_hex_helper(ref_h160_uncomp,        20, ref_hex);
+                    printf("  [FAIL] 10 batch%d step%d lane%d 非压缩hash160: "
+                           "AVX512F=%s API=%s\n",
+                           batch, step, lane, avx_hex, ref_hex);
+                    all_pass = 0;
+                    fail_count++;
+                }
+            }
+        }
+    }
+
+    if (all_pass) {
+        printf("  [PASS] 10 AVX512F 16way 完整流程（%d批次×%d步×16lane×压缩+非压缩）全部通过\n",
+               AVX512F_BATCHES, AVX512F_BATCH_STEPS);
+        pass_count++;
+    }
+
+#undef AVX512F_BATCH_STEPS
+#undef AVX512F_BATCHES
+}
+#endif /* __AVX512F__ && !__AVX512IFMA__ && !USE_PUBKEY_API_ONLY */
+
+/* ------------------------------------------------------------------
+ * test_avx2_8way_full_pipeline
+ *
+ * 验证 !__AVX512IFMA__ && !__AVX512F__ && __AVX2__ 路径下整个 8way
+ * 并发流程的端到端正确性，完整模拟 keysearch.c 中 __AVX2__ 分支的
+ * 执行逻辑：
+ *
+ *   keygen_privkey_to_gej  →  secp256k1_gej_add_ge_var（收集 rzr）
+ *   →  keygen_batch_normalize_rzr
+ *   →  keygen_ge_to_pubkey_bytes  →  sha256_pad_block_33/sha256_pad_block2_65
+ *   →  hash160_8way_compressed_prepadded
+ *   →  hash160_8way_uncompressed_prepadded
+ *
+ * 最终 hash160（压缩/非压缩）与 secp256k1 API 逐条对比。
+ *
+ * 覆盖场景：
+ *   11.1  单批次（BATCH_SIZE=64步）：1条链推进64步，
+ *         以8为步长分组，每组8路并行 hash160，与 API 逐条对比。
+ *   11.2  多批次（3批次）：每批次独立随机基准私钥，
+ *         验证批次间状态不互相污染。
+ * ------------------------------------------------------------------ */
+#if defined(__AVX2__) && !defined(__AVX512F__) && !defined(__AVX512IFMA__) && !defined(USE_PUBKEY_API_ONLY)
+static void test_avx2_8way_full_pipeline(void) {
+    printf("\n=== AVX2 8way 完整流程端到端测试（!AVX512 路径）===\n");
+
+#define AVX2_BATCH_STEPS 64   /* 每批次步数，必须是8的倍数 */
+#define AVX2_BATCHES     3    /* 批次数 */
+
+    int all_pass = 1;
+
+    secp256k1_scalar tweak;
+    secp256k1_scalar_set_int(&tweak, 1);
+
+    /* 固定3批次的基准私钥（小整数，便于复现） */
+    static const int base_vals[AVX2_BATCHES] = { 300, 1500, 7777 };
+
+    for (int batch = 0; batch < AVX2_BATCHES; batch++) {
+        int bv = base_vals[batch];
+
+        /* 构造基准私钥 */
+        uint8_t base_pk[32] = {0};
+        base_pk[29] = (uint8_t)(bv >> 16);
+        base_pk[30] = (uint8_t)(bv >> 8);
+        base_pk[31] = (uint8_t)(bv & 0xff);
+
+        secp256k1_scalar base_scalar, cur_scalar;
+        int overflow = 0;
+        secp256k1_scalar_set_b32(&base_scalar, base_pk, &overflow);
+        cur_scalar = base_scalar;
+
+        /* 从基准私钥生成起始 Jacobian 点 */
+        secp256k1_gej cur_gej;
+        if (keygen_privkey_to_gej(secp_ctx, base_pk, &cur_gej) != 0) {
+            printf("  [FAIL] 11 batch%d: keygen_privkey_to_gej 失败\n", batch);
+            all_pass = 0;
+            fail_count++;
+            continue;
+        }
+
+        /* 积累 AVX2_BATCH_STEPS 个 Jacobian 点，同时收集 rzr */
+        secp256k1_gej gej_batch[AVX2_BATCH_STEPS];
+        secp256k1_ge  ge_batch[AVX2_BATCH_STEPS];
+        secp256k1_fe  rzr_batch[AVX2_BATCH_STEPS];
+
+        secp256k1_gej next_gej;
+        for (int b = 0; b < AVX2_BATCH_STEPS; b++) {
+            gej_batch[b] = cur_gej;
+
+            if (b < AVX2_BATCH_STEPS - 1) {
+                secp256k1_gej_add_ge_var(&next_gej, &cur_gej, &G_affine, &rzr_batch[b]);
+                cur_gej = next_gej;
+                secp256k1_scalar_add(&cur_scalar, &cur_scalar, &tweak);
+            }
+        }
+
+        /* 批量归一化（使用 rzr 增量因子，与 __AVX2__ 分支完全一致） */
+        keygen_batch_normalize_rzr(gej_batch, ge_batch, rzr_batch,
+                                   (size_t)AVX2_BATCH_STEPS);
+
+        /* 以8为步长分组，8路并行 hash160，与 API 逐条对比 */
+        for (int b = 0; b < AVX2_BATCH_STEPS; b += 8) {
+            int valid_count = AVX2_BATCH_STEPS - b;
+            if (valid_count > 8) valid_count = 8;
+
+            uint8_t comp_bufs[8][64];
+            uint8_t uncomp_bufs[8][128];
+            const uint8_t *comp_ptrs[8];
+            const uint8_t *uncomp_ptrs[8];
+
+            for (int lane = 0; lane < 8; lane++) {
+                /* 不足8时用最后一个有效点填充（与 keysearch.c 逻辑一致） */
+                int idx = b + (lane < valid_count ? lane : valid_count - 1);
+                if (ge_batch[idx].infinity) {
+                    memset(comp_bufs[lane], 0, 64);
+                    memset(uncomp_bufs[lane], 0, 128);
+                    sha256_pad_block_33(comp_bufs[lane]);
+                    sha256_pad_block2_65(uncomp_bufs[lane]);
+                } else {
+                    keygen_ge_to_pubkey_bytes(&ge_batch[idx],
+                                             comp_bufs[lane], uncomp_bufs[lane]);
+                    sha256_pad_block_33(comp_bufs[lane]);
+                    sha256_pad_block2_65(uncomp_bufs[lane]);
+                }
+                comp_ptrs[lane]   = comp_bufs[lane];
+                uncomp_ptrs[lane] = uncomp_bufs[lane];
+            }
+
+            /* 8路并行 hash160 */
+            uint8_t avx_h160_comp[8][20];
+            uint8_t avx_h160_uncomp[8][20];
+            hash160_8way_compressed_prepadded(comp_ptrs,   avx_h160_comp);
+            hash160_8way_uncompressed_prepadded(uncomp_ptrs, avx_h160_uncomp);
+
+            /* 逐 lane 与 API 对比（仅有效 lane） */
+            for (int lane = 0; lane < valid_count; lane++) {
+                int step = b + lane;
+                /* 私钥 = base + step */
+                secp256k1_scalar ref_scalar = base_scalar;
+                for (int i = 0; i < step; i++)
+                    secp256k1_scalar_add(&ref_scalar, &ref_scalar, &tweak);
+
+                uint8_t ref_pk[32];
+                secp256k1_scalar_get_b32(ref_pk, &ref_scalar);
+
+                secp256k1_pubkey api_pubkey;
+                secp256k1_ec_pubkey_create(secp_ctx, &api_pubkey, ref_pk);
+
+                uint8_t api_comp[33], api_uncomp[65];
+                size_t len_c = 33, len_u = 65;
+                secp256k1_ec_pubkey_serialize(secp_ctx, api_comp,   &len_c,
+                                              &api_pubkey, SECP256K1_EC_COMPRESSED);
+                secp256k1_ec_pubkey_serialize(secp_ctx, api_uncomp, &len_u,
+                                              &api_pubkey, SECP256K1_EC_UNCOMPRESSED);
+
+                uint8_t ref_h160_comp[20], ref_h160_uncomp[20];
+                pubkey_bytes_to_hash160(api_comp,   33, ref_h160_comp);
+                pubkey_bytes_to_hash160(api_uncomp, 65, ref_h160_uncomp);
+
+                /* 比较压缩 hash160 */
+                if (memcmp(avx_h160_comp[lane], ref_h160_comp, 20) != 0) {
+                    char avx_hex[41], ref_hex[41];
+                    bytes_to_hex_helper(avx_h160_comp[lane], 20, avx_hex);
+                    bytes_to_hex_helper(ref_h160_comp,       20, ref_hex);
+                    printf("  [FAIL] 11 batch%d step%d lane%d 压缩hash160: "
+                           "AVX2=%s API=%s\n",
+                           batch, step, lane, avx_hex, ref_hex);
+                    all_pass = 0;
+                    fail_count++;
+                }
+
+                /* 比较非压缩 hash160 */
+                if (memcmp(avx_h160_uncomp[lane], ref_h160_uncomp, 20) != 0) {
+                    char avx_hex[41], ref_hex[41];
+                    bytes_to_hex_helper(avx_h160_uncomp[lane], 20, avx_hex);
+                    bytes_to_hex_helper(ref_h160_uncomp,        20, ref_hex);
+                    printf("  [FAIL] 11 batch%d step%d lane%d 非压缩hash160: "
+                           "AVX2=%s API=%s\n",
+                           batch, step, lane, avx_hex, ref_hex);
+                    all_pass = 0;
+                    fail_count++;
+                }
+            }
+        }
+    }
+
+    if (all_pass) {
+        printf("  [PASS] 11 AVX2 8way 完整流程（%d批次×%d步×8lane×压缩+非压缩）全部通过\n",
+               AVX2_BATCHES, AVX2_BATCH_STEPS);
+        pass_count++;
+    }
+
+#undef AVX2_BATCH_STEPS
+#undef AVX2_BATCHES
+}
+#endif /* __AVX2__ && !__AVX512F__ && !__AVX512IFMA__ && !USE_PUBKEY_API_ONLY */
+
 #endif /* USE_PUBKEY_API_ONLY */
 
 /* ===================== main ===================== */
@@ -2828,6 +3567,20 @@ int main(void) {
     } else {
         test_keygen_internal();
         test_search_key_privkey_pubkey();
+#ifdef __AVX512IFMA__
+        if (__builtin_cpu_supports("avx512ifma")) {
+            test_gej_add_ge_var_16way();
+            test_avx512ifma_16way_full_pipeline();
+        }
+#endif
+#if defined(__AVX512F__) && !defined(__AVX512IFMA__)
+        if (__builtin_cpu_supports("avx512f")) {
+            test_avx512f_16way_full_pipeline();
+        }
+#endif
+#if defined(__AVX2__) && !defined(__AVX512F__) && !defined(__AVX512IFMA__)
+        test_avx2_8way_full_pipeline();
+#endif
     }
 #endif
 
