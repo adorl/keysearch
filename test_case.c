@@ -5,6 +5,7 @@
 #include "sha256.h"
 #include "ripemd160.h"
 #include "hash_utils.h"
+#include "rand_key.h"
 /* secp256k1_keygen.h 在内部模式下已包含 secp256k1.h（源码目录版本），
  * 回退模式下需要系统 secp256k1.h，通过条件编译处理 */
 #ifndef USE_PUBKEY_API_ONLY
@@ -3046,28 +3047,31 @@ static void test_avx512ifma_16way_full_pipeline(void) {
     secp256k1_scalar tweak;
     secp256k1_scalar_set_int(&tweak, 1);
 
-    /* 固定16条链的基准私钥（小整数，便于复现） */
-    static const int base_vals[16][PIPE_BATCH] = {
-        { 100,  500, 1000 }, { 200,  600, 1100 }, { 300,  700, 1200 },
-        { 400,  800, 1300 }, { 101,  501, 1001 }, { 201,  601, 1101 },
-        { 301,  701, 1201 }, { 401,  801, 1301 }, { 103,  503, 1003 },
-        { 203,  603, 1103 }, { 303,  703, 1203 }, { 403,  803, 1303 },
-        { 107,  507, 1007 }, { 207,  607, 1107 }, { 307,  707, 1207 },
-        { 407,  807, 1307 },
-    };
+    /* 初始化随机上下文 */
+    rand_key_context rctx;
+    if (rand_ctx_init(&rctx) != 0) {
+        printf("  [FAIL] 9 rand_ctx_init 失败\n");
+        fail_count++;
+        return;
+    }
 
     for (int batch = 0; batch < PIPE_BATCH; batch++) {
-        /* 初始化16条链的起始 gej 和 scalar */
+        /* 初始化16条链的起始 gej 和 scalar（随机私钥） */
         secp256k1_gej chain_gej[16];
         secp256k1_scalar chain_scalar[16];
+        secp256k1_scalar init_scalar[16];  /* 保存初始 scalar，用于 API 对比 */
 
         for (int ch = 0; ch < 16; ch++) {
-            uint8_t pk[32] = {0};
-            int bv = base_vals[ch][batch];
-            pk[30] = (uint8_t)(bv >> 8);
-            pk[31] = (uint8_t)(bv & 0xff);
+            uint8_t pk[32];
+            if (gen_random_key(pk, &rctx) != 0) {
+                printf("  [FAIL] 9 batch%d ch%d gen_random_key 失败\n", batch, ch);
+                all_pass = 0;
+                fail_count++;
+                continue;
+            }
             int overflow = 0;
             secp256k1_scalar_set_b32(&chain_scalar[ch], pk, &overflow);
+            init_scalar[ch] = chain_scalar[ch];  /* 保存初始值 */
             keygen_privkey_to_gej(secp_ctx, pk, &chain_gej[ch]);
         }
 
@@ -3111,13 +3115,14 @@ static void test_avx512ifma_16way_full_pipeline(void) {
             hash160_16way_compressed_prepadded(comp_ptrs,   avx_h160_comp);
             hash160_16way_uncompressed_prepadded(uncomp_ptrs, avx_h160_uncomp);
 
-            /* 逐 lane 与 API 对比 */
+        /* 逐 lane 与 API 对比 */
             for (int lane = 0; lane < 16; lane++) {
-                /* 用 API 计算参考 hash160：私钥 = base + step + 1 */
-                int bv = base_vals[lane][batch] + step + 1;
-                uint8_t ref_pk[32] = {0};
-                ref_pk[30] = (uint8_t)(bv >> 8);
-                ref_pk[31] = (uint8_t)(bv & 0xff);
+                /* 用 API 计算参考 hash160：私钥 = init_scalar[lane] + step + 1 */
+                secp256k1_scalar ref_scalar = init_scalar[lane];
+                for (int i = 0; i <= step; i++)
+                    secp256k1_scalar_add(&ref_scalar, &ref_scalar, &tweak);
+                uint8_t ref_pk[32];
+                secp256k1_scalar_get_b32(ref_pk, &ref_scalar);
 
                 secp256k1_pubkey api_pubkey;
                 secp256k1_ec_pubkey_create(secp_ctx, &api_pubkey, ref_pk);
@@ -3203,17 +3208,23 @@ static void test_avx512f_16way_full_pipeline(void) {
     secp256k1_scalar tweak;
     secp256k1_scalar_set_int(&tweak, 1);
 
-    /* 固定3批次的基准私钥（小整数，便于复现） */
-    static const int base_vals[AVX512F_BATCHES] = { 500, 2000, 9999 };
+    /* 初始化随机上下文 */
+    rand_key_context rctx;
+    if (rand_ctx_init(&rctx) != 0) {
+        printf("  [FAIL] 10 rand_ctx_init 失败\n");
+        fail_count++;
+        return;
+    }
 
     for (int batch = 0; batch < AVX512F_BATCHES; batch++) {
-        int bv = base_vals[batch];
-
-        /* 构造基准私钥 */
-        uint8_t base_pk[32] = {0};
-        base_pk[29] = (uint8_t)(bv >> 16);
-        base_pk[30] = (uint8_t)(bv >> 8);
-        base_pk[31] = (uint8_t)(bv & 0xff);
+        /* 生成随机基准私钥 */
+        uint8_t base_pk[32];
+        if (gen_random_key(base_pk, &rctx) != 0) {
+            printf("  [FAIL] 10 batch%d gen_random_key 失败\n", batch);
+            all_pass = 0;
+            fail_count++;
+            continue;
+        }
 
         secp256k1_scalar base_scalar, cur_scalar;
         int overflow = 0;
@@ -3379,17 +3390,23 @@ static void test_avx2_8way_full_pipeline(void) {
     secp256k1_scalar tweak;
     secp256k1_scalar_set_int(&tweak, 1);
 
-    /* 固定3批次的基准私钥（小整数，便于复现） */
-    static const int base_vals[AVX2_BATCHES] = { 300, 1500, 7777 };
+    /* 初始化随机上下文 */
+    rand_key_context rctx;
+    if (rand_ctx_init(&rctx) != 0) {
+        printf("  [FAIL] 11 rand_ctx_init 失败\n");
+        fail_count++;
+        return;
+    }
 
     for (int batch = 0; batch < AVX2_BATCHES; batch++) {
-        int bv = base_vals[batch];
-
-        /* 构造基准私钥 */
-        uint8_t base_pk[32] = {0};
-        base_pk[29] = (uint8_t)(bv >> 16);
-        base_pk[30] = (uint8_t)(bv >> 8);
-        base_pk[31] = (uint8_t)(bv & 0xff);
+        /* 生成随机基准私钥 */
+        uint8_t base_pk[32];
+        if (gen_random_key(base_pk, &rctx) != 0) {
+            printf("  [FAIL] 11 batch%d gen_random_key 失败\n", batch);
+            all_pass = 0;
+            fail_count++;
+            continue;
+        }
 
         secp256k1_scalar base_scalar, cur_scalar;
         int overflow = 0;
@@ -3559,7 +3576,8 @@ int main(void) {
     if (__builtin_cpu_supports("avx512f")) {
         test_ht_contains_16way_func();
     }
-#endif    test_specialized_interfaces();
+#endif
+    test_specialized_interfaces();
 #ifndef USE_PUBKEY_API_ONLY
     /* 初始化全局生成元 G（供 test_keygen_internal / test_search_key_privkey_pubkey 使用） */
     if (keygen_init_generator(secp_ctx, &G_affine) != 0) {
