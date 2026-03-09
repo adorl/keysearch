@@ -36,7 +36,7 @@
 #define PROGRESS_INTERVAL   (10000000)      /* 进度打印间隔 */
 #define MAX_ADDRESSES       (400000)        /* 最多支持的目标地址数量 */
 #define ADDRESS_LEN         (35)            /* 比特币地址最大长度 */
-#define BATCH_SIZE          (4096)          /* 增量推导批次大小，每批后重置随机基准私钥 */
+#define BATCH_SIZE          (65536)         /* 增量推导批次大小，每批后重置随机基准私钥 */
 
 /* ===================== 全局共享数据 ===================== */
 
@@ -101,10 +101,9 @@ static void *search_key(void *arg)
      */
     secp256k1_gej (*gej_buf)[BATCH_SIZE] = malloc(16 * BATCH_SIZE * sizeof(secp256k1_gej));
     secp256k1_fe (*rzr_buf)[BATCH_SIZE] = malloc(16 * BATCH_SIZE * sizeof(secp256k1_fe));
-    secp256k1_ge (*ge_buf)[BATCH_SIZE]  = malloc(16 * BATCH_SIZE * sizeof(secp256k1_ge));
+    secp256k1_ge (*ge_buf)[BATCH_SIZE] = malloc(16 * BATCH_SIZE * sizeof(secp256k1_ge));
     if (!gej_buf || !rzr_buf || !ge_buf) {
         keylog_error("[线程-%d] AVX-512 批次缓冲区内存分配失败", thread_id);
-        free(gej_buf); free(rzr_buf); free(ge_buf);
         goto avx512_thread_exit;
     }
 
@@ -272,9 +271,14 @@ avx512_thread_exit:
 
 #else /* !__AVX512IFMA__ */
 
-    secp256k1_gej gej_batch[BATCH_SIZE];    /* Jacobian坐标批次缓冲区 */
-    secp256k1_ge ge_batch[BATCH_SIZE];      /* 仿射坐标批次缓冲区 */
-    secp256k1_fe rzr_batch[BATCH_SIZE];     /* Z坐标增量因子：Z[i+1] = Z[i] * rzr[i] */
+    secp256k1_gej *gej_batch = malloc(BATCH_SIZE * sizeof(secp256k1_gej));  /* Jacobian坐标批次缓冲区 */
+    secp256k1_ge *ge_batch = malloc(BATCH_SIZE * sizeof(secp256k1_ge));     /* 仿射坐标批次缓冲区 */
+    secp256k1_fe *rzr_batch = malloc(BATCH_SIZE * sizeof(secp256k1_fe));    /* Z坐标增量因子：Z[i+1] = Z[i] * rzr[i] */
+    if (!gej_batch || !ge_batch || !rzr_batch) {
+        keylog_error("[线程-%d] 批次缓冲区内存分配失败", thread_id);
+        goto thread_exit;
+    }
+
     uint8_t pubkey_compressed[33];
     uint8_t pubkey_uncompressed[65];
 
@@ -573,6 +577,11 @@ avx512_thread_exit:
         }
 #endif /* __AVX512F__ / __AVX2__ */
     }
+
+thread_exit:
+    free(gej_batch);
+    free(ge_batch);
+    free(rzr_batch);
 
 #endif /* __AVX512IFMA__ */
 
