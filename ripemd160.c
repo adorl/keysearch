@@ -1,7 +1,7 @@
 #include "ripemd160.h"
 
-/* 完全展开的RIPEMD160压缩函数：消除循环/数组访问 */
-/* 左链步骤宏：F(b,c,d)=b^c^d */
+/* Fully unrolled RIPEMD160 compression function: eliminates loop/array access */
+/* Left chain step macro: F(b,c,d)=b^c^d */
 #define RL_F(a, b, c, d, e, x, s)                                               \
     do {                                                                        \
         uint32_t _t = ROL32((a) + (b ^ c ^ d) + (x) + 0x00000000, (s)) + (e);   \
@@ -11,7 +11,7 @@
         (c) = (b);                                                              \
         (b) = _t;                                                               \
     } while (0)
-/* 左链步骤宏：G(b,c,d)=(b&c)|(~b&d) */
+/* Left chain step macro: G(b,c,d)=(b&c)|(~b&d) */
 #define RL_G(a, b, c, d, e, x, s)                                               \
     do {                                                                        \
         uint32_t _t = ROL32((a) + ((b & c) | (~(b) & d)) + (x) + 0x5A827999, (s)) + (e); \
@@ -21,7 +21,7 @@
         (c) = (b);                                                              \
         (b) = _t;                                                               \
     } while (0)
-/* 左链步骤宏：H(b,c,d)=(b|~c)^d */
+/* Left chain step macro: H(b,c,d)=(b|~c)^d */
 #define RL_H(a, b, c, d, e, x, s)                                               \
     do {                                                                        \
         uint32_t _t = ROL32((a) + ((b | ~(c)) ^ d) + (x) + 0x6ED9EBA1, (s)) + (e); \
@@ -31,7 +31,7 @@
         (c) = (b);                                                              \
         (b) = _t;                                                               \
     } while (0)
-/* 左链步骤宏：I(b,c,d)=(b&d)|(c&~d) */
+/* Left chain step macro: I(b,c,d)=(b&d)|(c&~d) */
 #define RL_I(a, b, c, d, e, x, s)                                               \
     do {                                                                        \
         uint32_t _t = ROL32((a) + ((b & d) | (c & ~(d))) + (x) + 0x8F1BBCDC, (s)) + (e); \
@@ -41,7 +41,7 @@
         (c) = (b);                                                              \
         (b) = _t;                                                               \
     } while (0)
-/* 左链步骤宏：J(b,c,d)=b^(c|~d) */
+/* Left chain step macro: J(b,c,d)=b^(c|~d) */
 #define RL_J(a, b, c, d, e, x, s)                                               \
     do {                                                                        \
         uint32_t _t = ROL32((a) + ((b) ^ (c | ~(d))) + (x) + 0xA953FD4E, (s)) + (e); \
@@ -51,7 +51,7 @@
         (c) = (b);                                                              \
         (b) = _t;                                                               \
     } while (0)
-/* 右链步骤宏 */
+/* Right chain step macros */
 #define RR_J(a, b, c, d, e, x, s)                                               \
     do {                                                                        \
         uint32_t _t = ROL32((a) + ((b) ^ (c | ~(d))) + (x) + 0x50A28BE6, (s)) + (e); \
@@ -100,7 +100,7 @@
 
 static void ripemd160_compress(uint32_t *state, const uint8_t *block)
 {
-    /* 加载消息字（小端序） */
+    /* Load message words (little-endian) */
 #define W(i) ((uint32_t)block[(i) * 4] | ((uint32_t)block[(i) * 4 + 1] << 8) | ((uint32_t)block[(i) * 4 + 2] << 16) | ((uint32_t)block[(i) * 4 + 3] << 24))
     uint32_t w0 = W(0), w1 = W(1), w2 = W(2), w3 = W(3), w4 = W(4), w5 = W(5), w6 = W(6), w7 = W(7);
     uint32_t w8 = W(8), w9 = W(9), w10 = W(10), w11 = W(11), w12 = W(12), w13 = W(13), w14 = W(14), w15 = W(15);
@@ -109,7 +109,7 @@ static void ripemd160_compress(uint32_t *state, const uint8_t *block)
     uint32_t al = state[0], bl = state[1], cl = state[2], dl = state[3], el = state[4];
     uint32_t ar = state[0], br = state[1], cr = state[2], dr = state[3], er = state[4];
 
-    /* 左链：轮0-15，F(b,c,d) = b^c^d */
+    /* Left chain: rounds 0-15, F(b,c,d) = b^c^d */
     RL_F(al, bl, cl, dl, el, w0, 11);
     RL_F(al, bl, cl, dl, el, w1, 14);
     RL_F(al, bl, cl, dl, el, w2, 15);
@@ -126,7 +126,7 @@ static void ripemd160_compress(uint32_t *state, const uint8_t *block)
     RL_F(al, bl, cl, dl, el, w13, 7);
     RL_F(al, bl, cl, dl, el, w14, 9);
     RL_F(al, bl, cl, dl, el, w15, 8);
-    /* 左链：轮16-31，G(b,c,d) = (b&c)|(~b&d) */
+    /* Left chain: rounds 16-31, G(b,c,d) = (b&c)|(~b&d) */
     RL_G(al, bl, cl, dl, el, w7, 7);
     RL_G(al, bl, cl, dl, el, w4, 6);
     RL_G(al, bl, cl, dl, el, w13, 8);
@@ -143,7 +143,7 @@ static void ripemd160_compress(uint32_t *state, const uint8_t *block)
     RL_G(al, bl, cl, dl, el, w14, 7);
     RL_G(al, bl, cl, dl, el, w11, 13);
     RL_G(al, bl, cl, dl, el, w8, 12);
-    /* 左链：轮32-47，H(b,c,d) = (b|~c)^d */
+    /* Left chain: rounds 32-47, H(b,c,d) = (b|~c)^d */
     RL_H(al, bl, cl, dl, el, w3, 11);
     RL_H(al, bl, cl, dl, el, w10, 13);
     RL_H(al, bl, cl, dl, el, w14, 6);
@@ -160,7 +160,7 @@ static void ripemd160_compress(uint32_t *state, const uint8_t *block)
     RL_H(al, bl, cl, dl, el, w11, 12);
     RL_H(al, bl, cl, dl, el, w5, 7);
     RL_H(al, bl, cl, dl, el, w12, 5);
-    /* 左链：轮48-63，I(b,c,d) = (b&d)|(c&~d) */
+    /* Left chain: rounds 48-63, I(b,c,d) = (b&d)|(c&~d) */
     RL_I(al, bl, cl, dl, el, w1, 11);
     RL_I(al, bl, cl, dl, el, w9, 12);
     RL_I(al, bl, cl, dl, el, w11, 14);
@@ -177,7 +177,7 @@ static void ripemd160_compress(uint32_t *state, const uint8_t *block)
     RL_I(al, bl, cl, dl, el, w5, 6);
     RL_I(al, bl, cl, dl, el, w6, 5);
     RL_I(al, bl, cl, dl, el, w2, 12);
-    /* 左链：轮64-79，J(b,c,d) = b^(c|~d) */
+    /* Left chain: rounds 64-79, J(b,c,d) = b^(c|~d) */
     RL_J(al, bl, cl, dl, el, w4, 9);
     RL_J(al, bl, cl, dl, el, w0, 15);
     RL_J(al, bl, cl, dl, el, w5, 5);
@@ -195,7 +195,7 @@ static void ripemd160_compress(uint32_t *state, const uint8_t *block)
     RL_J(al, bl, cl, dl, el, w15, 5);
     RL_J(al, bl, cl, dl, el, w13, 6);
 
-    /* 右链：轮0-15，J(b,c,d) = b^(c|~d) */
+    /* Right chain: rounds 0-15, J(b,c,d) = b^(c|~d) */
     RR_J(ar, br, cr, dr, er, w5, 8);
     RR_J(ar, br, cr, dr, er, w14, 9);
     RR_J(ar, br, cr, dr, er, w7, 9);
@@ -212,7 +212,7 @@ static void ripemd160_compress(uint32_t *state, const uint8_t *block)
     RR_J(ar, br, cr, dr, er, w10, 14);
     RR_J(ar, br, cr, dr, er, w3, 12);
     RR_J(ar, br, cr, dr, er, w12, 6);
-    /* 右链：轮16-31，I(b,c,d) = (b&d)|(c&~d) */
+    /* Right chain: rounds 16-31, I(b,c,d) = (b&d)|(c&~d) */
     RR_I(ar, br, cr, dr, er, w6, 9);
     RR_I(ar, br, cr, dr, er, w11, 13);
     RR_I(ar, br, cr, dr, er, w3, 15);
@@ -229,7 +229,7 @@ static void ripemd160_compress(uint32_t *state, const uint8_t *block)
     RR_I(ar, br, cr, dr, er, w9, 15);
     RR_I(ar, br, cr, dr, er, w1, 13);
     RR_I(ar, br, cr, dr, er, w2, 11);
-    /* 右链：轮32-47，H(b,c,d) = (b|~c)^d */
+    /* Right chain: rounds 32-47, H(b,c,d) = (b|~c)^d */
     RR_H(ar, br, cr, dr, er, w15, 9);
     RR_H(ar, br, cr, dr, er, w5, 7);
     RR_H(ar, br, cr, dr, er, w1, 15);
@@ -246,7 +246,7 @@ static void ripemd160_compress(uint32_t *state, const uint8_t *block)
     RR_H(ar, br, cr, dr, er, w0, 13);
     RR_H(ar, br, cr, dr, er, w4, 7);
     RR_H(ar, br, cr, dr, er, w13, 5);
-    /* 右链：轮48-63，G(b,c,d) = (b&c)|(~b&d) */
+    /* Right chain: rounds 48-63, G(b,c,d) = (b&c)|(~b&d) */
     RR_G(ar, br, cr, dr, er, w8, 15);
     RR_G(ar, br, cr, dr, er, w6, 5);
     RR_G(ar, br, cr, dr, er, w4, 8);
@@ -263,7 +263,7 @@ static void ripemd160_compress(uint32_t *state, const uint8_t *block)
     RR_G(ar, br, cr, dr, er, w7, 5);
     RR_G(ar, br, cr, dr, er, w10, 15);
     RR_G(ar, br, cr, dr, er, w14, 8);
-    /* 右链：轮64-79，F(b,c,d) = b^c^d */
+    /* Right chain: rounds 64-79, F(b,c,d) = b^c^d */
     RR_F(ar, br, cr, dr, er, w12, 8);
     RR_F(ar, br, cr, dr, er, w15, 5);
     RR_F(ar, br, cr, dr, er, w10, 12);
@@ -348,21 +348,21 @@ void ripemd160(const uint8_t *data, size_t len, uint8_t *digest)
 }
 
 /*
- * 针对固定32字节输入的专用RIPEMD160，消除ctx/update/final开销
+ * Specialized RIPEMD160 for fixed 32-byte input, eliminates ctx/update/final overhead
  */
 void ripemd160_32(const uint8_t *data32, uint8_t *digest)
 {
-    /* 初始状态 */
+    /* Initial state */
     uint32_t state[5] = {
         0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0
     };
 
-    /* 构造填充块：32字节数据+0x80+零填充+长度(小端，256 bits) */
+    /* Construct padded block: 32-byte data + 0x80 + zero padding + length (little-endian, 256 bits) */
     uint8_t block[64];
     memcpy(block, data32, 32);
     block[32] = 0x80;
     memset(block + 33, 0, 64 - 33 - 8);
-    /* 长度字段：256bits = 0x100，小端序写入最后8字节 */
+    /* Length field: 256 bits = 0x100, written little-endian into last 8 bytes */
     block[56] = 0x00; block[57] = 0x01;
     block[58] = 0x00; block[59] = 0x00;
     block[60] = 0x00; block[61] = 0x00;
@@ -370,7 +370,7 @@ void ripemd160_32(const uint8_t *data32, uint8_t *digest)
 
     ripemd160_compress(state, block);
 
-    /* 输出（小端序） */
+    /* Output (little-endian) */
     for (int i = 0; i < 5; i++) {
         digest[i * 4] = (state[i]) & 0xFF;
         digest[i * 4 + 1] = (state[i] >> 8) & 0xFF;

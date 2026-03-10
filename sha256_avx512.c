@@ -1,10 +1,11 @@
 /*
- * sha256_avx512.c — SHA256 16-way AVX-512并行压缩函数
+ * sha256_avx512.c — SHA256 16-way AVX-512 parallel compression function
  *
- * 同时处理16个独立消息块（每个块64字节），利用AVX-512 512-bit寄存器
- * 将16个uint32_t打包为一个__m512i，每条SIMD指令同时推进16路状态
+ * Processes 16 independent message blocks (each 64 bytes) simultaneously,
+ * using AVX-512 512-bit registers to pack 16 uint32_t values into one __m512i,
+ * advancing 16 lanes of state with each SIMD instruction.
  *
- * 接口：
+ * Interface:
  *   void sha256_compress_avx512(uint32_t *states[16], const uint8_t *blocks[16])
  */
 
@@ -14,10 +15,10 @@
 #include <stdint.h>
 #include "sha256.h"
 
-/* 右旋转 */
+/* Right rotation */
 #define V_ROR(x, n) _mm512_or_si512(_mm512_srli_epi32((x), (n)), _mm512_slli_epi32((x), 32 - (n)))
 
-/* SHA256辅助函数（向量化版本） */
+/* SHA256 auxiliary functions (vectorized versions) */
 #define V_CH(x, y, z)   _mm512_xor_si512(_mm512_and_si512((x), (y)), _mm512_andnot_si512((x), (z)))
 #define V_MAJ(x, y, z)  _mm512_xor_si512(_mm512_xor_si512(_mm512_and_si512((x), (y)), \
                             _mm512_and_si512((x), (z))), _mm512_and_si512((y), (z)))
@@ -26,7 +27,7 @@
 #define V_SIG0(x)       _mm512_xor_si512(_mm512_xor_si512(V_ROR((x), 7), V_ROR((x), 18)), _mm512_srli_epi32((x), 3))
 #define V_SIG1(x)       _mm512_xor_si512(_mm512_xor_si512(V_ROR((x), 17), V_ROR((x), 19)), _mm512_srli_epi32((x), 10))
 
-/* 一轮SHA256（向量化）：同时推进16路状态 */
+/* One SHA256 round (vectorized): advances 16 lanes of state simultaneously */
 #define V_ROUND(a, b, c, d, e, f, g, h, k_val, w)                                           \
     do {                                                                                    \
         __m512i _k = _mm512_set1_epi32(k_val);                                              \
@@ -38,11 +39,11 @@
         (h) = _mm512_add_epi32(_t1, _t2);                                                   \
     } while (0)
 
-/* 消息扩展 */
+/* Message expansion */
 #define V_EXPAND(w0, w1, w9, w14) \
     _mm512_add_epi32(_mm512_add_epi32(V_SIG1(w14), (w9)), _mm512_add_epi32(V_SIG0(w1), (w0)))
 
-/* 从16个block的第i个uint32_t（大端序）加载到__m512i */
+/* Load the i-th uint32_t (big-endian) from each of 16 blocks into a __m512i */
 static inline __m512i load_be32_16way(const uint8_t *const blocks[16], int i)
 {
     int off = i * 4;
@@ -66,7 +67,7 @@ static inline __m512i load_be32_16way(const uint8_t *const blocks[16], int i)
                             (int)v7, (int)v6, (int)v5, (int)v4, (int)v3, (int)v2, (int)v1, (int)v0);
 }
 
-/* 将__m512i的16个lane分别写回16个state的第i个元素 */
+/* Write the 16 lanes of a __m512i back to the i-th element of each of 16 states */
 static inline void store_16way(uint32_t *const states[16], int i, __m512i v)
 {
     uint32_t tmp[16];
@@ -90,12 +91,12 @@ static inline void store_16way(uint32_t *const states[16], int i, __m512i v)
 }
 
 /*
- * 同时对16个独立的(state, block)对执行一次SHA256压缩
+ * Perform one SHA256 compression on 16 independent (state, block) pairs simultaneously
  */
 __attribute__((target("avx512f")))
 void sha256_compress_avx512(uint32_t *states[16], const uint8_t *blocks[16])
 {
-    /* 加载 16 路初始状态 */
+    /* Load 16-lane initial state */
     __m512i a = _mm512_set_epi32((int)states[15][0], (int)states[14][0], (int)states[13][0], (int)states[12][0],
                                  (int)states[11][0], (int)states[10][0], (int)states[9][0], (int)states[8][0],
                                  (int)states[7][0], (int)states[6][0], (int)states[5][0], (int)states[4][0],
@@ -129,10 +130,10 @@ void sha256_compress_avx512(uint32_t *states[16], const uint8_t *blocks[16])
                                  (int)states[7][7], (int)states[6][7], (int)states[5][7], (int)states[4][7],
                                  (int)states[3][7], (int)states[2][7], (int)states[1][7], (int)states[0][7]);
 
-    /* 保存初始状态用于最后累加 */
+    /* Save initial state for final accumulation */
     __m512i a0 = a, b0 = b, c0 = c, d0 = d, e0 = e, f0 = f, g0 = g, h0 = h;
 
-    /* 加载 16 路消息字（大端序） */
+    /* Load 16-lane message words (big-endian) */
     __m512i w0 = load_be32_16way(blocks, 0), w1 = load_be32_16way(blocks, 1);
     __m512i w2 = load_be32_16way(blocks, 2), w3 = load_be32_16way(blocks, 3);
     __m512i w4 = load_be32_16way(blocks, 4), w5 = load_be32_16way(blocks, 5);
@@ -142,7 +143,7 @@ void sha256_compress_avx512(uint32_t *states[16], const uint8_t *blocks[16])
     __m512i w12 = load_be32_16way(blocks, 12), w13 = load_be32_16way(blocks, 13);
     __m512i w14 = load_be32_16way(blocks, 14), w15 = load_be32_16way(blocks, 15);
 
-    /* 轮0-15 */
+    /* Rounds 0-15 */
     V_ROUND(a, b, c, d, e, f, g, h, 0x428a2f98, w0);
     V_ROUND(h, a, b, c, d, e, f, g, 0x71374491, w1);
     V_ROUND(g, h, a, b, c, d, e, f, 0xb5c0fbcf, w2);
@@ -160,7 +161,7 @@ void sha256_compress_avx512(uint32_t *states[16], const uint8_t *blocks[16])
     V_ROUND(c, d, e, f, g, h, a, b, 0x9bdc06a7, w14);
     V_ROUND(b, c, d, e, f, g, h, a, 0xc19bf174, w15);
 
-    /* 轮16-31 */
+    /* Rounds 16-31 */
     w0 = V_EXPAND(w0, w1, w9, w14);
     V_ROUND(a, b, c, d, e, f, g, h, 0xe49b69c1, w0);
     w1 = V_EXPAND(w1, w2, w10, w15);
@@ -194,7 +195,7 @@ void sha256_compress_avx512(uint32_t *states[16], const uint8_t *blocks[16])
     w15 = V_EXPAND(w15, w0, w8, w13);
     V_ROUND(b, c, d, e, f, g, h, a, 0x14292967, w15);
 
-    /* 轮32-47 */
+    /* Rounds 32-47 */
     w0 = V_EXPAND(w0, w1, w9, w14);
     V_ROUND(a, b, c, d, e, f, g, h, 0x27b70a85, w0);
     w1 = V_EXPAND(w1, w2, w10, w15);
@@ -228,7 +229,7 @@ void sha256_compress_avx512(uint32_t *states[16], const uint8_t *blocks[16])
     w15 = V_EXPAND(w15, w0, w8, w13);
     V_ROUND(b, c, d, e, f, g, h, a, 0x106aa070, w15);
 
-    /* 轮48-63 */
+    /* Rounds 48-63 */
     w0 = V_EXPAND(w0, w1, w9, w14);
     V_ROUND(a, b, c, d, e, f, g, h, 0x19a4c116, w0);
     w1 = V_EXPAND(w1, w2, w10, w15);
@@ -262,7 +263,7 @@ void sha256_compress_avx512(uint32_t *states[16], const uint8_t *blocks[16])
     w15 = V_EXPAND(w15, w0, w8, w13);
     V_ROUND(b, c, d, e, f, g, h, a, 0xc67178f2, w15);
 
-    /* 累加初始状态 */
+    /* Accumulate initial state */
     a = _mm512_add_epi32(a, a0);
     b = _mm512_add_epi32(b, b0);
     c = _mm512_add_epi32(c, c0);
@@ -272,7 +273,7 @@ void sha256_compress_avx512(uint32_t *states[16], const uint8_t *blocks[16])
     g = _mm512_add_epi32(g, g0);
     h = _mm512_add_epi32(h, h0);
 
-    /* 写回 16 路状态 */
+    /* Write back 16-lane state */
     store_16way(states, 0, a);
     store_16way(states, 1, b);
     store_16way(states, 2, c);

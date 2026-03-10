@@ -14,18 +14,18 @@
 #include "secp256k1_keygen.h"
 #endif
 
-/* secp256k1上下文 */
+/* secp256k1 context */
 extern secp256k1_context *secp_ctx;
 
-/* Base58字符表 */
+/* Base58 character table */
 const char BASE58_CHARS[] =
     "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
-/* Base58反向映射表：ASCII->Base58索引（-1表示非法字符） */
+/* Base58 reverse lookup table: ASCII -> Base58 index (-1 means invalid character) */
 static int base58_decode_map[256];
 static int base58_decode_map_inited = 0;
 
-/* 私钥字节数组转十六进制字符串 */
+/* Convert private key byte array to hex string */
 void bytes_to_hex(const uint8_t *bytes, int len, char *hex_out)
 {
     for (int i = 0; i < len; i++) {
@@ -34,7 +34,7 @@ void bytes_to_hex(const uint8_t *bytes, int len, char *hex_out)
     hex_out[len * 2] = '\0';
 }
 
-/* SHA256两次哈希 */
+/* Double SHA256 hash */
 void sha256d(const uint8_t *data, size_t len, uint8_t *out)
 {
     uint8_t tmp[32];
@@ -42,25 +42,25 @@ void sha256d(const uint8_t *data, size_t len, uint8_t *out)
     sha256(tmp, 32, out);
 }
 
-/* Base58Check编码 */
+/* Base58Check encoding */
 void base58check_encode(const uint8_t *payload, size_t payload_len, char *out)
 {
-    /* 计算校验和：sha256d前4字节 */
+    /* Compute checksum: first 4 bytes of sha256d */
     uint8_t checksum[32];
     sha256d(payload, payload_len, checksum);
 
-    /* 拼接 payload + checksum[0..3] */
+    /* Concatenate payload + checksum[0..3] */
     uint8_t buf[payload_len + 4];
     memcpy(buf, payload, payload_len);
     memcpy(buf + payload_len, checksum, 4);
     size_t total = payload_len + 4;
 
-    /* 统计前导零字节 */
+    /* Count leading zero bytes */
     int leading_zeros = 0;
     for (size_t i = 0; i < total && buf[i] == 0; i++)
         leading_zeros++;
 
-    /* 大数转Base58 */
+    /* Convert big number to Base58 */
     uint8_t digits[128] = {0};
     int digits_len = 0;
 
@@ -77,7 +77,7 @@ void base58check_encode(const uint8_t *payload, size_t payload_len, char *out)
         }
     }
 
-    /* 构建输出字符串（逆序） */
+    /* Build output string (reverse order) */
     int pos = 0;
     for (int i = 0; i < leading_zeros; i++)
         out[pos++] = '1';
@@ -86,7 +86,7 @@ void base58check_encode(const uint8_t *payload, size_t payload_len, char *out)
     out[pos] = '\0';
 }
 
-/* 初始化反向映射表（只执行一次） */
+/* Initialize reverse lookup table (executed only once) */
 static void init_base58_decode_map(void)
 {
     if (base58_decode_map_inited > 0)
@@ -101,8 +101,8 @@ static void init_base58_decode_map(void)
 }
 
 /*
- * 将Base58字符串还原为字节数组（大端序）
- * 返回0成功，-1失败（非法字符或缓冲区溢出）
+ * Decode Base58 string to byte array (big-endian)
+ * Returns 0 on success, -1 on failure (invalid character or buffer overflow)
  */
 static int base58_decode_bytes(const char *b58str, uint8_t *out, int *out_len)
 {
@@ -111,19 +111,19 @@ static int base58_decode_bytes(const char *b58str, uint8_t *out, int *out_len)
     int cap = *out_len;
     int len = (int)strlen(b58str);
 
-    /* 统计前导'1'（对应前导零字节） */
+    /* Count leading '1' characters (corresponding to leading zero bytes) */
     int leading_ones = 0;
     while (leading_ones < len && b58str[leading_ones] == '1')
         leading_ones++;
 
-    /* 用临时缓冲区做大数运算 */
+    /* Use temporary buffer for big number arithmetic */
     uint8_t tmp[128] = {0};
     int tmp_len = 0;
 
     for (int i = leading_ones; i < len; i++) {
         int val = base58_decode_map[(uint8_t)b58str[i]];
         if (val < 0)
-            return -1; /* 非法字符 */
+            return -1; /* invalid character */
 
         int carry = val;
         for (int j = tmp_len - 1; j >= 0; j--) {
@@ -133,8 +133,8 @@ static int base58_decode_bytes(const char *b58str, uint8_t *out, int *out_len)
         }
         while (carry) {
             if (tmp_len >= 128)
-                return -1; /* 溢出 */
-            /* 向前移一位 */
+                return -1; /* overflow */
+            /* shift forward by one */
             memmove(tmp + 1, tmp, tmp_len);
             tmp[0] = (uint8_t)(carry & 0xFF);
             carry >>= 8;
@@ -144,45 +144,45 @@ static int base58_decode_bytes(const char *b58str, uint8_t *out, int *out_len)
             tmp_len = 1;
     }
 
-    /* 计算总长度 */
+    /* Compute total length */
     int total = leading_ones + tmp_len;
     if (total > cap)
-        return -1; /* 缓冲区不足 */
+        return -1; /* insufficient buffer */
 
-    /* 写入输出 */
+    /* Write output */
     memset(out, 0, leading_ones);
     memcpy(out + leading_ones, tmp, tmp_len);
     *out_len = total;
     return 0;
 }
 
-/* Base58Check 解码：从比特币地址字符串反向解码出20字节RIPEMD160哈希值 */
+/* Base58Check decoding: decode a Bitcoin address string back to a 20-byte RIPEMD160 hash */
 int base58check_decode(const char *b58str, uint8_t *hash160_out)
 {
     uint8_t buf[64];
     int buf_len = 64;
 
-    /* 步骤1：Base58还原为字节数组 */
+    /* Step 1: decode Base58 string to byte array */
     if (base58_decode_bytes(b58str, buf, &buf_len) != 0)
         return -1;
 
-    /* 步骤2：检查长度（版本1B + hash160 20B + 校验和4B = 25字节） */
+    /* Step 2: check length (version 1B + hash160 20B + checksum 4B = 25 bytes) */
     if (buf_len != 25)
         return -1;
 
-    /* 步骤3：校验和验证 */
+    /* Step 3: verify checksum */
     uint8_t hash[32];
-    sha256d(buf, 21, hash); /* 对前21字节做双重SHA256 */
+    sha256d(buf, 21, hash); /* double SHA256 over first 21 bytes */
     if (memcmp(hash, buf + 21, 4) != 0)
         return -2;
 
-    /* 步骤4：再转换为base58编码，与原始编码对比 */
+    /* Step 4: re-encode to base58 and compare with original */
     char address[64];
     base58check_encode(buf, 21, address);
     if (strcmp(b58str, address) != 0)
         return -2;
 
-    /* 步骤5：提取hash160（跳过版本字节） */
+    /* Step 5: extract hash160 (skip version byte) */
     if (hash160_out != NULL)
         memcpy(hash160_out, buf + 1, 20);
 
@@ -190,7 +190,7 @@ int base58check_decode(const char *b58str, uint8_t *hash160_out)
 }
 
 /*
- * 直接从已序列化的公钥字节计算hash160（SHA256 -> RIPEMD160）
+ * Compute hash160 (SHA256 -> RIPEMD160) directly from serialized public key bytes
  */
 void pubkey_bytes_to_hash160(const uint8_t *pubkey_bytes, size_t len,
                             uint8_t *hash160_out)
@@ -207,10 +207,11 @@ void pubkey_bytes_to_hash160(const uint8_t *pubkey_bytes, size_t len,
 }
 
 /*
- * 从32字节私钥计算压缩与非压缩公钥的hash160（SHA256 -> RIPEMD160），
- * compressed_hash160   : 压缩公钥的hash160输出（20字节），传NULL则跳过
- * uncompressed_hash160 : 非压缩公钥的hash160输出（20字节），传NULL则跳过
- * 返回值：0成功，-1失败（公钥生成失败）
+ * Compute hash160 (SHA256 -> RIPEMD160) for both compressed and uncompressed public keys
+ * from a 32-byte private key.
+ * compressed_hash160   : output for compressed pubkey hash160 (20 bytes), pass NULL to skip
+ * uncompressed_hash160 : output for uncompressed pubkey hash160 (20 bytes), pass NULL to skip
+ * Return value: 0 on success, -1 on failure (pubkey generation failed)
  */
 int privkey_to_hash160(const uint8_t *privkey,
                        uint8_t *compressed_hash160,
@@ -218,12 +219,12 @@ int privkey_to_hash160(const uint8_t *privkey,
 {
     uint8_t sha256_result[32];
 
-    /* 一次椭圆曲线运算，得到公钥对象 */
+    /* One elliptic curve operation to get the public key object */
     secp256k1_pubkey pubkey;
     if (!secp256k1_ec_pubkey_create(secp_ctx, &pubkey, privkey))
         return -1;
 
-    /* ---- 压缩公钥 hash160 ---- */
+    /* ---- Compressed pubkey hash160 ---- */
     if (compressed_hash160 != NULL) {
         uint8_t pubkey_compressed[33];
         size_t pubkey_len1 = 33;
@@ -233,7 +234,7 @@ int privkey_to_hash160(const uint8_t *privkey,
         ripemd160(sha256_result, 32, compressed_hash160);
     }
 
-    /* ---- 非压缩公钥 hash160 ---- */
+    /* ---- Uncompressed pubkey hash160 ---- */
     if (uncompressed_hash160 != NULL) {
         uint8_t pubkey_uncompressed[65];
         size_t pubkey_len2 = 65;
@@ -247,7 +248,8 @@ int privkey_to_hash160(const uint8_t *privkey,
 }
 
 /*
- * 从32字节私钥同时计算压缩与非压缩两种比特币地址（P2PKH）
+ * Compute both compressed and uncompressed Bitcoin addresses (P2PKH)
+ * from a 32-byte private key simultaneously.
  */
 int privkey_to_address(const uint8_t *privkey,
                        char *compressed_out,
@@ -257,16 +259,16 @@ int privkey_to_address(const uint8_t *privkey,
     uint8_t hash160_uncompressed[20];
     uint8_t versioned[21];
 
-    /* 复用privkey_to_hash160计算两种hash160 */
+    /* Reuse privkey_to_hash160 to compute both hash160 values */
     if (privkey_to_hash160(privkey, hash160_compressed, hash160_uncompressed) != 0)
         return -1;
 
-    /* ---- 压缩地址 ---- */
+    /* ---- Compressed address ---- */
     versioned[0] = 0x00;
     memcpy(versioned + 1, hash160_compressed, 20);
     base58check_encode(versioned, 21, compressed_out);
 
-    /* ---- 非压缩地址 ---- */
+    /* ---- Uncompressed address ---- */
     versioned[0] = 0x00;
     memcpy(versioned + 1, hash160_uncompressed, 20);
     base58check_encode(versioned, 21, uncompressed_out);
@@ -277,7 +279,7 @@ int privkey_to_address(const uint8_t *privkey,
 struct ht_slot *ht_slots = NULL;
 uint32_t ht_mask = 0;
 
-/* 初始化哈希表：分配capacity个槽位（capacity必须为2的幂次） */
+/* Initialize hash table: allocate capacity slots (capacity must be a power of 2) */
 int ht_init(uint32_t capacity)
 {
     ht_slots = (struct ht_slot *)calloc(capacity, sizeof(struct ht_slot));
@@ -287,7 +289,7 @@ int ht_init(uint32_t capacity)
     return 0;
 }
 
-/* 释放哈希表内存 */
+/* Free hash table memory */
 void ht_free(void)
 {
     free(ht_slots);
@@ -296,23 +298,23 @@ void ht_free(void)
 }
 
 /*
- * Knuth乘法哈希：直接对前4字节指纹fp做一次乘法
- * 返回槽位索引（已 & ht_mask）
+ * Knuth multiplicative hash: one multiplication on the 4-byte fingerprint fp
+ * Returns slot index (already & ht_mask)
  */
 static inline uint32_t ht_hash(uint32_t fp)
 {
     return (fp * 2654435761u) & ht_mask;
 }
 
-/* 向哈希表插入hash160（线性探测） */
+/* Insert hash160 into hash table (linear probing) */
 void ht_insert(const uint8_t *h160)
 {
-    /* 提取前4字节指纹（大端序） */
+    /* Extract 4-byte fingerprint (big-endian) */
     uint32_t fp = ((uint32_t)h160[0] << 24) |
                   ((uint32_t)h160[1] << 16) |
                   ((uint32_t)h160[2] <<  8) |
                    (uint32_t)h160[3];
-    /* fp == 0时用1代替，避免与空槽标识冲突 */
+    /* Replace fp == 0 with 1 to avoid conflict with empty slot marker */
     if (fp == 0)
         fp = 1;
 
@@ -324,7 +326,7 @@ void ht_insert(const uint8_t *h160)
     memcpy(ht_slots[idx].h160, h160, 20);
 }
 
-/* 在哈希表中查找hash160（线性探测） */
+/* Look up hash160 in hash table (linear probing) */
 int ht_contains(const uint8_t *h160)
 {
     uint32_t fp = ((uint32_t)h160[0] << 24) |
@@ -338,29 +340,29 @@ int ht_contains(const uint8_t *h160)
     while (1) {
         uint32_t slot_fp = ht_slots[idx].fp;
         if (slot_fp == 0)
-            return 0; /* 空槽，未命中 */
+            return 0; /* empty slot, miss */
         if (slot_fp == fp && memcmp(ht_slots[idx].h160, h160, 20) == 0)
-            return 1; /* 命中 */
+            return 1; /* hit */
         idx = (idx + 1) & ht_mask;
     }
 }
 
 #ifdef __AVX2__
 
-/* SHA256初始状态常量 */
+/* SHA256 initial state constants */
 static const uint32_t sha256_init_state[8] = {
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
     0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
 };
 
-/* RIPEMD160初始状态常量 */
+/* RIPEMD160 initial state constants */
 static const uint32_t rmd160_init_state[5] = {
     0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0
 };
 
 /*
- * 构造SHA256 padded block（单块，消息 <= 55 字节）
- * 消息+0x80+零填充+8字节大端消息位长
+ * Construct SHA256 padded block (single block, message <= 55 bytes)
+ * message + 0x80 + zero padding + 8-byte big-endian message bit length
  */
 static void make_sha256_block(const uint8_t *msg, size_t msglen, uint8_t block[64])
 {
@@ -379,8 +381,8 @@ static void make_sha256_block(const uint8_t *msg, size_t msglen, uint8_t block[6
 }
 
 /*
- * 构造SHA256第一个block（64字节消息块，无padding）
- * 用于65字节消息的第一块（取前64字节）
+ * Construct SHA256 first block (64-byte message block, no padding)
+ * Used for the first block of a 65-byte message (first 64 bytes)
  */
 static void make_sha256_block_raw(const uint8_t *msg64, uint8_t block[64])
 {
@@ -388,15 +390,15 @@ static void make_sha256_block_raw(const uint8_t *msg64, uint8_t block[64])
 }
 
 /*
- * 构造SHA256第二个padded block（65字节消息的尾块）
- * 消息剩余1字节+0x80+零填充+8字节大端消息位长(65*8=520bits)
+ * Construct SHA256 second padded block (tail block for 65-byte message)
+ * remaining 1 byte + 0x80 + zero padding + 8-byte big-endian bit length (65*8=520 bits)
  */
 static void make_sha256_block2_65(const uint8_t last_byte, uint8_t block[64])
 {
     memset(block, 0, 64);
     block[0] = last_byte;
     block[1] = 0x80;
-    /* 消息位长 = 65 * 8 = 520 = 0x208 */
+    /* message bit length = 65 * 8 = 520 = 0x208 */
     uint64_t bitlen = 65ULL * 8;
     block[56] = (uint8_t)(bitlen >> 56);
     block[57] = (uint8_t)(bitlen >> 48);
@@ -409,7 +411,7 @@ static void make_sha256_block2_65(const uint8_t last_byte, uint8_t block[64])
 }
 
 /*
- * 将SHA256 state[8]转为32字节大端序摘要
+ * Convert SHA256 state[8] to 32-byte big-endian digest
  */
 static void sha256_state_to_bytes(const uint32_t state[8], uint8_t out[32])
 {
@@ -422,8 +424,8 @@ static void sha256_state_to_bytes(const uint32_t state[8], uint8_t out[32])
 }
 
 /*
- * 构造RIPEMD160 padded block（单块，消息 <= 55字节）
- * 消息+0x80+零填充+8字节小端消息位长
+ * Construct RIPEMD160 padded block (single block, message <= 55 bytes)
+ * message + 0x80 + zero padding + 8-byte little-endian message bit length
  */
 static void make_rmd160_block(const uint8_t *msg, size_t msglen, uint8_t block[64])
 {
@@ -442,7 +444,7 @@ static void make_rmd160_block(const uint8_t *msg, size_t msglen, uint8_t block[6
 }
 
 /*
- * 将RIPEMD160 state[5]转为20字节小端序摘要
+ * Convert RIPEMD160 state[5] to 20-byte little-endian digest
  */
 static void rmd160_state_to_bytes(const uint32_t state[5], uint8_t out[20])
 {
@@ -455,23 +457,23 @@ static void rmd160_state_to_bytes(const uint32_t state[5], uint8_t out[20])
 }
 
 /*
- * 直接从SHA256 state（8个大端uint32_t）构造RIPEMD160 padded block
- * SHA256输出32字节（大端序），作为RIPEMD160的消息输入
+ * Construct RIPEMD160 padded block directly from SHA256 state (8 big-endian uint32_t)
+ * SHA256 outputs 32 bytes (big-endian), used as RIPEMD160 message input
  */
 static void make_rmd160_block_from_sha256_state(const uint32_t sha_state[8],
                                                 uint8_t block[64])
 {
-    /* 将SHA256 state按大端序写入block前32字节 */
+    /* Write SHA256 state in big-endian order to first 32 bytes of block */
     for (int i = 0; i < 8; i++) {
         block[i * 4 + 0] = (uint8_t)(sha_state[i] >> 24);
         block[i * 4 + 1] = (uint8_t)(sha_state[i] >> 16);
         block[i * 4 + 2] = (uint8_t)(sha_state[i] >> 8);
         block[i * 4 + 3] = (uint8_t)(sha_state[i]);
     }
-    /* RIPEMD160 padding：0x80 + 零填充 + 8字节小端位长（32*8=256bits） */
+    /* RIPEMD160 padding: 0x80 + zero padding + 8-byte little-endian bit length (32*8=256 bits) */
     block[32] = 0x80;
     memset(block + 33, 0, 64 - 33 - 8);
-    /* 位长 256 = 0x100，小端序写入最后8字节 */
+    /* bit length 256 = 0x100, written in little-endian to last 8 bytes */
     block[56] = 0x00;
     block[57] = 0x01;
     block[58] = 0x00;
@@ -483,15 +485,15 @@ static void make_rmd160_block_from_sha256_state(const uint32_t sha_state[8],
 }
 
 /*
- * 8路并行计算压缩公钥（33字节）的hash160（SHA256->RIPEMD160）
+ * 8-way parallel hash160 (SHA256->RIPEMD160) for compressed public keys (33 bytes)
  *
- * 压缩公钥33字节<56字节，单块SHA256即可完成
- * SHA256输出32字节<56字节，单块RIPEMD160即可完成
+ * Compressed pubkey 33 bytes < 56 bytes, single-block SHA256 suffices
+ * SHA256 output 32 bytes < 56 bytes, single-block RIPEMD160 suffices
  */
 __attribute__((target("avx2")))
 void hash160_8way_compressed(const uint8_t *pubkeys[8], uint8_t hash160s[8][20])
 {
-    /* ---- 步骤1：构造8路SHA256 padded block（33字节消息） ---- */
+    /* ---- Step 1: construct 8-way SHA256 padded blocks (33-byte message) ---- */
     uint8_t sha_blocks[8][64];
     uint32_t sha_states[8][8];
     uint32_t *sha_state_ptrs[8];
@@ -504,10 +506,10 @@ void hash160_8way_compressed(const uint8_t *pubkeys[8], uint8_t hash160s[8][20])
         sha_block_ptrs[i] = sha_blocks[i];
     }
 
-    /* ---- 步骤2：8路并行SHA256压缩 ---- */
+    /* ---- Step 2: 8-way parallel SHA256 compression ---- */
     sha256_compress_avx2(sha_state_ptrs, sha_block_ptrs);
 
-    /* ---- 步骤3：直接从SHA256 state构造8路RIPEMD160 padded block ---- */
+    /* ---- Step 3: construct 8-way RIPEMD160 padded blocks directly from SHA256 state ---- */
     uint8_t rmd_blocks[8][64];
     uint32_t rmd_states[8][5];
     uint32_t *rmd_state_ptrs[8];
@@ -520,24 +522,24 @@ void hash160_8way_compressed(const uint8_t *pubkeys[8], uint8_t hash160s[8][20])
         rmd_block_ptrs[i] = rmd_blocks[i];
     }
 
-    /* ---- 步骤4：8路并行RIPEMD160压缩 ---- */
+    /* ---- Step 4: 8-way parallel RIPEMD160 compression ---- */
     ripemd160_compress_avx2(rmd_state_ptrs, rmd_block_ptrs);
 
-    /* ---- 步骤5：提取8路RIPEMD160摘要（20字节小端序） ---- */
+    /* ---- Step 5: extract 8-way RIPEMD160 digests (20-byte little-endian) ---- */
     for (int i = 0; i < 8; i++) {
         rmd160_state_to_bytes(rmd_states[i], hash160s[i]);
     }
 }
 
 /*
- * 8路并行计算压缩公钥的hash160（预填充，零拷贝）
- * 调用方需提前将33字节公钥写入64字节buffer[0..32]，
- * 并调用 sha256_pad_block_33() 原地完成SHA256 padding
+ * 8-way parallel hash160 for compressed public keys (pre-padded, zero-copy)
+ * Caller must write the 33-byte pubkey into buffer[0..32] of a 64-byte buffer,
+ * and call sha256_pad_block_33() to complete SHA256 padding in-place
  */
 __attribute__((target("avx2")))
 void hash160_8way_compressed_prepadded(const uint8_t *blocks[8], uint8_t hash160s[8][20])
 {
-    /* ---- 步骤1：直接使用调用方已padded的block，无需拷贝 ---- */
+    /* ---- Step 1: use caller's pre-padded block directly, no copy needed ---- */
     uint32_t sha_states[8][8];
     uint32_t *sha_state_ptrs[8];
 
@@ -546,10 +548,10 @@ void hash160_8way_compressed_prepadded(const uint8_t *blocks[8], uint8_t hash160
         sha_state_ptrs[i] = sha_states[i];
     }
 
-    /* ---- 步骤2：8路并行SHA256压缩 ---- */
+    /* ---- Step 2: 8-way parallel SHA256 compression ---- */
     sha256_compress_avx2(sha_state_ptrs, (const uint8_t **)blocks);
 
-    /* ---- 步骤3：直接从SHA256 state构造8路RIPEMD160 padded block ---- */
+    /* ---- Step 3: construct 8-way RIPEMD160 padded blocks directly from SHA256 state ---- */
     uint8_t rmd_blocks[8][64];
     uint32_t rmd_states[8][5];
     uint32_t *rmd_state_ptrs[8];
@@ -562,26 +564,26 @@ void hash160_8way_compressed_prepadded(const uint8_t *blocks[8], uint8_t hash160
         rmd_block_ptrs[i] = rmd_blocks[i];
     }
 
-    /* ---- 步骤4：8路并行RIPEMD160压缩 ---- */
+    /* ---- Step 4: 8-way parallel RIPEMD160 compression ---- */
     ripemd160_compress_avx2(rmd_state_ptrs, rmd_block_ptrs);
 
-    /* ---- 步骤5：提取8路RIPEMD160摘要（20字节小端序） ---- */
+    /* ---- Step 5: extract 8-way RIPEMD160 digests (20-byte little-endian) ---- */
     for (int i = 0; i < 8; i++) {
         rmd160_state_to_bytes(rmd_states[i], hash160s[i]);
     }
 }
 
 /*
- * 8路并行计算非压缩公钥的hash160（预填充，零拷贝）
+ * 8-way parallel hash160 for uncompressed public keys (pre-padded, zero-copy)
  *
- * 调用方需提前将65字节公钥写入128字节buffer[0..64]，
- * 并调用sha256_pad_block2_65() 原地在buffer[64..127]构造block2，
- * 然后将该128字节buffer指针传入本函数，省去内部的make_sha256_block2_65
+ * Caller must write the 65-byte pubkey into buffer[0..64] of a 128-byte buffer,
+ * and call sha256_pad_block2_65() to construct block2 in-place at buffer[64..127],
+ * then pass the 128-byte buffer pointer to this function, avoiding internal make_sha256_block2_65
  */
 __attribute__((target("avx2")))
 void hash160_8way_uncompressed_prepadded(const uint8_t *bufs[8], uint8_t hash160s[8][20])
 {
-    /* ---- 步骤1：直接用bufs[i]指针作为SHA256第一个block（零拷贝） ---- */
+    /* ---- Step 1: use bufs[i] pointer directly as SHA256 first block (zero-copy) ---- */
     uint32_t sha_states[8][8];
     uint32_t *sha_state_ptrs[8];
     const uint8_t *sha_block_ptrs[8];
@@ -592,18 +594,18 @@ void hash160_8way_uncompressed_prepadded(const uint8_t *bufs[8], uint8_t hash160
         sha_block_ptrs[i] = bufs[i];           /* block1 = buf[0..63] */
     }
 
-    /* ---- 步骤2：8路并行SHA256第一次压缩 ---- */
+    /* ---- Step 2: 8-way parallel SHA256 first compression ---- */
     sha256_compress_avx2(sha_state_ptrs, sha_block_ptrs);
 
-    /* ---- 步骤3：直接用bufs[i]+64指针作为SHA256第二个block（零拷贝） ---- */
+    /* ---- Step 3: use bufs[i]+64 pointer directly as SHA256 second block (zero-copy) ---- */
     for (int i = 0; i < 8; i++) {
         sha_block_ptrs[i] = bufs[i] + 64;      /* block2 = buf[64..127] */
     }
 
-    /* ---- 步骤4：8路并行SHA256第二次压缩 ---- */
+    /* ---- Step 4: 8-way parallel SHA256 second compression ---- */
     sha256_compress_avx2(sha_state_ptrs, sha_block_ptrs);
 
-    /* ---- 步骤5：直接从SHA256 state构造8路RIPEMD160 padded block ---- */
+    /* ---- Step 5: construct 8-way RIPEMD160 padded blocks directly from SHA256 state ---- */
     uint8_t rmd_blocks[8][64];
     uint32_t rmd_states[8][5];
     uint32_t *rmd_state_ptrs[8];
@@ -616,26 +618,26 @@ void hash160_8way_uncompressed_prepadded(const uint8_t *bufs[8], uint8_t hash160
         rmd_block_ptrs[i] = rmd_blocks[i];
     }
 
-    /* ---- 步骤6：8路并行RIPEMD160压缩 ---- */
+    /* ---- Step 6: 8-way parallel RIPEMD160 compression ---- */
     ripemd160_compress_avx2(rmd_state_ptrs, rmd_block_ptrs);
 
-    /* ---- 步骤7：提取8路RIPEMD160摘要（20字节小端序） ---- */
+    /* ---- Step 7: extract 8-way RIPEMD160 digests (20-byte little-endian) ---- */
     for (int i = 0; i < 8; i++) {
         rmd160_state_to_bytes(rmd_states[i], hash160s[i]);
     }
 }
 
 /*
- * 8路并行计算非压缩公钥（65字节）的hash160（SHA256 -> RIPEMD160）
+ * 8-way parallel hash160 (SHA256 -> RIPEMD160) for uncompressed public keys (65 bytes)
  *
- * 非压缩公钥65字节需要2个SHA256 block：
- *   block1：前64字节（原始数据，无 padding）
- *   block2：第65字节+0x80+零填充+8字节大端位长(520bits)
+ * Uncompressed pubkey 65 bytes requires 2 SHA256 blocks:
+ *   block1: first 64 bytes (raw data, no padding)
+ *   block2: 65th byte + 0x80 + zero padding + 8-byte big-endian bit length (520 bits)
  */
 __attribute__((target("avx2")))
 void hash160_8way_uncompressed(const uint8_t *pubkeys[8], uint8_t hash160s[8][20])
 {
-    /* ---- 步骤1：直接使用pubkeys[i]原始指针作为SHA256第一个block ---- */
+    /* ---- Step 1: use pubkeys[i] raw pointer directly as SHA256 first block ---- */
     uint32_t sha_states[8][8];
     uint32_t *sha_state_ptrs[8];
     const uint8_t *sha_block_ptrs[8];
@@ -646,20 +648,20 @@ void hash160_8way_uncompressed(const uint8_t *pubkeys[8], uint8_t hash160s[8][20
         sha_block_ptrs[i] = pubkeys[i];
     }
 
-    /* ---- 步骤2：8路并行SHA256第一次压缩 ---- */
+    /* ---- Step 2: 8-way parallel SHA256 first compression ---- */
     sha256_compress_avx2(sha_state_ptrs, sha_block_ptrs);
 
-    /* ---- 步骤3：构造8路SHA256第二个padded block（第65字节 + padding） ---- */
+    /* ---- Step 3: construct 8-way SHA256 second padded block (65th byte + padding) ---- */
     uint8_t sha_blocks2[8][64];
     for (int i = 0; i < 8; i++) {
         make_sha256_block2_65(pubkeys[i][64], sha_blocks2[i]);
         sha_block_ptrs[i] = sha_blocks2[i];
     }
 
-    /* ---- 步骤4：8路并行SHA256第二次压缩（state已更新，继续累加） ---- */
+    /* ---- Step 4: 8-way parallel SHA256 second compression (state already updated, continue accumulating) ---- */
     sha256_compress_avx2(sha_state_ptrs, sha_block_ptrs);
 
-    /* ---- 步骤5：直接从SHA256 state构造8路RIPEMD160 padded block ---- */
+    /* ---- Step 5: construct 8-way RIPEMD160 padded blocks directly from SHA256 state ---- */
     uint8_t rmd_blocks[8][64];
     uint32_t rmd_states[8][5];
     uint32_t *rmd_state_ptrs[8];
@@ -672,28 +674,28 @@ void hash160_8way_uncompressed(const uint8_t *pubkeys[8], uint8_t hash160s[8][20
         rmd_block_ptrs[i] = rmd_blocks[i];
     }
 
-    /* ---- 步骤6：8路并行RIPEMD160压缩 ---- */
+    /* ---- Step 6: 8-way parallel RIPEMD160 compression ---- */
     ripemd160_compress_avx2(rmd_state_ptrs, rmd_block_ptrs);
 
-    /* ---- 步骤7：提取8路RIPEMD160摘要（20字节小端序） ---- */
+    /* ---- Step 7: extract 8-way RIPEMD160 digests (20-byte little-endian) ---- */
     for (int i = 0; i < 8; i++) {
         rmd160_state_to_bytes(rmd_states[i], hash160s[i]);
     }
 }
 
 /*
- * 8路并行查表：同时查找8个hash160
+ * 8-way parallel hash table lookup: search for 8 hash160 values simultaneously
  *
- * 策略：
- *   1. 用标量FNV-1a计算8路槽位索引（与ht_contains完全一致）
- *   2. 用AVX2 _mm256_set_epi32加载8路指纹，_mm256_cmpeq_epi32同时比较
- *   3. 对指纹命中的lane执行标量线性探测 + memcmp 20字节确认
- *   4. 返回8位命中掩码（bit i为1表示第i路命中）
+ * Strategy:
+ *   1. Use scalar Knuth hash to compute 8-way slot indices (identical to ht_contains)
+ *   2. Use AVX2 _mm256_set_epi32 to load 8-way fingerprints, _mm256_cmpeq_epi32 to compare simultaneously
+ *   3. For fingerprint-matched lanes, perform scalar linear probing + memcmp 20-byte confirmation
+ *   4. Return 8-bit hit mask (bit i set means lane i matched)
  */
 __attribute__((target("avx2")))
 uint8_t ht_contains_8way(const uint8_t *h160s[8])
 {
-    /* ---- 步骤1：计算8路指纹和初始槽位索引 ---- */
+    /* ---- Step 1: compute 8-way fingerprints and initial slot indices ---- */
     uint32_t fps[8];
     uint32_t idxs[8];
 
@@ -707,38 +709,38 @@ uint8_t ht_contains_8way(const uint8_t *h160s[8])
             fp = 1;
         fps[i] = fp;
 
-        /* Knuth乘法哈希（与ht_hash完全一致） */
+        /* Knuth multiplicative hash (identical to ht_hash) */
         idxs[i] = (fp * 2654435761u) & ht_mask;
     }
 
-    /* ---- 步骤2：AVX2同时加载8路槽位指纹并比较 ---- */
+    /* ---- Step 2: AVX2 load 8-way slot fingerprints and compare simultaneously ---- */
 
-    /* 加载8路当前槽位的指纹 */
+    /* Load fingerprints of 8 current slots */
     __m256i vslot = _mm256_set_epi32(
         (int32_t)ht_slots[idxs[7]].fp, (int32_t)ht_slots[idxs[6]].fp,
         (int32_t)ht_slots[idxs[5]].fp, (int32_t)ht_slots[idxs[4]].fp,
         (int32_t)ht_slots[idxs[3]].fp, (int32_t)ht_slots[idxs[2]].fp,
         (int32_t)ht_slots[idxs[1]].fp, (int32_t)ht_slots[idxs[0]].fp);
 
-    /* 检测空槽（fp == 0表示空槽，直接未命中） */
+    /* Detect empty slots (fp == 0 means empty slot, direct miss) */
     __m256i vzero = _mm256_setzero_si256();
-    __m256i vempty = _mm256_cmpeq_epi32(vslot, vzero); /* 空槽掩码 */
+    __m256i vempty = _mm256_cmpeq_epi32(vslot, vzero); /* empty slot mask */
 
     int empty_mask = _mm256_movemask_epi8(vempty);
 
-    /* ---- 步骤3：对指纹命中的lane执行标量线性探测+memcmp确认 ---- */
+    /* ---- Step 3: for fingerprint-matched lanes, perform scalar linear probing + memcmp confirmation ---- */
     uint8_t result = 0;
 
     for (int i = 0; i < 8; i++) {
-        /* 每个lane对应movemask中的4个连续bit（epi32 -> 4字节） */
+        /* Each lane corresponds to 4 consecutive bits in movemask (epi32 -> 4 bytes) */
         int lane_bit = 1 << (i * 4);
 
         if (empty_mask & lane_bit) {
-            /* 初始槽为空，直接未命中 */
+            /* initial slot is empty, direct miss */
             continue;
         }
 
-        /* 标量线性探测：从初始槽开始，直到找到匹配或空槽 */
+        /* Scalar linear probing: start from initial slot until match or empty slot found */
         uint32_t idx = idxs[i];
         uint32_t fp  = fps[i];
         const uint8_t *h = h160s[i];
@@ -746,7 +748,7 @@ uint8_t ht_contains_8way(const uint8_t *h160s[8])
         while (1) {
             uint32_t slot_fp = ht_slots[idx].fp;
             if (slot_fp == 0)
-                break; /* 空槽，未命中 */
+                break; /* empty slot, miss */
             if (slot_fp == fp && memcmp(ht_slots[idx].h160, h, 20) == 0) {
                 result |= (uint8_t)(1 << i);
                 break;

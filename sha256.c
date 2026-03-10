@@ -1,13 +1,13 @@
 #include "sha256.h"
 
-/* 完全展开的SHA256压缩函数：消除循环/数组访问，让编译器将变量分配到寄存器 */
+/* Fully unrolled SHA256 compression function: eliminates loop/array access, lets compiler allocate variables to registers */
 #define SHA256_LOAD(i) \
     (((uint32_t)block[(i) * 4] << 24) | ((uint32_t)block[(i) * 4 + 1] << 16) | ((uint32_t)block[(i) * 4 + 2] << 8) | (uint32_t)block[(i) * 4 + 3])
 
 #define SHA256_EXPAND(w0, w1, w9, w14) \
     (SHA256_SIG1(w14) + (w9) + SHA256_SIG0(w1) + (w0))
 
-/* 一轮SHA256：a..h -> 新a..h，k为常量，w为消息字 */
+/* One SHA256 round: a..h -> new a..h, k is constant, w is message word */
 #define SHA256_ROUND(a, b, c, d, e, f, g, h, k, w)                              \
     do {                                                                        \
         uint32_t _t1 = (h) + SHA256_EP1(e) + SHA256_CH(e, f, g) + (k) + (w);    \
@@ -18,7 +18,7 @@
 
 static void sha256_compress(uint32_t *state, const uint8_t *block)
 {
-    /* 加载消息块（大端序） */
+    /* Load message block (big-endian) */
     uint32_t w0 = SHA256_LOAD(0), w1 = SHA256_LOAD(1);
     uint32_t w2 = SHA256_LOAD(2), w3 = SHA256_LOAD(3);
     uint32_t w4 = SHA256_LOAD(4), w5 = SHA256_LOAD(5);
@@ -31,7 +31,7 @@ static void sha256_compress(uint32_t *state, const uint8_t *block)
     uint32_t a=state[0], b=state[1], c=state[2], d=state[3];
     uint32_t e=state[4], f=state[5], g=state[6], h=state[7];
 
-    /* 轮0-15（直接使用消息字） */
+    /* Rounds 0-15 (use message words directly) */
     SHA256_ROUND(a, b, c, d, e, f, g, h, 0x428a2f98, w0);
     SHA256_ROUND(h, a, b, c, d, e, f, g, 0x71374491, w1);
     SHA256_ROUND(g, h, a, b, c, d, e, f, 0xb5c0fbcf, w2);
@@ -49,7 +49,7 @@ static void sha256_compress(uint32_t *state, const uint8_t *block)
     SHA256_ROUND(c, d, e, f, g, h, a, b, 0x9bdc06a7, w14);
     SHA256_ROUND(b, c, d, e, f, g, h, a, 0xc19bf174, w15);
 
-    /* 轮16-31（消息扩展后使用） */
+    /* Rounds 16-31 (use after message expansion) */
     w0 = SHA256_EXPAND(w0, w1, w9, w14);
     SHA256_ROUND(a, b, c, d, e, f, g, h, 0xe49b69c1, w0);
     w1 = SHA256_EXPAND(w1, w2, w10, w15);
@@ -83,7 +83,7 @@ static void sha256_compress(uint32_t *state, const uint8_t *block)
     w15 = SHA256_EXPAND(w15, w0, w8, w13);
     SHA256_ROUND(b, c, d, e, f, g, h, a, 0x14292967, w15);
 
-    /* 轮32-47 */
+    /* Rounds 32-47 */
     w0 = SHA256_EXPAND(w0, w1, w9, w14);
     SHA256_ROUND(a, b, c, d, e, f, g, h, 0x27b70a85, w0);
     w1 = SHA256_EXPAND(w1, w2, w10, w15);
@@ -117,7 +117,7 @@ static void sha256_compress(uint32_t *state, const uint8_t *block)
     w15 = SHA256_EXPAND(w15, w0, w8, w13);
     SHA256_ROUND(b, c, d, e, f, g, h, a, 0x106aa070, w15);
 
-    /* 轮48-63 */
+    /* Rounds 48-63 */
     w0 = SHA256_EXPAND(w0, w1, w9, w14);
     SHA256_ROUND(a, b, c, d, e, f, g, h, 0x19a4c116, w0);
     w1 = SHA256_EXPAND(w1, w2, w10, w15);
@@ -212,8 +212,8 @@ void sha256(const uint8_t *data, size_t len, uint8_t *digest)
 }
 
 /*
- * 针对固定33字节输入（压缩公钥）的专用SHA256，单块处理
- * 33字节+0x80+22字节零+8字节长度=64字节
+ * Specialized SHA256 for fixed 33-byte input (compressed pubkey), single-block processing
+ * 33 bytes + 0x80 + 22 zero bytes + 8 bytes length = 64 bytes
  */
 void sha256_33(const uint8_t *data33, uint8_t *digest)
 {
@@ -225,7 +225,7 @@ void sha256_33(const uint8_t *data33, uint8_t *digest)
     memcpy(block, data33, 33);
     block[33] = 0x80;
     memset(block + 34, 0, 64 - 34 - 8);
-    /* 长度：33*8=264bits=0x108，大端序写入最后8字节 */
+    /* Length: 33*8=264 bits=0x108, written big-endian into last 8 bytes */
     block[56] = 0x00;
     block[57] = 0x00;
     block[58] = 0x00;
@@ -246,9 +246,9 @@ void sha256_33(const uint8_t *data33, uint8_t *digest)
 }
 
 /*
- * 针对固定65字节输入（非压缩公钥）的专用SHA256，两块处理。
- * 第一块：65字节中的前64字节
- * 第二块：第65字节+0x80+54字节零+8字节长度
+ * Specialized SHA256 for fixed 65-byte input (uncompressed pubkey), two-block processing.
+ * First block: first 64 bytes of 65 bytes
+ * Second block: 65th byte + 0x80 + 54 zero bytes + 8 bytes length
  */
 void sha256_65(const uint8_t *data65, uint8_t *digest)
 {
@@ -256,15 +256,15 @@ void sha256_65(const uint8_t *data65, uint8_t *digest)
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
         0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
     };
-    /* 第一块：直接使用前64字节 */
+    /* First block: use first 64 bytes directly */
     sha256_compress(state, data65);
 
-    /* 第二块：第65字节 + padding + 长度 */
+    /* Second block: 65th byte + padding + length */
     uint8_t block2[64];
     block2[0] = data65[64];
     block2[1] = 0x80;
     memset(block2 + 2, 0, 64 - 2 - 8);
-    /* 长度：65*8=520bits=0x208，大端序 */
+    /* Length: 65*8=520 bits=0x208, big-endian */
     block2[56] = 0x00;
     block2[57] = 0x00;
     block2[58] = 0x00;

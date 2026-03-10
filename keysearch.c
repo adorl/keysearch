@@ -1,10 +1,10 @@
 /*
- * 依赖库：
- *   - libsecp256k1  (椭圆曲线公钥计算)
- *   - pthread       (多线程)
- *   SHA256 与 RIPEMD160 均已内嵌纯 C 实现，无需 OpenSSL
- * 用法：
- *   ./keysearch -a <地址文件> [-n 线程数] [-h]
+ * Dependencies:
+ *   - libsecp256k1  (elliptic curve public key computation)
+ *   - pthread       (multi-threading)
+ *   SHA256 and RIPEMD160 are embedded pure-C implementations, no OpenSSL required
+ * Usage:
+ *   ./keysearch -a <address_file> [-n num_threads] [-h]
  */
 #define _POSIX_C_SOURCE 200112L
 
@@ -22,8 +22,12 @@
 #include "ripemd160.h"
 #include "hash_utils.h"
 #include "rand_key.h"
-/* secp256k1_keygen.h在内部模式下已包含secp256k1.h
- * 回退模式需要系统secp256k1.h，通过条件编译处理 */
+
+#ifdef USE_GPU
+#  include "gpu/gpu_interface.h"
+#endif
+/* secp256k1_keygen.h already includes secp256k1.h in internal mode
+ * Fallback mode requires system secp256k1.h, handled via conditional compilation */
 #ifndef USE_PUBKEY_API_ONLY
 #  include "secp256k1_keygen.h"
 #else
@@ -31,62 +35,64 @@
 #  include "secp256k1_keygen.h"
 #endif
 
-/* ===================== 常量定义 ===================== */
-#define MAX_ATTEMPTS        (1ULL << 63)    /* 每个线程最大尝试次数 */
-#define PROGRESS_INTERVAL   (10000000)      /* 进度打印间隔 */
-#define MAX_ADDRESSES       (400000)        /* 最多支持的目标地址数量 */
-#define ADDRESS_LEN         (35)            /* 比特币地址最大长度 */
-#define BATCH_SIZE          (65536)         /* 增量推导批次大小，每批后重置随机基准私钥 */
 
-/* ===================== 全局共享数据 ===================== */
+#define MAX_ATTEMPTS        (1ULL << 63)    /* max attempts per thread */
+#define PROGRESS_INTERVAL   (10000000)      /* progress print interval */
+#define MAX_ADDRESSES       (400000)        /* max number of target addresses */
+#define ADDRESS_LEN         (35)            /* max Bitcoin address length */
+#define BATCH_SIZE          (65536)         /* incremental derivation batch size, reset random base key after each batch */
 
-static int address_count = 0;                /* 已加载地址数量 */
 
-/* 跨线程找到标志 */
+static int address_count = 0;                /* number of loaded addresses */
+
+/* cross-thread found flag */
 static volatile int found_flag = 0;
 
-/* secp256k1上下文（只读，多线程安全） */
+#ifdef USE_GPU
+/* GPU path flag (set by -g argument) */
+static int use_gpu = 0;
+#endif
+
+/* secp256k1 context (read-only, thread-safe) */
 secp256k1_context *secp_ctx = NULL;
 
 #ifndef USE_PUBKEY_API_ONLY
-/* 全局生成元G的仿射坐标（由keygen_init_generator初始化） */
+/* Global generator G affine coordinates (initialized by keygen_init_generator) */
 secp256k1_ge G_affine;
 #endif
-
 struct thread_args
 {
     int thread_id;
 };
 
-/* ===================== 线程工作函数 ===================== */
+
 static void *search_key(void *arg)
 {
     struct thread_args *args = (struct thread_args *)arg;
     int thread_id = args->thread_id;
 
-    uint8_t privkey[32];            /* 当前私钥（每批随机生成基准，内层递增） */
+    uint8_t privkey[32];            /* current private key (random base per batch, incremented in inner loop) */
     uint8_t hash160_compressed[20];
     uint8_t hash160_uncompressed[20];
 #ifndef USE_PUBKEY_API_ONLY
-    /* AVX2/标量内部路径：预构造tweak scalar（值为1），外层循环前初始化一次 */
-    secp256k1_scalar tweak_scalar;
+    /* AVX2/scalar internal path: pre-construct tweak scalar (value=1), initialized once before outer loop */    secp256k1_scalar tweak_scalar;
     secp256k1_scalar_set_int(&tweak_scalar, 1);
 #else
-    uint8_t tweak[32];              /* 标量加法tweak = 1（回退路径使用） */
+    uint8_t tweak[32];              /* scalar addition tweak = 1 (used in fallback path) */
     memset(tweak, 0, 32);
     tweak[31] = 1;
 #endif
     uint64_t count = 0;
-    int progress_counter = PROGRESS_INTERVAL; /* 递减计数器，避免取模除法 */
+    int progress_counter = PROGRESS_INTERVAL; /* countdown counter, avoids modulo division */
     rand_key_context rand_ctx;
 
-    /* 初始化真随机上下文（每线程独立fd，无锁竞争） */
+    /* Initialize true-random context (per-thread independent fd, no lock contention) */
     if (rand_ctx_init(&rand_ctx) != 0) {
-        keylog_error("[线程-%d] 打开/dev/urandom失败", thread_id);
+        keylog_error("[Thread-%d] Failed to open /dev/urandom", thread_id);
         return NULL;
     }
 
-    /* 性能监控：记录上一次打印时间 */
+    /* Performance monitoring: record last print time */
     struct timespec ts_last, ts_now;
     clock_gettime(CLOCK_MONOTONIC, &ts_last);
     uint64_t count_last = 0;
@@ -95,34 +101,32 @@ static void *search_key(void *arg)
 
 #ifdef __AVX512IFMA__
     /*
-     * AVX-512 IFMA 16链缓冲区：每条链积累BATCH_SIZE步的Jacobian点和rzr因子
-     * 三个缓冲区合计约24MB，必须堆分配
-     * 在最外层循环前分配一次，线程退出时统一释放
-     */
-    secp256k1_gej (*gej_buf)[BATCH_SIZE] = malloc(16 * BATCH_SIZE * sizeof(secp256k1_gej));
+     * AVX-512 IFMA 16-chain buffers: each chain accumulates BATCH_SIZE steps of Jacobian points and rzr factors
+     * Three buffers total ~24MB, must be heap-allocated
+     * Allocated once before the outermost loop, freed when thread exits
+     */    secp256k1_gej (*gej_buf)[BATCH_SIZE] = malloc(16 * BATCH_SIZE * sizeof(secp256k1_gej));
     secp256k1_fe (*rzr_buf)[BATCH_SIZE] = malloc(16 * BATCH_SIZE * sizeof(secp256k1_fe));
     secp256k1_ge (*ge_buf)[BATCH_SIZE] = malloc(16 * BATCH_SIZE * sizeof(secp256k1_ge));
     if (!gej_buf || !rzr_buf || !ge_buf) {
-        keylog_error("[线程-%d] AVX-512 批次缓冲区内存分配失败", thread_id);
+        keylog_error("[Thread-%d] AVX-512 batch buffer memory allocation failed", thread_id);
         goto avx512_thread_exit;
     }
 
     while (count < MAX_ATTEMPTS) {
-        /* 16条独立链的当前Jacobian坐标和私钥scalar */
+        /* Current Jacobian coordinates and private key scalar for 16 independent chains */
         secp256k1_gej chain_gej[16];
         secp256k1_scalar chain_scalar[16];
         secp256k1_scalar chain_base_scalar[16];
-        /* chain_valid_steps[ch]：该链本批次实际积累的有效步数 */
+        /* chain_valid_steps[ch]: actual valid steps accumulated in this batch for this chain */
         int chain_valid_steps[16];
 
-        /* 初始化16条链：全部独立随机生成 */
+        /* Initialize 16 chains: all independently randomly generated */
         for (int ch = 0; ch < 16; ch++) {
             uint8_t ch_privkey[32];
             int ch_ok = 0;
             while (!ch_ok) {
                 if (gen_random_key(ch_privkey, &rand_ctx) != 0) {
-                    keylog_error("[线程-%d] 读取随机数失败", thread_id);
-                    continue;
+                    keylog_error("[Thread-%d] Failed to read random number", thread_id);                    continue;
                 }
 
                 int overflow = 0;
@@ -139,7 +143,7 @@ static void *search_key(void *arg)
             chain_valid_steps[ch] = BATCH_SIZE;
         }
 
-        /* 内层循环：每次推进16条链各一步，共BATCH_SIZE步，只积累不归一化 */
+        /* Inner loop: advance 16 chains one step each, BATCH_SIZE steps total, accumulate without normalizing */
         for (int step = 0; step < BATCH_SIZE; step++) {
             secp256k1_fe step_rzr[16];
             secp256k1_gej next_gej_16[16];
@@ -149,7 +153,7 @@ static void *search_key(void *arg)
                 gej_add_ge_var_16way(next_gej_16, chain_gej, &G_affine, step_rzr, 1);
 
             for (int ch = 0; ch < 16; ch++) {
-                /* 链已经溢出归零 */
+                /* chain has already overflowed to zero */
                 if (step >= chain_valid_steps[ch]) {
                     continue;
                 }
@@ -157,7 +161,7 @@ static void *search_key(void *arg)
                 gej_buf[ch][step] = next_gej_16[ch];
                 rzr_buf[ch][step] = step_rzr[ch];
 
-                /* 更新各链状态（scalar+1，检测溢出归零） */
+                /* Update each chain state (scalar+1, detect overflow to zero) */
                 secp256k1_scalar_add(&chain_scalar[ch], &chain_scalar[ch], &tweak_scalar);
                 if (secp256k1_scalar_is_zero(&chain_scalar[ch])) {
                     chain_valid_steps[ch] = step + 1;
@@ -167,13 +171,13 @@ static void *search_key(void *arg)
             }
         }
 
-        /* 批量归一化：对每条链调用keygen_batch_normalize_rzr */
+        /* Batch normalize: call keygen_batch_normalize_rzr for each chain */
         for (int ch = 0; ch < 16; ch++) {
             keygen_batch_normalize_rzr(gej_buf[ch], ge_buf[ch], rzr_buf[ch],
                                        (size_t)chain_valid_steps[ch]);
         }
 
-        /* 遍历所有步骤，以16路为单位批量计算 hash160 并查表 */
+        /* Iterate all steps, compute hash160 and lookup in batches of 16 */
         for (int step = 0; step < BATCH_SIZE && count < MAX_ATTEMPTS; step++) {
             uint8_t comp_bufs[16][64];
             uint8_t uncomp_bufs[16][128];
@@ -196,7 +200,7 @@ static void *search_key(void *arg)
                 uncomp_ptrs[lane] = uncomp_bufs[lane];
             }
 
-            /* 16路并行计算 hash160 */
+            /* 16-way parallel hash160 computation */
             uint8_t hash160_comp_16[16][20];
             uint8_t hash160_uncomp_16[16][20];
             hash160_16way_compressed_prepadded(comp_ptrs, hash160_comp_16);
@@ -209,12 +213,12 @@ static void *search_key(void *arg)
                 uncomp_h160_ptrs[lane] = hash160_uncomp_16[lane];
             }
 
-            /* 16路批量查表 */
+            /* 16-way batch lookup */
             uint16_t mask_comp = ht_contains_16way(comp_h160_ptrs);
             uint16_t mask_uncomp = ht_contains_16way(uncomp_h160_ptrs);
             uint16_t hit_mask = mask_comp | mask_uncomp;
 
-            /* 统计本步有效 lane 数 */
+            /* Count valid lanes in this step */
             int valid_lanes = 0;
             for (int lane = 0; lane < 16; lane++) {
                 if (step < chain_valid_steps[lane])
@@ -241,23 +245,23 @@ static void *search_key(void *arg)
                     char address_compressed[ADDRESS_LEN + 1];
                     char address_uncompressed[ADDRESS_LEN + 1];
                     bytes_to_hex(privkey, 32, privkey_hex);
-                    keylog_info("[线程-%d] 找到匹配！总尝试次数: %lu", thread_id, count);
-                    keylog_info("私钥(hex): %s", privkey_hex);
+                    keylog_info("[Thread-%d] Found match! Total attempts: %lu", thread_id, count);
+                    keylog_info("Private key (hex): %s", privkey_hex);
                     if (privkey_to_address(privkey, address_compressed, address_uncompressed) == 0) {
-                        keylog_info("压缩地址: %s", address_compressed);
-                        keylog_info("非压缩地址: %s", address_uncompressed);
+                        keylog_info("Compressed address: %s", address_compressed);
+                        keylog_info("Uncompressed address: %s", address_uncompressed);
                     }
                 }
             }
 
-            /* 性能监控 */
+            /* Performance monitoring */
             progress_counter -= valid_lanes;
             if (progress_counter <= 0) {
                 progress_counter = PROGRESS_INTERVAL;
                 clock_gettime(CLOCK_MONOTONIC, &ts_now);
                 double elapsed = (ts_now.tv_sec - ts_last.tv_sec) + (ts_now.tv_nsec - ts_last.tv_nsec) * 1e-9;
                 double kps = (elapsed > 0) ? (double)(count - count_last) / elapsed : 0.0;
-                keylog_info("[线程-%d] 已尝试: %lu 速度: %.0f keys/s", thread_id, count, kps);
+                keylog_info("[Thread-%d] Attempted: %lu Speed: %.0f keys/s", thread_id, count, kps);
                 ts_last = ts_now;
                 count_last = count;
             }
@@ -271,11 +275,11 @@ avx512_thread_exit:
 
 #else /* !__AVX512IFMA__ */
 
-    secp256k1_gej *gej_batch = malloc(BATCH_SIZE * sizeof(secp256k1_gej));  /* Jacobian坐标批次缓冲区 */
-    secp256k1_ge *ge_batch = malloc(BATCH_SIZE * sizeof(secp256k1_ge));     /* 仿射坐标批次缓冲区 */
-    secp256k1_fe *rzr_batch = malloc(BATCH_SIZE * sizeof(secp256k1_fe));    /* Z坐标增量因子：Z[i+1] = Z[i] * rzr[i] */
+    secp256k1_gej *gej_batch = malloc(BATCH_SIZE * sizeof(secp256k1_gej));  /* Jacobian coordinate batch buffer */
+    secp256k1_ge *ge_batch = malloc(BATCH_SIZE * sizeof(secp256k1_ge));     /* affine coordinate batch buffer */
+    secp256k1_fe *rzr_batch = malloc(BATCH_SIZE * sizeof(secp256k1_fe));    /* Z coordinate increment factor: Z[i+1] = Z[i] * rzr[i] */
     if (!gej_batch || !ge_batch || !rzr_batch) {
-        keylog_error("[线程-%d] 批次缓冲区内存分配失败", thread_id);
+        keylog_error("[Thread-%d] Batch buffer memory allocation failed", thread_id);
         goto thread_exit;
     }
 
@@ -283,13 +287,13 @@ avx512_thread_exit:
     uint8_t pubkey_uncompressed[65];
 
     while (count < MAX_ATTEMPTS) {
-        /* 生成随机基准私钥 */
+        /* Generate random base private key */
         if (gen_random_key(privkey, &rand_ctx) != 0) {
-            keylog_error("[线程-%d] 读取随机数失败", thread_id);
+            keylog_error("[Thread-%d] Failed to read random number", thread_id);
             break;
         }
 
-        /* 将基准私钥转换为scalar形式，内层循环直接在scalar上累加 */
+        /* Convert base private key to scalar form, inner loop accumulates directly on scalar */
         secp256k1_scalar base_privkey_scalar;
         secp256k1_scalar cur_privkey_scalar;
         int overflow = 0;
@@ -302,29 +306,29 @@ avx512_thread_exit:
         secp256k1_gej cur_gej;
         secp256k1_gej next_gej;
 
-        /* 从基准私钥生成Jacobian坐标公钥 */
+        /* Generate Jacobian coordinate public key from base private key */
         if (keygen_privkey_to_gej(secp_ctx, privkey, &cur_gej) != 0)
             continue;
 
-        /* 内层循环：积累BATCH_SIZE个Jacobian点 */
+        /* Inner loop: accumulate BATCH_SIZE Jacobian points */
         int batch_valid = 0;
-        int inner_overflow = 0; /* 标记内层scalar加法是否溢出 */
+        int inner_overflow = 0; /* flag whether inner scalar addition overflowed */
         for (int b = 0; b < BATCH_SIZE && count < MAX_ATTEMPTS; b++) {
             gej_batch[b] = cur_gej;
             batch_valid++;
 
-            /* 最后一个点不需要推导下一步 */
+            /* last point does not need to derive next step */
             if (b == BATCH_SIZE - 1)
                 break;
 
-            /* 增量推导：私钥scalar+1，公钥点加G（直接点加法，无ecmult） */
+            /* Incremental derivation: private key scalar+1, public key point add G (direct point addition, no ecmult) */
             secp256k1_scalar_add(&cur_privkey_scalar, &cur_privkey_scalar, &tweak_scalar);
             if (secp256k1_scalar_is_zero(&cur_privkey_scalar)) {
-                /* 极小概率：scalar溢出归零，跳出内层循环重新生成基准私钥 */
+                /* Very rare: scalar overflows to zero, break inner loop and regenerate base private key */
                 inner_overflow = 1;
                 break;
             }
-            /* 使用变量时间点加法，同时收集Z坐标增量因子rzr[b]，用于加速batch_normalize */
+            /* Use variable-time point addition, collect Z coordinate increment factor rzr[b] for batch_normalize acceleration */
             secp256k1_gej_add_ge_var(&next_gej, &cur_gej, &G_affine, &rzr_batch[b]);
             cur_gej = next_gej;
         }
@@ -332,14 +336,14 @@ avx512_thread_exit:
         if (inner_overflow)
             continue;
 
-        /* 批量归一化：利用rzr增量因子，省去前向累积对gej.z的内存读取 */
+        /* Batch normalize: use rzr increment factors, avoid memory reads of gej.z in forward accumulation */
         keygen_batch_normalize_rzr(gej_batch, ge_batch, rzr_batch, (size_t)batch_valid);
 
 #ifdef __AVX512F__
 
-        /* 以16为步长批量处理（AVX-512F 16路并发SHA256+RIPEMD160） */
+        /* Process in batches of 16 (AVX-512F 16-way concurrent SHA256+RIPEMD160) */
         for (int b = 0; b < batch_valid; b += 16) {
-            /* 计算本组实际有效lane数（不足16时用最后一个有效点填充） */
+            /* Compute actual valid lane count in this group (pad with last valid point if < 16) */
             int valid_count = batch_valid - b;
             if (valid_count > 16)
                 valid_count = 16;
@@ -366,7 +370,7 @@ avx512_thread_exit:
                 uncomp_ptrs[lane] = uncomp_bufs[lane];
             }
 
-            /* 16路并行计算hash160（压缩/非压缩均使用预填充接口，零拷贝） */
+            /* 16-way parallel hash160 computation (both compressed/uncompressed use pre-padded interface, zero-copy) */
             uint8_t hash160_comp_16[16][20];
             uint8_t hash160_uncomp_16[16][20];
             hash160_16way_compressed_prepadded(comp_ptrs, hash160_comp_16);
@@ -378,15 +382,15 @@ avx512_thread_exit:
                 uncomp_h160_ptrs[lane] = hash160_uncomp_16[lane];
             }
 
-            /* 16路批量查表（压缩+非压缩各一次） */
+            /* 16-way batch lookup (compressed + uncompressed each once) */
             uint16_t mask_comp = ht_contains_16way(comp_h160_ptrs);
             uint16_t mask_uncomp = ht_contains_16way(uncomp_h160_ptrs);
             uint16_t hit_mask = mask_comp | mask_uncomp;
 
-            /* 更新计数（仅有效lane） */
+            /* Update count (valid lanes only) */
             count += (uint64_t)valid_count;
 
-            /* 仅当有命中时才进入处理逻辑 */
+            /* Only enter processing logic when there is a hit */
             if (hit_mask) {
                 for (int lane = 0; lane < valid_count; lane++) {
                     if (!(hit_mask & (1u << lane)))
@@ -406,39 +410,38 @@ avx512_thread_exit:
                     char address_compressed[ADDRESS_LEN + 1];
                     char address_uncompressed[ADDRESS_LEN + 1];
                     bytes_to_hex(privkey, 32, privkey_hex);
-                    keylog_info("[线程-%d] 找到匹配！总尝试次数: %lu", thread_id, count);
-                    keylog_info("私钥(hex): %s", privkey_hex);
+                    keylog_info("[Thread-%d] Found match! Total attempts: %lu", thread_id, count);
+                    keylog_info("Private key (hex): %s", privkey_hex);
                     if (privkey_to_address(privkey, address_compressed, address_uncompressed) == 0) {
-                        keylog_info("压缩地址: %s", address_compressed);
-                        keylog_info("非压缩地址: %s", address_uncompressed);
+                        keylog_info("Compressed address: %s", address_compressed);
+                        keylog_info("Uncompressed address: %s", address_uncompressed);
                     }
                 }
             }
 
-            /* 性能监控（以批次为粒度递减） */
             progress_counter -= valid_count;
             if (progress_counter <= 0) {
                 progress_counter = PROGRESS_INTERVAL;
                 clock_gettime(CLOCK_MONOTONIC, &ts_now);
                 double elapsed = (ts_now.tv_sec - ts_last.tv_sec) + (ts_now.tv_nsec - ts_last.tv_nsec) * 1e-9;
                 double kps = (elapsed > 0) ? (double)(count - count_last) / elapsed : 0.0;
-                keylog_info("[线程-%d] 已尝试: %lu 速度: %.0f keys/s", thread_id, count, kps);
+                keylog_info("[Thread-%d] Attempted: %lu Speed: %.0f keys/s", thread_id, count, kps);
                 ts_last = ts_now;
                 count_last = count;
             }
         }
 #elif defined(__AVX2__)
 
-        /* 以8为步长批量处理 */
+        /* Process in batches of 8 */
         for (int b = 0; b < batch_valid; b += 8) {
-            /* 计算本组实际有效lane数（不足8时用最后一个有效点填充） */
+            /* Compute actual valid lane count in this group (pad with last valid point if < 8) */
             int valid_count = batch_valid - b;
             if (valid_count > 8)
                 valid_count = 8;
 
-            /* comp_bufs: 64字节（前33字节为公钥，后31字节为SHA256 padding）
-             * uncomp_bufs: 128字节（前65字节为公钥，后63字节为SHA256 block2 padding）
-             * 两者均原地构造padded block，避免hash160函数内部拷贝 */
+            /* comp_bufs: 64 bytes (first 33 bytes = pubkey, last 31 bytes = SHA256 padding)
+             * uncomp_bufs: 128 bytes (first 65 bytes = pubkey, last 63 bytes = SHA256 block2 padding)
+             * Both construct padded block in-place, avoiding internal copy in hash160 function */
             uint8_t comp_bufs[8][64];
             uint8_t uncomp_bufs[8][128];
             const uint8_t *comp_ptrs[8];
@@ -447,7 +450,7 @@ avx512_thread_exit:
             for (int lane = 0; lane < 8; lane++) {
                 int idx = b + (lane < valid_count ? lane : valid_count - 1);
                 if (ge_batch[idx].infinity) {
-                    /* 无穷远点：填充全零公钥并做padding（不会命中哈希表） */
+                    /* Infinity point: fill with zero pubkey and pad (won't hit hash table) */
                     memset(comp_bufs[lane], 0, 64);
                     memset(uncomp_bufs[lane], 0, 128);
                     sha256_pad_block_33(comp_bufs[lane]);
@@ -455,7 +458,7 @@ avx512_thread_exit:
                 }
                 else {
                     keygen_ge_to_pubkey_bytes(&ge_batch[idx], comp_bufs[lane], uncomp_bufs[lane]);
-                    /* 原地完成SHA256 padding，省去hash160函数内部的memset+memcpy */
+                    /* Complete SHA256 padding in-place, avoiding memset+memcpy inside hash160 function */
                     sha256_pad_block_33(comp_bufs[lane]);
                     sha256_pad_block2_65(uncomp_bufs[lane]);
                 }
@@ -463,7 +466,7 @@ avx512_thread_exit:
                 uncomp_ptrs[lane] = uncomp_bufs[lane];
             }
 
-            /* 8路并行计算hash160（压缩/非压缩均使用预填充接口，零拷贝） */
+            /* 8-way parallel hash160 computation (both compressed/uncompressed use pre-padded interface, zero-copy) */
             uint8_t hash160_comp_8[8][20];
             uint8_t hash160_uncomp_8[8][20];
             hash160_8way_compressed_prepadded(comp_ptrs, hash160_comp_8);
@@ -475,15 +478,15 @@ avx512_thread_exit:
                 uncomp_h160_ptrs[lane] = hash160_uncomp_8[lane];
             }
 
-            /* 8路批量查表（压缩 + 非压缩各一次，共16路） */
+            /* 8-way batch lookup (compressed + uncompressed each once, 16 total) */
             uint8_t mask_comp = ht_contains_8way(comp_h160_ptrs);
             uint8_t mask_uncomp = ht_contains_8way(uncomp_h160_ptrs);
             uint8_t hit_mask = mask_comp | mask_uncomp;
 
-            /* 更新计数（仅有效lane） */
+            /* Update count (valid lanes only) */
             count += (uint64_t)valid_count;
 
-            /* 仅当有命中时才进入处理逻辑 */
+            /* Only enter processing logic when there is a hit */
             if (hit_mask) {
                 for (int lane = 0; lane < valid_count; lane++) {
                     if (!(hit_mask & (1 << lane)))
@@ -494,7 +497,7 @@ avx512_thread_exit:
                         continue;
 
                     found_flag = 1;
-                    /* 命中时重建私钥：从base_privkey_scalar出发，scalar加法重建命中位置 */
+                    /* Rebuild private key on hit: start from base_privkey_scalar, use scalar addition to rebuild hit position */
                     secp256k1_scalar hit_scalar = base_privkey_scalar;
                     for (int i = 0; i < b_idx; i++) {
                         secp256k1_scalar_add(&hit_scalar, &hit_scalar, &tweak_scalar);
@@ -504,73 +507,73 @@ avx512_thread_exit:
                     char address_compressed[ADDRESS_LEN + 1];
                     char address_uncompressed[ADDRESS_LEN + 1];
                     bytes_to_hex(privkey, 32, privkey_hex);
-                    keylog_info("[线程-%d] 找到匹配！总尝试次数: %lu", thread_id, count);
-                    keylog_info("私钥(hex): %s", privkey_hex);
+                    keylog_info("[Thread-%d] Found match! Total attempts: %lu", thread_id, count);
+                    keylog_info("Private key (hex): %s", privkey_hex);
                     if (privkey_to_address(privkey, address_compressed, address_uncompressed) == 0) {
-                        keylog_info("压缩地址: %s", address_compressed);
-                        keylog_info("非压缩地址: %s", address_uncompressed);
+                        keylog_info("Compressed address: %s", address_compressed);
+                        keylog_info("Uncompressed address: %s", address_uncompressed);
                     }
                 }
             }
 
-            /* 性能监控（以批次为粒度递减） */
+            /* Performance monitoring (decremented by batch) */
             progress_counter -= valid_count;
             if (progress_counter <= 0) {
                 progress_counter = PROGRESS_INTERVAL;
                 clock_gettime(CLOCK_MONOTONIC, &ts_now);
                 double elapsed = (ts_now.tv_sec - ts_last.tv_sec) + (ts_now.tv_nsec - ts_last.tv_nsec) * 1e-9;
                 double kps = (elapsed > 0) ? (double)(count - count_last) / elapsed : 0.0;
-                keylog_info("[线程-%d] 已尝试: %lu 速度: %.0f keys/s", thread_id, count, kps);
+                keylog_info("[Thread-%d] Attempted: %lu Speed: %.0f keys/s", thread_id, count, kps);
                 ts_last = ts_now;
                 count_last = count;
             }
         }
 #else
-        /* 标量路径（非 AVX512F/AVX2 平台） */
+        /* Scalar path (non-AVX512F/AVX2 platform) */
         for (int b = 0; b < batch_valid; b++) {
             count++;
 
             if (ge_batch[b].infinity)
                 continue;
 
-            /* 直接从仿射坐标构造公钥字节，跳过serialize */
+            /* Construct public key bytes directly from affine coordinates, skip serialize */
             keygen_ge_to_pubkey_bytes(&ge_batch[b],
                                       pubkey_compressed,
                                       pubkey_uncompressed);
 
-            /* 计算hash160 */
+            /* Compute hash160 */
             pubkey_bytes_to_hash160(pubkey_compressed, 33, hash160_compressed);
             pubkey_bytes_to_hash160(pubkey_uncompressed, 65, hash160_uncompressed);
 
-            /* 哈希表查找（字节层面直接比对） */
+            /* Hash table lookup (direct byte comparison) */
             if (ht_contains(hash160_compressed) || ht_contains(hash160_uncompressed)) {
                 found_flag = 1;
-                /* 命中时重建私钥：从base_privkey_scalar出发，scalar加法重建命中位置 */
+                /* Rebuild private key on hit: start from base_privkey_scalar, use scalar addition to rebuild hit position */
                 secp256k1_scalar hit_scalar = base_privkey_scalar;
                 for (int i = 0; i < b; i++) {
                     secp256k1_scalar_add(&hit_scalar, &hit_scalar, &tweak_scalar);
                 }
                 secp256k1_scalar_get_b32(privkey, &hit_scalar);
-                /* 仅在命中时才做格式转换 */
+                /* Only do format conversion on hit */
                 char privkey_hex[65];
                 char address_compressed[ADDRESS_LEN + 1];
                 char address_uncompressed[ADDRESS_LEN + 1];
                 bytes_to_hex(privkey, 32, privkey_hex);
-                keylog_info("[线程-%d] 找到匹配！总尝试次数: %lu", thread_id, count);
-                keylog_info("私钥(hex): %s", privkey_hex);
+                keylog_info("[Thread-%d] Found match! Total attempts: %lu", thread_id, count);
+                keylog_info("Private key (hex): %s", privkey_hex);
                 if (privkey_to_address(privkey, address_compressed, address_uncompressed) == 0) {
-                    keylog_info("压缩地址: %s", address_compressed);
-                    keylog_info("非压缩地址: %s", address_uncompressed);
+                    keylog_info("Compressed address: %s", address_compressed);
+                    keylog_info("Uncompressed address: %s", address_uncompressed);
                 }
             }
 
-            /* 性能监控：每PROGRESS_INTERVAL次输出keys/s */
+            /* Performance monitoring: output keys/s every PROGRESS_INTERVAL iterations */
             if (--progress_counter == 0) {
                 progress_counter = PROGRESS_INTERVAL;
                 clock_gettime(CLOCK_MONOTONIC, &ts_now);
                 double elapsed = (ts_now.tv_sec - ts_last.tv_sec) + (ts_now.tv_nsec - ts_last.tv_nsec) * 1e-9;
                 double kps = (elapsed > 0) ? (double)(count - count_last) / elapsed : 0.0;
-                keylog_info("[线程-%d] 已尝试: %lu 速度: %.0f keys/s", thread_id, count, kps);
+                keylog_info("[Thread-%d] Attempted: %lu Speed: %.0f keys/s", thread_id, count, kps);
                 ts_last = ts_now;
                 count_last = count;
             }
@@ -592,16 +595,16 @@ thread_exit:
     uint8_t pubkey_uncompressed[65];
 
     while (count < MAX_ATTEMPTS) {
-        /* 生成随机私钥 */
+        /* Generate random private key */
         if (gen_random_key(privkey, &rand_ctx) != 0) {
-            keylog_error("[线程-%d] 读取随机数失败", thread_id);
+            keylog_error("[Thread-%d] Failed to read random number", thread_id);
             break;
         }
 
         if (!secp256k1_ec_pubkey_create(secp_ctx, &pubkey, privkey))
             continue;
 
-        /* 内层循环：增量推导 BATCH_SIZE 次 */
+        /* Inner loop: incremental derivation BATCH_SIZE times */
         for (int batch = 0; batch < BATCH_SIZE && count < MAX_ATTEMPTS; batch++) {
             count++;
 
@@ -620,11 +623,11 @@ thread_exit:
                 char address_compressed[ADDRESS_LEN + 1];
                 char address_uncompressed[ADDRESS_LEN + 1];
                 bytes_to_hex(privkey, 32, privkey_hex);
-                keylog_info("[线程-%d] 找到匹配！总尝试次数: %lu", thread_id, count);
-                keylog_info("私钥(hex): %s", privkey_hex);
+                keylog_info("[Thread-%d] Found match! Total attempts: %lu", thread_id, count);
+                keylog_info("Private key (hex): %s", privkey_hex);
                 if (privkey_to_address(privkey, address_compressed, address_uncompressed) == 0) {
-                    keylog_info("压缩地址: %s", address_compressed);
-                    keylog_info("非压缩地址: %s", address_uncompressed);
+                    keylog_info("Compressed address: %s", address_compressed);
+                    keylog_info("Uncompressed address: %s", address_uncompressed);
                 }
             }
 
@@ -634,18 +637,18 @@ thread_exit:
                 double elapsed = (ts_now.tv_sec - ts_last.tv_sec)
                                + (ts_now.tv_nsec - ts_last.tv_nsec) * 1e-9;
                 double kps = (elapsed > 0) ? (double)(count - count_last) / elapsed : 0.0;
-                keylog_info("[线程-%d] 已尝试: %lu 速度: %.0f keys/s",
+                keylog_info("[Thread-%d] Attempted: %lu Speed: %.0f keys/s",
                         thread_id, count, kps);
                 ts_last = ts_now;
                 count_last = count;
             }
 
             if (!secp256k1_ec_seckey_tweak_add(secp_ctx, privkey, tweak)) {
-                keylog_warn("私钥推导失败，batch=%d！", batch);
+                keylog_warn("Private key derivation failed, batch=%d!", batch);
                 break;
             }
             if (!secp256k1_ec_pubkey_tweak_add(secp_ctx, &pubkey, tweak)) {
-                keylog_warn("公钥推导失败，batch=%d！", batch);
+                keylog_warn("Public key derivation failed, batch=%d!", batch);
                 break;
             }
         }
@@ -653,18 +656,18 @@ thread_exit:
 #endif /* USE_PUBKEY_API_ONLY */
 
     if (count >= MAX_ATTEMPTS) {
-        keylog_info("[线程-%d] 已达到最大尝试次数，退出。", thread_id);
+        keylog_info("[Thread-%d] Reached max attempts, exiting.", thread_id);
     }
 
     return NULL;
 }
 
-/* ===================== 加载地址文件 ===================== */
+
 static int load_target_addresses(const char *filename)
 {
     FILE *f = fopen(filename, "r");
     if (!f) {
-        keylog_error("文件%s不存在！", filename);
+        keylog_error("File %s does not exist!", filename);
         return -1;
     }
 
@@ -672,7 +675,7 @@ static int load_target_addresses(const char *filename)
     int count = 0;
     int skip_count = 0;
     while (fgets(line, sizeof(line), f)) {
-        /* 去除换行符 */
+        /* Strip newline characters */
         size_t len = strlen(line);
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
             line[--len] = '\0';
@@ -680,15 +683,15 @@ static int load_target_addresses(const char *filename)
         if (len == 0)
             continue;
         if (count >= MAX_ADDRESSES) {
-            keylog_warn("地址数量超过上限%d，忽略多余地址", MAX_ADDRESSES);
+            keylog_warn("Address count exceeds limit %d, ignoring extra addresses", MAX_ADDRESSES);
             break;
         }
 
-        /* 将地址解码为20字节hash160后存入哈希表 */
+        /* Decode address to 20-byte hash160 and insert into hash table */
         uint8_t h160[20];
         int ret = base58check_decode(line, h160);
         if (ret != 0) {
-            keylog_warn("地址解码失败（ret=%d），跳过：%s", ret, line);
+            keylog_warn("Address decode failed (ret=%d), skipping: %s", ret, line);
             skip_count++;
             continue;
         }
@@ -699,23 +702,29 @@ static int load_target_addresses(const char *filename)
     fclose(f);
 
     if (count == 0) {
-        keylog_error("文件%s中没有有效地址！", filename);
+        keylog_error("No valid addresses in file %s!", filename);
         return -1;
     }
     address_count = count;
-    keylog_info("成功加载%d个地址（跳过%d个无效地址）", count, skip_count);
+    keylog_info("Successfully loaded %d addresses (skipped %d invalid)", count, skip_count);
 
     return 0;
 }
 
-/* ===================== 主函数 ===================== */
+
 int main(int argc, char *argv[])
 {
     const char *address_file = NULL;
-    int thread_count = 4;   /* 默认线程数 */
+    int thread_count = 4;   /* default thread count */
     int opt;
 
-    while ((opt = getopt(argc, argv, "a:n:h")) != -1) {
+#ifdef USE_GPU
+#  define GETOPT_STR "a:n:gh"
+#else
+#  define GETOPT_STR "a:n:h"
+#endif
+
+    while ((opt = getopt(argc, argv, GETOPT_STR)) != -1) {
         switch (opt) {
         case 'a':
             address_file = optarg;
@@ -723,73 +732,106 @@ int main(int argc, char *argv[])
         case 'n': {
             int n = atoi(optarg);
             if (n <= 0) {
-                fprintf(stderr, "警告：-n参数值无效（%s），使用默认线程数4\n", optarg); /* log_init前，只能用stderr */
+                fprintf(stderr, "Warning: invalid -n value (%s), using default thread count 4\n", optarg); /* before log_init, must use stderr */
                 thread_count = 4;
             } else {
                 thread_count = n;
             }
             break;
         }
+#ifdef USE_GPU
+        case 'g':
+            use_gpu = 1;
+            break;
+#endif
         case 'h':
-            fprintf(stdout, "用法: ./keysearch -a <地址文件> [-n <线程数>] [-h]\n");
-            fprintf(stdout, "  -a <地址文件>  每行一个目标比特币地址（必填）\n");
-            fprintf(stdout, "  -n <线程数>    工作线程数量，默认为 4\n");
-            fprintf(stdout, "  -h             显示此帮助信息\n");
+            fprintf(stdout, "Usage: ./keysearch -a <address_file> [-n <num_threads>] [-g] [-h]\n");
+            fprintf(stdout, "  -a <address_file>  one target Bitcoin address per line (required)\n");
+            fprintf(stdout, "  -n <num_threads>   number of worker threads, default 4 (CPU path)\n");
+#ifdef USE_GPU
+            fprintf(stdout, "  -g             enable Nvidia GPU acceleration path\n");
+#endif
+            fprintf(stdout, "  -h             show this help message\n");
             return 0;
         default:
-            fprintf(stderr, "错误：未知参数，使用-h查看帮助\n"); /* log_init前，只能用stderr */
+            fprintf(stderr, "Error: unknown argument, use -h for help\n"); /* before log_init, must use stderr */
             return 1;
         }
     }
 
     if (!address_file) {
-        fprintf(stderr, "错误：必须通过-a指定地址文件，使用-h查看帮助\n"); /* log_init前，只能用stderr */
+        fprintf(stderr, "Error: must specify address file with -a, use -h for help\n"); /* before log_init, must use stderr */
         return 1;
     }
 
-    /* 初始化日志文件 */
+    /* Initialize log file */
     if (log_init() != 0)
         return 1;
 
-    /* 初始化哈希表（开放寻址，负载因子 ≤ 0.5，槽位数为地址数2倍向上取2的幂次） */
-    /* 先用最大容量初始化：MAX_ADDRESSES * 2，向上取2的幂次 */
+    /* Initialize hash table (open addressing, load factor <= 0.5, slot count = 2x address count rounded up to power of 2) */
+    /* Initialize with max capacity: MAX_ADDRESSES * 2, rounded up to power of 2 */
     uint32_t ht_capacity = 1;
     while (ht_capacity < (uint32_t)MAX_ADDRESSES * 2)
         ht_capacity <<= 1;
     if (ht_init(ht_capacity) != 0) {
-        keylog_error("哈希表内存分配失败");
+        keylog_error("Hash table memory allocation failed");
         log_close();
         return 1;
     }
 
-    /* 加载目标地址 */
+    /* Load target addresses */
     if (load_target_addresses(address_file) != 0) {
         log_close();
         return 1;
     }
 
-    keylog_info("已加载%d个目标地址，启动%d个线程开始查找...",
+#ifdef USE_GPU
+    if (use_gpu && thread_count != 4) {
+        keylog_warn("GPU path: -n parameter is ignored");
+    }
+#endif
+
+    keylog_info("Loaded %d target addresses, starting %d threads...",
                 address_count, thread_count);
 
-    /* 初始化secp256k1上下文（SIGN用于创建公钥） */
+    /* Initialize secp256k1 context (SIGN used for public key creation) */
     secp_ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
     if (!secp_ctx) {
-        keylog_error("初始化secp256k1失败");
+        keylog_error("Failed to initialize secp256k1");
         log_close();
         return 1;
     }
 
 #ifndef USE_PUBKEY_API_ONLY
-    /* 初始化全局生成元G的仿射坐标 */
+    /* Initialize global generator G affine coordinates */
     if (keygen_init_generator(secp_ctx, &G_affine) != 0) {
-        keylog_error("初始化生成元G失败");
+        keylog_error("Failed to initialize generator G");
         secp256k1_context_destroy(secp_ctx);
         log_close();
         return 1;
     }
 #endif
 
-    /* 启动线程 */
+#ifdef USE_GPU
+    if (use_gpu) {
+        /* GPU path: initialize GPU, start search main loop */
+        if (gpu_init(ht_slots, ht_mask + 1) != 0) {
+            keylog_error("GPU initialization failed, exiting");
+            secp256k1_context_destroy(secp_ctx);
+            ht_free();
+            log_close();
+            return 1;
+        }
+        int gpu_ret = gpu_search();
+        gpu_cleanup();
+        secp256k1_context_destroy(secp_ctx);
+        ht_free();
+        log_close();
+        return (gpu_ret == 0) ? 0 : 1;
+    }
+#endif
+
+    /* CPU path: start threads */
     pthread_t *threads = (pthread_t *)malloc(thread_count * sizeof(pthread_t));
     struct thread_args *args = (struct thread_args *)malloc(thread_count * sizeof(struct thread_args));
 
@@ -798,16 +840,16 @@ int main(int argc, char *argv[])
         pthread_create(&threads[i], NULL, search_key, &args[i]);
     }
 
-    /* 等待所有线程结束 */
+    /* Wait for all threads to finish */
     for (int i = 0; i < thread_count; i++) {
         pthread_join(threads[i], NULL);
     }
 
     if (!found_flag) {
-        keylog_info("所有线程均已达到最大尝试次数，未找到匹配地址。");
+        keylog_info("All threads reached max attempts, no matching address found.");
     }
 
-    /* 清理资源 */
+    /* Clean up resources */
     secp256k1_context_destroy(secp_ctx);
     ht_free();
     free(threads);

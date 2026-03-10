@@ -1,6 +1,6 @@
 /*
  * hash_utils_avx512.c
- * AVX-512专用16路并行hash160函数实现
+ * AVX-512 specialized 16-way parallel hash160 function implementation
  */
 #include "hash_utils.h"
 #include <string.h>
@@ -8,23 +8,23 @@
 
 #ifdef __AVX512F__
 
-/* sha256_compress_avx512前向声明 */
+/* Forward declaration of sha256_compress_avx512 */
 void sha256_compress_avx512(uint32_t *states[16], const uint8_t *blocks[16]);
-/* ripemd160_compress_avx512前向声明 */
+/* Forward declaration of ripemd160_compress_avx512 */
 void ripemd160_compress_avx512(uint32_t *states[16], const uint8_t *blocks[16]);
 
-/* SHA256初始状态常量 */
+/* SHA256 initial state constants */
 static const uint32_t sha256_init_state[8] = {
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
     0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
 };
 
-/* RIPEMD160初始状态常量 */
+/* RIPEMD160 initial state constants */
 static const uint32_t rmd160_init_state[5] = {
     0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0
 };
 
-/* 构造SHA256 padded block（单块，消息 <= 55 字节） */
+/* Construct SHA256 padded block (single block, message <= 55 bytes) */
 static void make_sha256_block(const uint8_t *msg, size_t msglen, uint8_t block[64])
 {
     memset(block, 0, 64);
@@ -41,13 +41,13 @@ static void make_sha256_block(const uint8_t *msg, size_t msglen, uint8_t block[6
     block[63] = (uint8_t)(bitlen);
 }
 
-/* 构造SHA256第一个block（64字节消息块，无padding） */
+/* Construct SHA256 first block (64-byte message block, no padding) */
 static void make_sha256_block_raw(const uint8_t *msg64, uint8_t block[64])
 {
     memcpy(block, msg64, 64);
 }
 
-/* 构造SHA256第二个padded block（65字节消息的尾块） */
+/* Construct SHA256 second padded block (tail block for 65-byte message) */
 static void make_sha256_block2_65(const uint8_t last_byte, uint8_t block[64])
 {
     memset(block, 0, 64);
@@ -64,7 +64,7 @@ static void make_sha256_block2_65(const uint8_t last_byte, uint8_t block[64])
     block[63] = (uint8_t)(bitlen);
 }
 
-/* 将SHA256 state[8]转为32字节大端序摘要 */
+/* Convert SHA256 state[8] to 32-byte big-endian digest */
 static void sha256_state_to_bytes(const uint32_t state[8], uint8_t out[32])
 {
     for (int i = 0; i < 8; i++) {
@@ -75,7 +75,7 @@ static void sha256_state_to_bytes(const uint32_t state[8], uint8_t out[32])
     }
 }
 
-/* 构造RIPEMD160 padded block（单块，消息 <= 55字节） */
+/* Construct RIPEMD160 padded block (single block, message <= 55 bytes) */
 static void make_rmd160_block(const uint8_t *msg, size_t msglen, uint8_t block[64])
 {
     memset(block, 0, 64);
@@ -92,7 +92,7 @@ static void make_rmd160_block(const uint8_t *msg, size_t msglen, uint8_t block[6
     block[63] = (uint8_t)(bitlen >> 56);
 }
 
-/* 将RIPEMD160 state[5]转为20字节小端序摘要 */
+/* Convert RIPEMD160 state[5] to 20-byte little-endian digest */
 static void rmd160_state_to_bytes(const uint32_t state[5], uint8_t out[20])
 {
     for (int i = 0; i < 5; i++) {
@@ -104,7 +104,7 @@ static void rmd160_state_to_bytes(const uint32_t state[5], uint8_t out[20])
 }
 
 /*
- * 16路并行计算压缩公钥（33字节）的hash160（SHA256->RIPEMD160）
+ * 16-way parallel hash160 (SHA256->RIPEMD160) for compressed public keys (33 bytes)
  */
 __attribute__((target("avx512f")))
 void hash160_16way_compressed(const uint8_t *pubkeys[16], uint8_t hash160s[16][20])
@@ -148,8 +148,8 @@ void hash160_16way_compressed(const uint8_t *pubkeys[16], uint8_t hash160s[16][2
 }
 
 /*
- * 16路并行计算压缩公钥的hash160（预填充，零拷贝）
- * blocks[16]: 调用者已原地完成SHA256 padding的64字节block指针数组
+ * 16-way parallel hash160 for compressed public keys (pre-padded, zero-copy)
+ * blocks[16]: array of 64-byte block pointers with SHA256 padding already applied in-place by caller
  */
 __attribute__((target("avx512f")))
 void hash160_16way_compressed_prepadded(const uint8_t *blocks[16], uint8_t hash160s[16][20])
@@ -164,7 +164,7 @@ void hash160_16way_compressed_prepadded(const uint8_t *blocks[16], uint8_t hash1
 
     sha256_compress_avx512(sha_state_ptrs, blocks);
 
-    /* sha_digests扩展为64字节，SHA256摘要写入前32字节，后32字节原地构造RIPEMD160 padding */
+    /* sha_digests extended to 64 bytes, SHA256 digest written to first 32 bytes, last 32 bytes construct RIPEMD160 padding in-place */
     uint8_t sha_digests[16][64];
     uint32_t rmd_states[16][5];
     uint32_t *rmd_state_ptrs[16];
@@ -172,10 +172,10 @@ void hash160_16way_compressed_prepadded(const uint8_t *blocks[16], uint8_t hash1
 
     for (int i = 0; i < 16; i++) {
         sha256_state_to_bytes(sha_states[i], sha_digests[i]);
-        /* 原地构造RIPEMD160 padded block：消息32字节，小端序位长256 */
+        /* Construct RIPEMD160 padded block in-place: 32-byte message, little-endian bit length 256 */
         sha_digests[i][32] = 0x80;
         memset(&sha_digests[i][33], 0, 23);
-        /* 小端序位长 256 = 0x0000000000000100 */
+        /* Little-endian bit length 256 = 0x0000000000000100 */
         sha_digests[i][56] = 0x00; sha_digests[i][57] = 0x01;
         sha_digests[i][58] = 0x00; sha_digests[i][59] = 0x00;
         sha_digests[i][60] = 0x00; sha_digests[i][61] = 0x00;
@@ -193,10 +193,10 @@ void hash160_16way_compressed_prepadded(const uint8_t *blocks[16], uint8_t hash1
 }
 
 /*
- * 16路并行计算非压缩公钥的hash160（预填充，零拷贝）
- * bufs[16]: 调用者已原地完成SHA256 padding的128字节buffer指针数组
- *           buf[0..63]  = SHA256 block1（公钥前64字节，无需padding）
- *           buf[64..127]= SHA256 block2（已完成padding）
+ * 16-way parallel hash160 for uncompressed public keys (pre-padded, zero-copy)
+ * bufs[16]: array of 128-byte buffer pointers with SHA256 padding already applied in-place by caller
+ *           buf[0..63]  = SHA256 block1 (first 64 bytes of pubkey, no padding needed)
+ *           buf[64..127]= SHA256 block2 (padding already applied)
  */
 __attribute__((target("avx512f")))
 void hash160_16way_uncompressed_prepadded(const uint8_t *bufs[16], uint8_t hash160s[16][20])
@@ -205,7 +205,7 @@ void hash160_16way_uncompressed_prepadded(const uint8_t *bufs[16], uint8_t hash1
     uint32_t *sha_state_ptrs[16];
     const uint8_t *sha_block_ptrs[16];
 
-    /* 第一轮：处理block1（buf[0..63]） */
+    /* First pass: process block1 (buf[0..63]) */
     for (int i = 0; i < 16; i++) {
         memcpy(sha_states[i], sha256_init_state, 32);
         sha_state_ptrs[i] = sha_states[i];
@@ -214,14 +214,14 @@ void hash160_16way_uncompressed_prepadded(const uint8_t *bufs[16], uint8_t hash1
 
     sha256_compress_avx512(sha_state_ptrs, sha_block_ptrs);
 
-    /* 第二轮：处理block2（buf[64..127]） */
+    /* Second pass: process block2 (buf[64..127]) */
     for (int i = 0; i < 16; i++) {
         sha_block_ptrs[i] = bufs[i] + 64;
     }
 
     sha256_compress_avx512(sha_state_ptrs, sha_block_ptrs);
 
-    /* sha_digests扩展为64字节，原地构造RIPEMD160 padding */
+    /* sha_digests extended to 64 bytes, construct RIPEMD160 padding in-place */
     uint8_t sha_digests[16][64];
     uint32_t rmd_states[16][5];
     uint32_t *rmd_state_ptrs[16];
@@ -229,10 +229,10 @@ void hash160_16way_uncompressed_prepadded(const uint8_t *bufs[16], uint8_t hash1
 
     for (int i = 0; i < 16; i++) {
         sha256_state_to_bytes(sha_states[i], sha_digests[i]);
-        /* 原地构造RIPEMD160 padded block：消息32字节，小端序位长256 */
+        /* Construct RIPEMD160 padded block in-place: 32-byte message, little-endian bit length 256 */
         sha_digests[i][32] = 0x80;
         memset(&sha_digests[i][33], 0, 23);
-        /* 小端序位长256 = 0x0000000000000100 */
+        /* Little-endian bit length 256 = 0x0000000000000100 */
         sha_digests[i][56] = 0x00; sha_digests[i][57] = 0x01;
         sha_digests[i][58] = 0x00; sha_digests[i][59] = 0x00;
         sha_digests[i][60] = 0x00; sha_digests[i][61] = 0x00;
@@ -250,7 +250,7 @@ void hash160_16way_uncompressed_prepadded(const uint8_t *bufs[16], uint8_t hash1
 }
 
 /*
- * 16路并行计算非压缩公钥（65字节）的hash160（SHA256 -> RIPEMD160）
+ * 16-way parallel hash160 (SHA256->RIPEMD160) for uncompressed public keys (65 bytes)
  */
 __attribute__((target("avx512f")))
 void hash160_16way_uncompressed(const uint8_t *pubkeys[16], uint8_t hash160s[16][20])
@@ -302,8 +302,8 @@ void hash160_16way_uncompressed(const uint8_t *pubkeys[16], uint8_t hash160s[16]
 }
 
 /*
- * 16路并行查表：同时查找16个hash160
- * 返回16位命中掩码（bit i为1表示第i路命中）
+ * 16-way parallel hash table lookup: search for 16 hash160 values simultaneously
+ * Returns 16-bit hit mask (bit i set means lane i matched)
  */
 __attribute__((target("avx512f")))
 uint16_t ht_contains_16way(const uint8_t *h160s[16])

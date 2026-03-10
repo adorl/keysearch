@@ -3,17 +3,17 @@
 #include <fcntl.h>
 #include <string.h>
 
-/* 初始化随机上下文，打开/dev/urandom */
+/* Initialize random context, open /dev/urandom */
 int rand_ctx_init(rand_key_context *ctx)
 {
     ctx->fd = open("/dev/urandom", O_RDONLY);
     if (ctx->fd < 0)
         return -1;
-    ctx->pos = RAND_BUF_SIZE; /* 触发首次填充 */
+    ctx->pos = RAND_BUF_SIZE; /* trigger first refill */
     return 0;
 }
 
-/* 填充缓冲区 */
+/* Refill buffer */
 int rand_ctx_refill(rand_key_context *ctx)
 {
     ssize_t n = read(ctx->fd, ctx->buf, RAND_BUF_SIZE);
@@ -23,7 +23,7 @@ int rand_ctx_refill(rand_key_context *ctx)
     return 0;
 }
 
-/* 生成32字节真随机私钥 */
+/* Generate 32-byte true random private key */
 int gen_random_key(uint8_t *key32, rand_key_context *ctx)
 {
     if (ctx->pos + 32 > RAND_BUF_SIZE) {

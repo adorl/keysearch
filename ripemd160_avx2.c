@@ -1,9 +1,10 @@
 /*
- * ripemd160_avx2.c — RIPEMD160 8-way AVX2并行压缩函数
+ * ripemd160_avx2.c — RIPEMD160 8-way AVX2 parallel compression function
  *
- * 同时处理8个独立消息块（每个块64字节），利用 AVX2 256-bit寄存器
+ * Processes 8 independent message blocks (each 64 bytes) simultaneously,
+ * using AVX2 256-bit registers
  *
- * 接口：
+ * Interface:
  *   void ripemd160_compress_avx2(uint32_t *states[8], const uint8_t *blocks[8])
  */
 
@@ -13,17 +14,17 @@
 #include <stdint.h>
 #include "ripemd160.h"
 
-/* 左旋转 */
+/* Left rotation */
 #define V_ROL(x, n) _mm256_or_si256(_mm256_slli_epi32((x), (n)), _mm256_srli_epi32((x), 32 - (n)))
 
-/* RIPEMD160辅助函数（向量化版本） */
+/* RIPEMD160 auxiliary functions (vectorized versions) */
 #define V_F(x, y, z)    _mm256_xor_si256(_mm256_xor_si256((x), (y)), (z))
 #define V_G(x, y, z)    _mm256_or_si256(_mm256_and_si256((x), (y)), _mm256_andnot_si256((x), (z)))
 #define V_H(x, y, z)    _mm256_xor_si256(_mm256_or_si256((x), _mm256_xor_si256(_mm256_set1_epi32(-1), (y))), (z))
 #define V_I(x, y, z)    _mm256_or_si256(_mm256_and_si256((x), (z)), _mm256_andnot_si256((z), (y)))
 #define V_J(x, y, z)    _mm256_xor_si256((x), _mm256_or_si256((y), _mm256_xor_si256(_mm256_set1_epi32(-1), (z))))
 
-/* 左链步骤宏 */
+/* Left chain step macro */
 #define VRL_STEP(a, b, c, d, e, func_val, s)                                                \
     do {                                                                                    \
         __m256i _t = _mm256_add_epi32(V_ROL(_mm256_add_epi32((a), (func_val)), (s)), (e));  \
@@ -34,21 +35,21 @@
         (b) = _t;                                                                           \
     } while (0)
 
-/* 左链各轮宏（func_val 已包含 x 和 k） */
+/* Left chain round macros (func_val already includes x and k) */
 #define VRL_F(a, b, c, d, e, x, s)  VRL_STEP(a, b, c, d, e, _mm256_add_epi32(V_F(b, c, d), (x)), s)
 #define VRL_G(a, b, c, d, e, x, s)  VRL_STEP(a, b, c, d, e, _mm256_add_epi32(_mm256_add_epi32(V_G(b, c, d), (x)), _mm256_set1_epi32(0x5A827999)), s)
 #define VRL_H(a, b, c, d, e, x, s)  VRL_STEP(a, b, c, d, e, _mm256_add_epi32(_mm256_add_epi32(V_H(b, c, d), (x)), _mm256_set1_epi32(0x6ED9EBA1)), s)
 #define VRL_I(a, b, c, d, e, x, s)  VRL_STEP(a, b, c, d, e, _mm256_add_epi32(_mm256_add_epi32(V_I(b, c, d), (x)), _mm256_set1_epi32((int)0x8F1BBCDC)), s)
 #define VRL_J(a, b, c, d, e, x, s)  VRL_STEP(a, b, c, d, e, _mm256_add_epi32(_mm256_add_epi32(V_J(b, c, d), (x)), _mm256_set1_epi32((int)0xA953FD4E)), s)
 
-/* 右链各轮宏 */
+/* Right chain round macros */
 #define VRR_J(a, b, c, d, e, x, s)  VRL_STEP(a, b, c, d, e, _mm256_add_epi32(_mm256_add_epi32(V_J(b, c, d), (x)), _mm256_set1_epi32(0x50A28BE6)), s)
 #define VRR_I(a, b, c, d, e, x, s)  VRL_STEP(a, b, c, d, e, _mm256_add_epi32(_mm256_add_epi32(V_I(b, c, d), (x)), _mm256_set1_epi32(0x5C4DD124)), s)
 #define VRR_H(a, b, c, d, e, x, s)  VRL_STEP(a, b, c, d, e, _mm256_add_epi32(_mm256_add_epi32(V_H(b, c, d), (x)), _mm256_set1_epi32(0x6D703EF3)), s)
 #define VRR_G(a, b, c, d, e, x, s)  VRL_STEP(a, b, c, d, e, _mm256_add_epi32(_mm256_add_epi32(V_G(b, c, d), (x)), _mm256_set1_epi32(0x7A6D76E9)), s)
 #define VRR_F(a, b, c, d, e, x, s)  VRL_STEP(a, b, c, d, e, _mm256_add_epi32(V_F(b, c, d), (x)), s)
 
-/* 从8个block的第i个uint32_t（小端序）加载到__m256i */
+/* Load the i-th uint32_t (little-endian) from each of 8 blocks into a __m256i */
 static inline __m256i load_le32_8way(const uint8_t *const blocks[8], int i)
 {
     int off = i * 4;
@@ -63,7 +64,7 @@ static inline __m256i load_le32_8way(const uint8_t *const blocks[8], int i)
     return _mm256_set_epi32((int)v7, (int)v6, (int)v5, (int)v4, (int)v3, (int)v2, (int)v1, (int)v0);
 }
 
-/* 将__m256i的8个lane分别写回8个state的第i个元素 */
+/* Write the 8 lanes of a __m256i back to the i-th element of each of 8 states */
 static inline void rmd_store_8way(uint32_t *const states[8], int i, __m256i v)
 {
     uint32_t tmp[8];
@@ -79,14 +80,14 @@ static inline void rmd_store_8way(uint32_t *const states[8], int i, __m256i v)
 }
 
 /*
- * ripemd160_compress_avx2 — 8-way并行RIPEMD160压缩
+ * ripemd160_compress_avx2 — 8-way parallel RIPEMD160 compression
  *
- * 同时对8个独立的(state, block)对执行一次RIPEMD160压缩
+ * Performs one RIPEMD160 compression on 8 independent (state, block) pairs simultaneously
  */
 __attribute__((target("avx2")))
 void ripemd160_compress_avx2(uint32_t *states[8], const uint8_t *blocks[8])
 {
-    /* 加载8路初始状态 */
+    /* Load 8-lane initial state */
     __m256i al = _mm256_set_epi32((int)states[7][0], (int)states[6][0], (int)states[5][0], (int)states[4][0], (int)states[3][0], (int)states[2][0], (int)states[1][0], (int)states[0][0]);
     __m256i bl = _mm256_set_epi32((int)states[7][1], (int)states[6][1], (int)states[5][1], (int)states[4][1], (int)states[3][1], (int)states[2][1], (int)states[1][1], (int)states[0][1]);
     __m256i cl = _mm256_set_epi32((int)states[7][2], (int)states[6][2], (int)states[5][2], (int)states[4][2], (int)states[3][2], (int)states[2][2], (int)states[1][2], (int)states[0][2]);
@@ -94,10 +95,10 @@ void ripemd160_compress_avx2(uint32_t *states[8], const uint8_t *blocks[8])
     __m256i el = _mm256_set_epi32((int)states[7][4], (int)states[6][4], (int)states[5][4], (int)states[4][4], (int)states[3][4], (int)states[2][4], (int)states[1][4], (int)states[0][4]);
     __m256i ar = al, br = bl, cr = cl, dr = dl, er = el;
 
-    /* 保存初始状态 */
+    /* Save initial state */
     __m256i s0 = al, s1 = bl, s2 = cl, s3 = dl, s4 = el;
 
-    /* 加载8路消息字（小端序） */
+    /* Load 8-lane message words (little-endian) */
     __m256i w0 = load_le32_8way(blocks, 0), w1 = load_le32_8way(blocks, 1);
     __m256i w2 = load_le32_8way(blocks, 2), w3 = load_le32_8way(blocks, 3);
     __m256i w4 = load_le32_8way(blocks, 4), w5 = load_le32_8way(blocks, 5);
@@ -107,7 +108,7 @@ void ripemd160_compress_avx2(uint32_t *states[8], const uint8_t *blocks[8])
     __m256i w12 = load_le32_8way(blocks, 12), w13 = load_le32_8way(blocks, 13);
     __m256i w14 = load_le32_8way(blocks, 14), w15 = load_le32_8way(blocks, 15);
 
-    /* 左链：轮0-15，F */
+    /* Left chain: rounds 0-15, F */
     VRL_F(al, bl, cl, dl, el, w0, 11);
     VRL_F(al, bl, cl, dl, el, w1, 14);
     VRL_F(al, bl, cl, dl, el, w2, 15);
@@ -124,7 +125,7 @@ void ripemd160_compress_avx2(uint32_t *states[8], const uint8_t *blocks[8])
     VRL_F(al, bl, cl, dl, el, w13, 7);
     VRL_F(al, bl, cl, dl, el, w14, 9);
     VRL_F(al, bl, cl, dl, el, w15, 8);
-    /* 左链：轮16-31，G */
+    /* Left chain: rounds 16-31, G */
     VRL_G(al, bl, cl, dl, el, w7, 7);
     VRL_G(al, bl, cl, dl, el, w4, 6);
     VRL_G(al, bl, cl, dl, el, w13, 8);
@@ -141,7 +142,7 @@ void ripemd160_compress_avx2(uint32_t *states[8], const uint8_t *blocks[8])
     VRL_G(al, bl, cl, dl, el, w14, 7);
     VRL_G(al, bl, cl, dl, el, w11, 13);
     VRL_G(al, bl, cl, dl, el, w8, 12);
-    /* 左链：轮32-47，H */
+    /* Left chain: rounds 32-47, H */
     VRL_H(al, bl, cl, dl, el, w3, 11);
     VRL_H(al, bl, cl, dl, el, w10, 13);
     VRL_H(al, bl, cl, dl, el, w14, 6);
@@ -158,7 +159,7 @@ void ripemd160_compress_avx2(uint32_t *states[8], const uint8_t *blocks[8])
     VRL_H(al, bl, cl, dl, el, w11, 12);
     VRL_H(al, bl, cl, dl, el, w5, 7);
     VRL_H(al, bl, cl, dl, el, w12, 5);
-    /* 左链：轮48-63，I */
+    /* Left chain: rounds 48-63, I */
     VRL_I(al, bl, cl, dl, el, w1, 11);
     VRL_I(al, bl, cl, dl, el, w9, 12);
     VRL_I(al, bl, cl, dl, el, w11, 14);
@@ -175,7 +176,7 @@ void ripemd160_compress_avx2(uint32_t *states[8], const uint8_t *blocks[8])
     VRL_I(al, bl, cl, dl, el, w5, 6);
     VRL_I(al, bl, cl, dl, el, w6, 5);
     VRL_I(al, bl, cl, dl, el, w2, 12);
-    /* 左链：轮64-79，J */
+    /* Left chain: rounds 64-79, J */
     VRL_J(al, bl, cl, dl, el, w4, 9);
     VRL_J(al, bl, cl, dl, el, w0, 15);
     VRL_J(al, bl, cl, dl, el, w5, 5);
@@ -193,7 +194,7 @@ void ripemd160_compress_avx2(uint32_t *states[8], const uint8_t *blocks[8])
     VRL_J(al, bl, cl, dl, el, w15, 5);
     VRL_J(al, bl, cl, dl, el, w13, 6);
 
-    /* 右链：轮0-15，J */
+    /* Right chain: rounds 0-15, J */
     VRR_J(ar, br, cr, dr, er, w5, 8);
     VRR_J(ar, br, cr, dr, er, w14, 9);
     VRR_J(ar, br, cr, dr, er, w7, 9);
@@ -210,7 +211,7 @@ void ripemd160_compress_avx2(uint32_t *states[8], const uint8_t *blocks[8])
     VRR_J(ar, br, cr, dr, er, w10, 14);
     VRR_J(ar, br, cr, dr, er, w3, 12);
     VRR_J(ar, br, cr, dr, er, w12, 6);
-    /* 右链：轮16-31，I */
+    /* Right chain: rounds 16-31, I */
     VRR_I(ar, br, cr, dr, er, w6, 9);
     VRR_I(ar, br, cr, dr, er, w11, 13);
     VRR_I(ar, br, cr, dr, er, w3, 15);
@@ -227,7 +228,7 @@ void ripemd160_compress_avx2(uint32_t *states[8], const uint8_t *blocks[8])
     VRR_I(ar, br, cr, dr, er, w9, 15);
     VRR_I(ar, br, cr, dr, er, w1, 13);
     VRR_I(ar, br, cr, dr, er, w2, 11);
-    /* 右链：轮32-47，H */
+    /* Right chain: rounds 32-47, H */
     VRR_H(ar, br, cr, dr, er, w15, 9);
     VRR_H(ar, br, cr, dr, er, w5, 7);
     VRR_H(ar, br, cr, dr, er, w1, 15);
@@ -244,7 +245,7 @@ void ripemd160_compress_avx2(uint32_t *states[8], const uint8_t *blocks[8])
     VRR_H(ar, br, cr, dr, er, w0, 13);
     VRR_H(ar, br, cr, dr, er, w4, 7);
     VRR_H(ar, br, cr, dr, er, w13, 5);
-    /* 右链：轮48-63，G */
+    /* Right chain: rounds 48-63, G */
     VRR_G(ar, br, cr, dr, er, w8, 15);
     VRR_G(ar, br, cr, dr, er, w6, 5);
     VRR_G(ar, br, cr, dr, er, w4, 8);
@@ -261,7 +262,7 @@ void ripemd160_compress_avx2(uint32_t *states[8], const uint8_t *blocks[8])
     VRR_G(ar, br, cr, dr, er, w7, 5);
     VRR_G(ar, br, cr, dr, er, w10, 15);
     VRR_G(ar, br, cr, dr, er, w14, 8);
-    /* 右链：轮64-79，F */
+    /* Right chain: rounds 64-79, F */
     VRR_F(ar, br, cr, dr, er, w12, 8);
     VRR_F(ar, br, cr, dr, er, w15, 5);
     VRR_F(ar, br, cr, dr, er, w10, 12);
@@ -279,7 +280,7 @@ void ripemd160_compress_avx2(uint32_t *states[8], const uint8_t *blocks[8])
     VRR_F(ar, br, cr, dr, er, w9, 11);
     VRR_F(ar, br, cr, dr, er, w11, 11);
 
-    /* 合并左右链，更新state */
+    /* Merge left and right chains, update state */
     __m256i t = _mm256_add_epi32(_mm256_add_epi32(s1, cl), dr);
     __m256i new1 = _mm256_add_epi32(_mm256_add_epi32(s2, dl), er);
     __m256i new2 = _mm256_add_epi32(_mm256_add_epi32(s3, el), ar);

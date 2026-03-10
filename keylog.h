@@ -2,31 +2,31 @@
 #define KEYLOG_H
 
 /*
- * keylog.h — 日志基础设施
+ * keylog.h — logging infrastructure
  *
- * 提供三个级别的日志宏：
- *   keylog_info(fmt, ...)   — 信息级别，前缀 [info]
- *   keylog_warn(fmt, ...)   — 警告级别，前缀 [warn]
- *   keylog_error(fmt, ...)  — 错误级别，前缀 [error]
+ * Provides three log level macros:
+ *   keylog_info(fmt, ...)   — info level, prefix [info]
+ *   keylog_warn(fmt, ...)   — warning level, prefix [warn]
+ *   keylog_error(fmt, ...)  — error level, prefix [error]
  *
- * 使用前须调用 log_init()，程序退出前调用 log_close()。
- * 日志文件名格式：search_YYYYMMDD_HH:MM:SS.log
- * 底层使用 open/write/close，每条日志单次 write，多线程安全。
+ * Must call log_init() before use, call log_close() before program exit.
+ * Log file name format: search_YYYYMMDD_HH:MM:SS.log
+ * Uses open/write/close internally, single write per log entry, thread-safe.
  */
 
 #include <unistd.h>
 #include <stdio.h>
 
-/* 初始化日志文件，成功返回 0，失败返回 -1 */
+/* Initialize log file, returns 0 on success, -1 on failure */
 int  log_init(void);
 
-/* 关闭日志文件 */
+/* Close log file */
 void log_close(void);
 
-/* 全局日志文件描述符（由 keylog.c 定义，宏内部使用） */
+/* Global log file descriptor (defined in keylog.c, used internally by macros) */
 extern int g_log_fd;
 
-/* 内部辅助宏：将前缀+格式化内容拼装为单次 write，保证多线程下日志行不交错 */
+/* Internal helper macro: assemble prefix+formatted content into a single write, ensuring log lines don't interleave in multi-threaded context */
 #define _keylog_write(prefix, fmt, ...) \
     do { \
         char _buf[1024]; \

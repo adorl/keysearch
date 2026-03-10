@@ -5,8 +5,6 @@
 #include <stddef.h>
 #include <string.h>
 
-/* ===================== RIPEMD160 ===================== */
-
 typedef struct {
     uint32_t state[5];
     uint32_t count[2];

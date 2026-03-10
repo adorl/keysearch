@@ -1,24 +1,24 @@
 /*
  * secp256k1_keygen.c
  *
- * 封装libsecp256k1内部接口，实现：
- *   1. 直接点加法（绕过ecmult路径）
- *   2. 批量仿射坐标归一化（Montgomery trick）
- *   3. 直接从仿射坐标构造公钥字节（跳过 serialize）
+ * Wraps libsecp256k1 internal interfaces, implementing:
+ *   1. Direct point addition (bypassing ecmult path)
+ *   2. Batch affine coordinate normalization (Montgomery trick)
+ *   3. Direct public key byte construction from affine coordinates (skip serialize)
  *
- * 编译模式：
- *   - 默认：使用内部头文件，链接本地编译的 secp256k1_lib.o
- *   - USE_PUBKEY_API_ONLY：回退到公开API
+ * Compilation modes:
+ *   - Default: use internal headers, link locally compiled secp256k1_lib.o
+ *   - USE_PUBKEY_API_ONLY: fall back to public API
  *
- * 注意：本文件定义 SECP256K1_BUILD 并包含 *_impl.h，
- * 这些 static/inline 函数每个编译单元都需要自己的副本，
- * 不会与 secp256k1_lib.o 产生符号冲突（static 符号不导出）。
- * secp256k1_context_struct 等非 static 符号由 secp256k1_lib.o 提供。
+ * Note: this file defines SECP256K1_BUILD and includes *_impl.h,
+ * these static/inline functions each compilation unit needs its own copy,
+ * no symbol conflict with secp256k1_lib.o (static symbols are not exported).
+ * Non-static symbols like secp256k1_context_struct are provided by secp256k1_lib.o.
  */
 
 /*
- * 注意：SECP256K1_BUILD 和所有 *_impl.h 已在 secp256k1_keygen.h 中定义/包含。
- * 此处直接包含 secp256k1_keygen.h 即可，无需重复定义。
+ * Note: SECP256K1_BUILD and all *_impl.h are already defined/included in secp256k1_keygen.h.
+ * Simply include secp256k1_keygen.h here, no need to redefine.
  */
 #include "secp256k1_keygen.h"
 #include <string.h>
@@ -28,9 +28,9 @@
 #ifndef USE_PUBKEY_API_ONLY
 
 /*
- * secp256k1_context_struct 完整定义（与 secp256k1/src/secp256k1.c 中一致）。
- * 此处需要完整定义才能访问 ctx->ecmult_gen_ctx 字段。
- * 结构体定义不产生链接符号，与 secp256k1_lib.o 中的定义不冲突。
+ * Full definition of secp256k1_context_struct (consistent with secp256k1/src/secp256k1.c).
+ * Full definition needed here to access ctx->ecmult_gen_ctx field.
+ * Struct definition produces no link symbols, no conflict with secp256k1_lib.o.
  */
 struct secp256k1_context_struct {
     secp256k1_ecmult_gen_context ecmult_gen_ctx;
@@ -45,7 +45,7 @@ int keygen_init_generator(const secp256k1_context *ctx,
     (void)ctx;
 
     /*
-     * secp256k1生成元G的仿射坐标（硬编码标准值）
+     * secp256k1 generator G affine coordinates (hardcoded standard values)
      * X = 79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
      * Y = 483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8
      */
@@ -62,13 +62,15 @@ int keygen_init_generator(const secp256k1_context *ctx,
         0x9C,0x47,0xD0,0x8F,0xFB,0x10,0xD4,0xB8
     };
 
-    if (!secp256k1_fe_set_b32_limit(&G_out->x, Gx)) return -1;
-    if (!secp256k1_fe_set_b32_limit(&G_out->y, Gy)) return -1;
+    if (!secp256k1_fe_set_b32_limit(&G_out->x, Gx))
+        return -1;
+    if (!secp256k1_fe_set_b32_limit(&G_out->y, Gy))
+        return -1;
     G_out->infinity = 0;
 
-    /* 验证 infinity 标志 */
+    /* Verify infinity flag */
     if (G_out->infinity != 0) {
-        fprintf(stderr, "keygen_init_generator: G.infinity != 0，异常！\n");
+        fprintf(stderr, "keygen_init_generator: G.infinity != 0, unexpected!\n");
         return -1;
     }
     return 0;
@@ -86,25 +88,25 @@ int keygen_privkey_to_gej(const secp256k1_context *ctx,
         return -1;
     }
 
-    /* 直接调用内部ecmult_gen：gej = scalar * G */
+    /* Directly call internal ecmult_gen: gej = scalar * G */
     secp256k1_ecmult_gen(&ctx->ecmult_gen_ctx, gej_out, &scalar);
 
-    /* 清零标量，防止侧信道泄露 */
+    /* Clear scalar to prevent side-channel leakage */
     secp256k1_scalar_clear(&scalar);
     return 0;
 }
 
 /* ------------------------------------------------------------------ */
-/* 使用Montgomery trick批量归一化：                                     */
+/* Batch normalization using Montgomery trick:                          */
 /*   acc[0] = Z[0]                                                     */
 /*   acc[i] = acc[i-1] * Z[i]                                         */
-/*   inv = 1 / acc[n-1]  （1次模逆）                                   */
-/*   从后往前：                                                         */
-/*     inv_zi = inv * acc[i-1]  （Z[i]的逆）                           */
-/*     inv    = inv * Z[i]      （更新inv为acc[i-1]的逆）               */
+/*   inv = 1 / acc[n-1]  (1 modular inverse)                          */
+/*   Backward pass:                                                    */
+/*     inv_zi = inv * acc[i-1]  (inverse of Z[i])                     */
+/*     inv    = inv * Z[i]      (update inv to inverse of acc[i-1])   */
 /* ------------------------------------------------------------------ */
 
-/* 大小与keysearch.c中的BATCH_SIZE保持一致 */
+/* Size consistent with BATCH_SIZE in keysearch.c */
 #define KEYGEN_BATCH_MAX (4096)
 static __thread secp256k1_fe acc_buf[KEYGEN_BATCH_MAX];
 
@@ -115,16 +117,16 @@ void keygen_batch_normalize(const secp256k1_gej *gej_in,
     if (n == 0 || n > KEYGEN_BATCH_MAX)
         return;
 
-    /* 优先使用线程局部静态缓冲区，避免堆分配 */
+    /* Prefer thread-local static buffer to avoid heap allocation */
     secp256k1_fe *acc = acc_buf;
 
-    /* 第一步：计算累积乘积，跳过infinity点 */
+    /* Step 1: compute cumulative product, skip infinity points */
     int first = 1;
     size_t first_idx = 0;
     for (size_t i = 0; i < n; i++) {
         if (gej_in[i].infinity) {
             ge_out[i].infinity = 1;
-            /* acc[i]留作占位，不参与运算 */
+            /* acc[i] is a placeholder, not involved in computation */
             if (!first) {
                 acc[i] = acc[i - 1];
             } else {
@@ -142,15 +144,15 @@ void keygen_batch_normalize(const secp256k1_gej *gej_in,
     }
 
     if (first) {
-        /* 所有点都是infinity */
+        /* All points are infinity */
         return;
     }
 
-    /* 第二步：计算acc[n-1]的模逆 */
+    /* Step 2: compute modular inverse of acc[n-1] */
     secp256k1_fe inv;
     secp256k1_fe_inv(&inv, &acc[n - 1]);
 
-    /* 第三步：从后往前，逐个恢复Z的逆，并转换为仿射坐标 */
+    /* Step 3: backward pass, recover inverse of each Z, convert to affine coordinates */
     for (size_t i = n; i-- > 0; ) {
         if (gej_in[i].infinity) {
             continue;
@@ -158,16 +160,16 @@ void keygen_batch_normalize(const secp256k1_gej *gej_in,
 
         secp256k1_fe inv_zi;
         if (i == first_idx) {
-            /* 第一个非infinity点，inv已经是Z[i]的逆 */
+            /* First non-infinity point, inv is already the inverse of Z[i] */
             inv_zi = inv;
         } else {
             /* inv_zi = inv * acc[i-1] */
             secp256k1_fe_mul(&inv_zi, &inv, &acc[i - 1]);
-            /* 更新inv = inv * Z[i]，使其成为acc[i-1]的逆 */
+            /* Update inv = inv * Z[i], making it the inverse of acc[i-1] */
             secp256k1_fe_mul(&inv, &inv, &gej_in[i].z);
         }
 
-        /* 仿射坐标：x = X/Z^2, y = Y/Z^3 */
+        /* Affine coordinates: x = X/Z^2, y = Y/Z^3 */
         secp256k1_fe inv_zi2;
         secp256k1_fe_sqr(&inv_zi2, &inv_zi);
 
@@ -179,23 +181,23 @@ void keygen_batch_normalize(const secp256k1_gej *gej_in,
 }
 
 /*
- * keygen_batch_normalize_rzr：利用rzr增量因子加速的批量归一化
- * 原理：
- *   gej_in[i]由gej_in[i-1] + G 得到，secp256k1_gej_add_ge_var输出的rzr[i-1]
- *   满足Z[i] = Z[i-1] * rzr[i-1]，因此：
+ * keygen_batch_normalize_rzr: batch normalization accelerated by rzr increment factors
+ * Principle:
+ *   gej_in[i] is obtained from gej_in[i-1] + G, the rzr[i-1] output by secp256k1_gej_add_ge_var
+ *   satisfies Z[i] = Z[i-1] * rzr[i-1], therefore:
  *     1/Z[i-1] = (1/Z[i]) * rzr[i-1]
  *
- *   直接对gej_in[n-1].z求模逆（1次），然后从后往前用rzr链推导每个点的1/Z[i]：
+ *   Compute modular inverse of gej_in[n-1].z once, then use rzr chain backward to derive 1/Z[i]:
  *     inv = 1/Z[n-1]
- *     inv_zi = inv  （第n-1个点）
- *     inv = inv * rzr[i-1]  →  inv = 1/Z[i-1]  （向前传递）
+ *     inv_zi = inv  (for point n-1)
+ *     inv = inv * rzr[i-1]  ->  inv = 1/Z[i-1]  (forward propagation)
  *
- * 要求：所有点均非infinity（内层循环已保证）
- * 参数：
- *   gej_in  : 输入Jacobian坐标数组（大小n）
- *   ge_out  : 输出仿射坐标数组（大小>=n）
- *   rzr     : Z坐标增量因子数组（大小n-1，rzr[i]满足Z[i+1]=Z[i]*rzr[i]）
- *   n       : 数组元素个数
+ * Requirement: all points are non-infinity (guaranteed by inner loop)
+ * Parameters:
+ *   gej_in  : input Jacobian coordinate array (size n)
+ *   ge_out  : output affine coordinate array (size >= n)
+ *   rzr     : Z coordinate increment factor array (size n-1, rzr[i] satisfies Z[i+1]=Z[i]*rzr[i])
+ *   n       : number of array elements
  */
 void keygen_batch_normalize_rzr(const secp256k1_gej *gej_in,
                                 secp256k1_ge *ge_out,
@@ -206,19 +208,19 @@ void keygen_batch_normalize_rzr(const secp256k1_gej *gej_in,
         return;
 
     /*
-     * 直接对最后一个点的Z坐标求模逆（1次模逆）
-     * 无需前向累积：gej_in[n-1].z就是所有rzr乘积的终点
+     * Compute modular inverse of the last point's Z coordinate (1 modular inverse)
+     * No forward accumulation needed: gej_in[n-1].z is the endpoint of all rzr products
      */
     secp256k1_fe inv;
     secp256k1_fe_inv(&inv, &gej_in[n - 1].z);
 
     /*
-     * 从后往前，利用rzr链逐个推导1/Z[i]，并转换为仿射坐标：
-     *   inv始终持有当前点i的1/Z[i]
-     *   处理完第i点后：inv = inv * rzr[i-1] = 1/Z[i-1]
+     * Backward pass, use rzr chain to derive 1/Z[i] for each point, convert to affine:
+     *   inv always holds 1/Z[i] for current point i
+     *   After processing point i: inv = inv * rzr[i-1] = 1/Z[i-1]
      */
     for (size_t i = n; i-- > 0; ) {
-        /* inv 此时 = 1/Z[i] */
+        /* inv is now = 1/Z[i] */
         secp256k1_fe inv_zi2;
         secp256k1_fe_sqr(&inv_zi2, &inv);                           /* inv_zi^2 */
         secp256k1_fe_mul(&ge_out[i].x, &gej_in[i].x, &inv_zi2);     /* X/Z^2 */
@@ -226,7 +228,7 @@ void keygen_batch_normalize_rzr(const secp256k1_gej *gej_in,
         secp256k1_fe_mul(&ge_out[i].y, &gej_in[i].y, &inv_zi2);     /* Y/Z^3 */
         ge_out[i].infinity = 0;
 
-        /* 向前传递：inv = 1/Z[i-1] = (1/Z[i]) * rzr[i-1] */
+        /* Forward propagation: inv = 1/Z[i-1] = (1/Z[i]) * rzr[i-1] */
         if (i > 0) {
             secp256k1_fe_mul(&inv, &inv, &rzr[i - 1]);
         }
@@ -248,14 +250,14 @@ void keygen_ge_to_pubkey_bytes(const secp256k1_ge *ge,
     secp256k1_fe_get_b32(x_bytes, &x);
 
     if (compressed_out != NULL) {
-        /* 压缩公钥：前缀0x02（Y偶）或0x03（Y奇）+ X(32字节) */
+        /* Compressed pubkey: prefix 0x02 (Y even) or 0x03 (Y odd) + X (32 bytes) */
         compressed_out[0] = secp256k1_fe_is_odd(&y) ? 0x03 : 0x02;
         memcpy(compressed_out + 1, x_bytes, 32);
     }
 
     if (uncompressed_out != NULL) {
         secp256k1_fe_get_b32(y_bytes, &y);
-        /* 非压缩公钥：0x04 + X(32字节) + Y(32字节) */
+        /* Uncompressed pubkey: 0x04 + X (32 bytes) + Y (32 bytes) */
         uncompressed_out[0] = 0x04;
         memcpy(uncompressed_out + 1, x_bytes, 32);
         memcpy(uncompressed_out + 1 + 32, y_bytes, 32);
@@ -269,7 +271,7 @@ int keygen_init_generator(const secp256k1_context *ctx,
 {
     (void)ctx;
     (void)G_out;
-    /* 回退模式无需预加载G，直接返回成功 */
+    /* Fallback mode: no need to preload G, return success directly */
     return 0;
 }
 

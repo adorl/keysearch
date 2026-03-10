@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* 每线程随机缓冲区大小：一次读取8KB，可供8192-32次私钥生成使用 */
+/* Per-thread random buffer size: read 8KB at once, sufficient for 8192/32 private key generations */
 #define RAND_BUF_SIZE   (8192)
 
 typedef struct {
@@ -13,13 +13,13 @@ typedef struct {
     int      fd;
 } rand_key_context;
 
-/* 初始化随机上下文，打开 /dev/urandom */
+/* Initialize random context, open /dev/urandom */
 int rand_ctx_init(rand_key_context *ctx);
 
-/* 填充缓冲区 */
+/* Refill buffer */
 int rand_ctx_refill(rand_key_context *ctx);
 
-/* 生成32字节真随机私钥 */
+/* Generate 32-byte true random private key */
 int gen_random_key(uint8_t *key32, rand_key_context *ctx);
 
 #endif /* RAND_KEY_H */

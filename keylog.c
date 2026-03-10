@@ -6,10 +6,10 @@
 #include <time.h>
 #include <stdio.h>
 
-/* 全局日志文件描述符，-1 表示未初始化 */
+/* Global log file descriptor, -1 means uninitialized */
 int g_log_fd = -1;
 
-/* 初始化日志文件：按启动时间生成文件名并打开 */
+/* Initialize log file: generate filename based on startup time and open */
 int log_init(void)
 {
     time_t t = time(NULL);
@@ -18,13 +18,13 @@ int log_init(void)
     strftime(log_path, sizeof(log_path), "search_%Y%m%d_%H:%M:%S.log", tm_info);
     g_log_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (g_log_fd < 0) {
-        fprintf(stderr, "错误：无法创建日志文件 %s\n", log_path);
+        fprintf(stderr, "Error: cannot create log file %s\n", log_path);
         return -1;
     }
     return 0;
 }
 
-/* 关闭日志文件 */
+/* Close log file */
 void log_close(void)
 {
     if (g_log_fd >= 0) {
