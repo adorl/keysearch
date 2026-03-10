@@ -10,7 +10,7 @@
  *       asynchronously via cudaMemcpyAsync; two CUDA streams alternate to
  *       eliminate CPU/PCIe serial stalls.
  *   - On hit, calls keylog_info to record private key and address
- *   - Prints speed info every PROGRESS_INTERVAL iterations
+ *   - Prints speed info every GPU_PROGRESS_INTERVAL iterations
  *
  * Requirements: 3.2, 8.1, 8.2, 8.3
  */
@@ -26,6 +26,8 @@
 #include "../keylog.h"
 #include "../hash_utils.h"
 #include "../rand_key.h"
+
+#define GPU_PROGRESS_INTERVAL   (100000000)      /* progress print interval */
 
 /* External Function Declarations (from other .cu files) */
 
@@ -305,7 +307,7 @@ int gpu_search(void)
     struct timespec ts_last, ts_now;
     clock_gettime(CLOCK_MONOTONIC, &ts_last);
 
-    int progress_counter = PROGRESS_INTERVAL;
+    int progress_counter = GPU_PROGRESS_INTERVAL;
     int num_chains = g_batch_size;
     int steps = GPU_CHAIN_STEPS;
 
@@ -360,7 +362,7 @@ int gpu_search(void)
         /* ---- Performance monitoring ---- */
         progress_counter -= num_chains * steps;
         if (progress_counter <= 0) {
-            progress_counter = PROGRESS_INTERVAL;
+            progress_counter = GPU_PROGRESS_INTERVAL;
             clock_gettime(CLOCK_MONOTONIC, &ts_now);
             double elapsed = (ts_now.tv_sec  - ts_last.tv_sec) +
                              (ts_now.tv_nsec - ts_last.tv_nsec) * 1e-9;
@@ -407,3 +409,4 @@ void gpu_cleanup(void)
     g_initialized = 0;
     keylog_info("[GPU] Resources freed");
 }
+

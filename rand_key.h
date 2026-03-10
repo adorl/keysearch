@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Per-thread random buffer size: read 8KB at once, sufficient for 8192/32 private key generations */
 #define RAND_BUF_SIZE   (8192)
 
@@ -22,5 +26,10 @@ int rand_ctx_refill(rand_key_context *ctx);
 /* Generate 32-byte true random private key */
 int gen_random_key(uint8_t *key32, rand_key_context *ctx);
 
+#ifdef __cplusplus
+}
+#endif
+
 #endif /* RAND_KEY_H */
+
 

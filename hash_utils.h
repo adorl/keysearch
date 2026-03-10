@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Convert private key byte array to hex string */
 void bytes_to_hex(const uint8_t *bytes, int len, char *hex_out);
 
@@ -221,5 +225,10 @@ void hash160_16way_uncompressed_prepadded(const uint8_t *bufs[16], uint8_t hash1
 uint16_t ht_contains_16way(const uint8_t *h160s[16]);
 #endif /* __AVX512F__ */
 
+#ifdef __cplusplus
+}
+#endif
+
 #endif /* HASH_UTILS_H */
+
 

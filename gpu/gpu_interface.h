@@ -11,9 +11,13 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 
 /* Number of chains processed per GPU batch (must be power of 2, auto-adjusted based on VRAM) */
-#define GPU_BATCH_SIZE      (1 << 20)    /* default 1M chains */
+#define GPU_BATCH_SIZE      (1 << 18)    /* default 256K chains */
 
 /* Incremental steps per chain (steps derived from base private key per chain) */
 #define GPU_CHAIN_STEPS     (256)        /* 256 steps per chain */
@@ -67,5 +71,9 @@ void gpu_cleanup(void);
  * Returns internal static pointer, caller must not free
  */
 const gpu_device_info_t *gpu_get_device_info(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* GPU_INTERFACE_H */

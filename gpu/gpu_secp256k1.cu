@@ -278,8 +278,7 @@ __device__ fe256 fe_mul(const fe256 &a, const fe256 &b)
 
     /* Final conditional reduction: result may be in [0, 2p), reduce to [0, p) */
     /* Check r >= p: r >= p iff r + c overflows 256 bits */
-
-    uint64_t c = 0x1000003D1ULL;
+    /* Note: c = 0x1000003D1ULL is already declared above, reuse it */
     uint64_t s0 = r[0] + c; uint64_t sc = (s0 < r[0]) ? 1 : 0;
     uint64_t s1 = r[1] + sc; sc = (s1 < r[1]) ? 1 : 0;
     uint64_t s2 = r[2] + sc; sc = (s2 < r[2]) ? 1 : 0;
@@ -329,7 +328,7 @@ __device__ fe256 fe_inv(const fe256 &a)
                     fe_sqr(fe_sqr(fe_sqr(fe_sqr(fe_sqr(fe_sqr(
                     fe_sqr(fe_sqr(fe_sqr(fe_sqr(fe_sqr(fe_sqr(
                     fe_sqr(fe_sqr(fe_sqr(fe_sqr(fe_sqr(fe_sqr(
-                    fe_sqr(fe_sqr(fe_sqr(fe_sqr(x44))))))))))))))))))))))))))))))))))))))))))), x44);
+                    fe_sqr(fe_sqr(fe_sqr(fe_sqr(x44)))))))))))))))))))))))))))))))))))))))))))), x44);
     fe256 x176 = fe_mul(fe_sqr(fe_sqr(fe_sqr(fe_sqr(fe_sqr(
                     fe_sqr(fe_sqr(fe_sqr(fe_sqr(fe_sqr(fe_sqr(
                     fe_sqr(fe_sqr(fe_sqr(fe_sqr(fe_sqr(fe_sqr(
@@ -345,7 +344,7 @@ __device__ fe256 fe_inv(const fe256 &a)
                     fe_sqr(fe_sqr(fe_sqr(fe_sqr(fe_sqr(fe_sqr(
                     fe_sqr(fe_sqr(fe_sqr(fe_sqr(fe_sqr(fe_sqr(
                     fe_sqr(fe_sqr(fe_sqr(fe_sqr(fe_sqr(fe_sqr(
-                    fe_sqr(fe_sqr(x88))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))), x88);
+                    fe_sqr(fe_sqr(x88)))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))), x88);
     fe256 x220 = fe_mul(fe_sqr(fe_sqr(fe_sqr(fe_sqr(fe_sqr(
                     fe_sqr(fe_sqr(fe_sqr(fe_sqr(fe_sqr(fe_sqr(
                     fe_sqr(fe_sqr(fe_sqr(fe_sqr(fe_sqr(fe_sqr(
@@ -353,7 +352,7 @@ __device__ fe256 fe_inv(const fe256 &a)
                     fe_sqr(fe_sqr(fe_sqr(fe_sqr(fe_sqr(fe_sqr(
                     fe_sqr(fe_sqr(fe_sqr(fe_sqr(fe_sqr(fe_sqr(
                     fe_sqr(fe_sqr(fe_sqr(fe_sqr(fe_sqr(fe_sqr(
-                    fe_sqr(fe_sqr(fe_sqr(fe_sqr(x176))))))))))))))))))))))))))))))))))))))))))), x44);
+                    fe_sqr(fe_sqr(fe_sqr(fe_sqr(x176)))))))))))))))))))))))))))))))))))))))))))), x44);
     fe256 x223 = fe_mul(fe_sqr(fe_sqr(fe_sqr(x220))), x3);
 
     /* Final: a^(p-2) using correct addition chain */
@@ -372,6 +371,12 @@ __device__ fe256 fe_inv(const fe256 &a)
     t1 = fe_sqr(t1);
     t1 = fe_mul(t1, a);
     return t1;
+}
+
+/* Check if fe256 is zero */
+__device__ __forceinline__ int fe_is_zero(const fe256 &a)
+{
+    return (a.d[0] == 0 && a.d[1] == 0 && a.d[2] == 0 && a.d[3] == 0);
 }
 
 /*
@@ -508,12 +513,6 @@ __device__ __forceinline__ void fe_to_bytes(const fe256 &a, uint8_t *b)
     b[26] = (uint8_t)(a.d[0] >> 40); b[27] = (uint8_t)(a.d[0] >> 32);
     b[28] = (uint8_t)(a.d[0] >> 24); b[29] = (uint8_t)(a.d[0] >> 16);
     b[30] = (uint8_t)(a.d[0] >>  8); b[31] = (uint8_t)(a.d[0]);
-}
-
-/* Check if fe256 is zero */
-__device__ __forceinline__ int fe_is_zero(const fe256 &a)
-{
-    return (a.d[0] == 0 && a.d[1] == 0 && a.d[2] == 0 && a.d[3] == 0);
 }
 
 /* Check if fe256 is odd (lowest bit) */
@@ -984,3 +983,4 @@ const uint8_t *gpu_secp256k1_get_base_privkeys(void)
 {
     return d_base_privkeys;
 }
+
