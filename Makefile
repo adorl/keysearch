@@ -87,25 +87,25 @@ ripemd160_avx2.o: ripemd160_avx2.c
 	$(CC) $(CFLAGS) -mavx2 -c -o $@ $<
 
 sha256_avx512.o: sha256_avx512.c
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) -mavx512f -c -o $@ $<
 
 ripemd160_avx512.o: ripemd160_avx512.c
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) -mavx512f -c -o $@ $<
 
 hash_utils.o: hash_utils.c
 	$(CC) $(CFLAGS) -mavx2 -c -o $@ $<
 
 hash_utils_avx512.o: hash_utils_avx512.c
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) -mavx512f -c -o $@ $<
 
 secp256k1_keygen_avx512.o: secp256k1_keygen_avx512.c
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) -mavx512f -mavx512ifma -c -o $@ $<
 
 keysearch.o: keysearch.c
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) -mavx512f -mavx512ifma -c -o $@ $<
 
 test_case.o: test_case.c
-	$(CC) $(CFLAGS) -mavx2 -c -o $@ $<
+	$(CC) $(CFLAGS) -mavx2 -mavx512f -mavx512ifma -c -o $@ $<
 endif
 
 test: test_case
