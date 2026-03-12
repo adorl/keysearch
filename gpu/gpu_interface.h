@@ -20,7 +20,8 @@ extern "C" {
 #define GPU_BATCH_SIZE      (1 << 18)    /* default 256K chains */
 
 /* Incremental steps per chain (steps derived from base private key per chain) */
-#define GPU_CHAIN_STEPS     (256)        /* 256 steps per chain */
+/* H3: must be a power of 2; kernel_hashtable_lookup uses bit-shift/AND instead of division */
+#define GPU_CHAIN_STEPS     (256)        /* 256 steps per chain (2^8) */
 
 /* Hit result buffer size (max hits returned per batch) */
 #define GPU_MAX_HITS        (64)

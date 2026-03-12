@@ -11,7 +11,7 @@ ifdef GPU
     CFLAGS  += -DUSE_GPU
     NVCCFLAGS = -O3 -arch=sm_60 --compiler-options "-O3 -march=native"
     LDFLAGS += -lcuda -lcudart
-    GPU_SRCS = gpu/gpu_detect.cu gpu/gpu_secp256k1.cu gpu/gpu_hash160.cu \
+    GPU_SRCS = gpu/gpu_detect.cu gpu/gpu_secp256k1.cu \
                gpu/gpu_hashtable.cu gpu/gpu_search.cu
     GPU_OBJS = $(GPU_SRCS:.cu=.o)
 else

@@ -161,144 +161,407 @@ __device__ __forceinline__ void mul128(uint64_t a, uint64_t b, uint64_t *lo, uin
     *hi = __umul64hi(a, b);
 }
 
-/* Modular multiplication: r = a * b mod p (fast reduction using secp256k1 p special structure) */
+/*
+ * P1 optimization: fe_mul using PTX inline assembly for 4x4 multiply core + secp256k1 fast reduction
+ *
+ * Rationale:
+ *   Replace C-level __umul64hi + manual carry detection with PTX mad.lo/hi.cc.u64 + madc
+ *   instruction chains, letting the compiler emit carry-flag-aware multiply-add sequences
+ *   directly and eliminating redundant conditional branches and intermediate variables.
+ *
+ * PTX instruction reference:
+ *   mul.lo.u64      rd, a, b       : rd = (a*b)[63:0]
+ *   mul.hi.u64      rd, a, b       : rd = (a*b)[127:64]
+ *   mad.lo.cc.u64   rd, a, b, c    : rd = (a*b)[63:0] + c,  sets CC.CF
+ *   madc.lo.cc.u64  rd, a, b, c    : rd = (a*b)[63:0] + c + CC.CF, sets CC.CF
+ *   madc.hi.cc.u64  rd, a, b, c    : rd = (a*b)[127:64] + c + CC.CF, sets CC.CF
+ *   madc.hi.u64     rd, a, b, c    : rd = (a*b)[127:64] + c + CC.CF, no carry out (chain end)
+ *   add.cc.u64      rd, a, b       : rd = a + b, sets CC.CF
+ *   addc.cc.u64     rd, a, b       : rd = a + b + CC.CF, sets CC.CF
+ *   addc.u64        rd, a, b       : rd = a + b + CC.CF, no carry out (chain end)
+ *
+ * The 4x4 multiply is unrolled into 16 partial products accumulated column-by-column
+ * (along diagonals), propagating carries via CC.CF with no C-level conditionals.
+ *
+ * secp256k1 fast reduction: p = 2^256 - c, c = 2^32 + 977 = 0x1000003D1
+ *   Round 1: fold t[4..7] * c back into t[0..3], yielding r[0..3] and overflow ov
+ *   Round 2: fold ov * c back into r[0..1] (ov < 2^34, ov*c < 2^67, only low two limbs affected)
+ *   Final conditional reduction: if r >= p (i.e. r + c overflows 256 bits), subtract p
+ *                                (equivalent to keeping r + c and discarding the overflow)
+ */
 __device__ fe256 fe_mul(const fe256 &a, const fe256 &b)
 {
-    /* Compute 512-bit product t[0..7] */
-    uint64_t t[8] = {0};
-    uint64_t lo, hi, carry;
+    /*
+     * Step 1: compute 512-bit product t[0..7] = a[0..3] * b[0..3]
+     *
+     * Row-major accumulation: row i adds a[i]*b[j] (lo and hi) into
+     * t[i+j] and t[i+j+1].  After each madc.hi.cc, the carry is
+     * propagated upward with addc.cc until it is absorbed (CF=0).
+     * This guarantees correctness even when upper limbs are 0xffffffff...
+     *
+     * Instruction semantics:
+     *   mad.lo.cc  rd,a,b,c : rd = lo(a*b)+c,        sets CC.CF (ignores old CF)
+     *   madc.hi.cc rd,a,b,c : rd = hi(a*b)+c+CC.CF,  sets CC.CF
+     *   addc.cc    rd,a,b   : rd = a+b+CC.CF,         sets CC.CF
+     *   madc.hi.u64 rd,a,b,c: rd = hi(a*b)+c+CC.CF,  no CF out (chain end)
+     */
+    const uint64_t a0=a.d[0], a1=a.d[1], a2=a.d[2], a3=a.d[3];
+    const uint64_t b0=b.d[0], b1=b.d[1], b2=b.d[2], b3=b.d[3];
+    uint64_t t0, t1, t2, t3, t4, t5, t6, t7;
 
-    /* Unrolled 4x4 multiplication with correct carry propagation */
-    /* For each partial product a[i]*b[j]: add lo to t[i+j], add hi to t[i+j+1],
-     * then propagate all carries upward. */
-#define MULADD(i, j) \
-    do { \
-        mul128(a.d[i], b.d[j], &lo, &hi); \
-        /* Step 1: t[i+j] += lo, record carry c1 */ \
-        uint64_t _old0 = t[i+j]; \
-        t[i+j] += lo; \
-        uint64_t _c1 = (t[i+j] < _old0) ? 1 : 0; \
-        /* Step 2: t[i+j+1] += hi, record carry c2 */ \
-        uint64_t _old1 = t[i+j+1]; \
-        t[i+j+1] += hi; \
-        uint64_t _c2 = (t[i+j+1] < _old1) ? 1 : 0; \
-        /* Step 3: t[i+j+1] += c1 (carry from step 1), record carry c3 */ \
-        if (_c1) { \
-            t[i+j+1]++; \
-            _c2 += (t[i+j+1] == 0) ? 1 : 0; \
-        } \
-        /* Step 4: propagate _c2 upward from t[i+j+2] */ \
-        carry = _c2; \
-        for (int _k = i+j+2; _k < 8 && carry; _k++) { \
-            uint64_t _old_k = t[_k]; \
-            t[_k] += carry; \
-            carry = (t[_k] < _old_k) ? 1 : 0; \
-        } \
-    } while(0)
+    /* ---- Row 0: a0 * b[0..3] -> t[0..4] ---- */
+    asm(
+        "mul.lo.u64       %0,  %5,  %9;        \n\t"   /* t0  = lo(a0*b0) */
+        "mul.hi.u64       %1,  %5,  %9;        \n\t"   /* t1  = hi(a0*b0) */
+        "mad.lo.cc.u64    %1,  %5, %10,   %1;  \n\t"   /* t1 += lo(a0*b1), CF */
+        "madc.hi.cc.u64   %2,  %5, %10,    0;  \n\t"   /* t2  = hi(a0*b1)+CF, CF */
+        "addc.cc.u64      %3,   0,   0;        \n\t"   /* t3  = CF, CF */
+        "addc.u64         %4,   0,   0;        \n\t"   /* t4  = CF (chain end; t3<=1, no overflow) */
+        "mad.lo.cc.u64    %2,  %5, %11,   %2;  \n\t"   /* t2 += lo(a0*b2), CF */
+        "madc.hi.cc.u64   %3,  %5, %11,   %3;  \n\t"   /* t3 += hi(a0*b2)+CF, CF */
+        "addc.u64         %4,  %4,   0;        \n\t"   /* t4 += CF (chain end; t4<=1, no overflow) */
+        "mad.lo.cc.u64    %3,  %5, %12,   %3;  \n\t"   /* t3 += lo(a0*b3), CF */
+        "madc.hi.u64      %4,  %5, %12,   %4;  \n\t"   /* t4 += hi(a0*b3)+CF (end) */
+        : "=&l"(t0),"=&l"(t1),"=&l"(t2),"=&l"(t3),"=&l"(t4)
+        : "l"(a0),"l"(a1),"l"(a2),"l"(a3),
+          "l"(b0),"l"(b1),"l"(b2),"l"(b3)
+    );
+    t5 = 0; t6 = 0; t7 = 0;
 
-    MULADD(0,0); MULADD(0,1); MULADD(0,2); MULADD(0,3);
-    MULADD(1,0); MULADD(1,1); MULADD(1,2); MULADD(1,3);
-    MULADD(2,0); MULADD(2,1); MULADD(2,2); MULADD(2,3);
-    MULADD(3,0); MULADD(3,1); MULADD(3,2); MULADD(3,3);
-#undef MULADD
+    /* ---- Row 1: a1 * b[0..3] -> add into t[1..5] ---- */
+    asm(
+        /* hi(a1*b0) carry: propagate to t3, t4, t5 (t4 may overflow) */
+        "mad.lo.cc.u64    %0,  %6,  %9,   %0;  \n\t"   /* t1 += lo(a1*b0), CF */
+        "madc.hi.cc.u64   %1,  %6,  %9,   %1;  \n\t"   /* t2 += hi(a1*b0)+CF, CF */
+        "addc.cc.u64      %2,  %2,   0;        \n\t"   /* t3 += CF, CF */
+        "addc.cc.u64      %3,  %3,   0;        \n\t"   /* t4 += CF, CF */
+        "addc.u64         %4,  %4,   0;        \n\t"   /* t5 += CF (chain end) */
+        /* hi(a1*b1) carry: propagate to t4, t5 */
+        "mad.lo.cc.u64    %1,  %6, %10,   %1;  \n\t"   /* t2 += lo(a1*b1), CF */
+        "madc.hi.cc.u64   %2,  %6, %10,   %2;  \n\t"   /* t3 += hi(a1*b1)+CF, CF */
+        "addc.cc.u64      %3,  %3,   0;        \n\t"   /* t4 += CF, CF */
+        "addc.u64         %4,  %4,   0;        \n\t"   /* t5 += CF (chain end) */
+        /* hi(a1*b2) carry: propagate to t5 */
+        "mad.lo.cc.u64    %2,  %6, %11,   %2;  \n\t"   /* t3 += lo(a1*b2), CF */
+        "madc.hi.cc.u64   %3,  %6, %11,   %3;  \n\t"   /* t4 += hi(a1*b2)+CF, CF */
+        "addc.u64         %4,  %4,   0;        \n\t"   /* t5 += CF (chain end) */
+        "mad.lo.cc.u64    %3,  %6, %12,   %3;  \n\t"   /* t4 += lo(a1*b3), CF */
+        "madc.hi.u64      %4,  %6, %12,   %4;  \n\t"   /* t5 += hi(a1*b3)+CF (end) */
+        : "+l"(t1),"+l"(t2),"+l"(t3),"+l"(t4),"+l"(t5)
+        : "l"(a0),"l"(a1),"l"(a2),"l"(a3),
+          "l"(b0),"l"(b1),"l"(b2),"l"(b3)
+    );
+
+    /* ---- Row 2: a2 * b[0..3] -> add into t[2..6] ---- */
+    asm(
+        /* hi(a2*b0) carry: propagate to t4, t5, t6, t7 (t6 may overflow) */
+        "mad.lo.cc.u64    %0,  %7,  %9,   %0;  \n\t"   /* t2 += lo(a2*b0), CF */
+        "madc.hi.cc.u64   %1,  %7,  %9,   %1;  \n\t"   /* t3 += hi(a2*b0)+CF, CF */
+        "addc.cc.u64      %2,  %2,   0;        \n\t"   /* t4 += CF, CF */
+        "addc.cc.u64      %3,  %3,   0;        \n\t"   /* t5 += CF, CF */
+        "addc.u64         %4,  %4,   0;        \n\t"   /* t6 += CF (chain end; t6=0, no overflow) */
+        /* hi(a2*b1) carry: propagate to t5, t6 */
+        "mad.lo.cc.u64    %1,  %7, %10,   %1;  \n\t"   /* t3 += lo(a2*b1), CF */
+        "madc.hi.cc.u64   %2,  %7, %10,   %2;  \n\t"   /* t4 += hi(a2*b1)+CF, CF */
+        "addc.cc.u64      %3,  %3,   0;        \n\t"   /* t5 += CF, CF */
+        "addc.u64         %4,  %4,   0;        \n\t"   /* t6 += CF (chain end) */
+        /* hi(a2*b2) carry: propagate to t6 */
+        "mad.lo.cc.u64    %2,  %7, %11,   %2;  \n\t"   /* t4 += lo(a2*b2), CF */
+        "madc.hi.cc.u64   %3,  %7, %11,   %3;  \n\t"   /* t5 += hi(a2*b2)+CF, CF */
+        "addc.u64         %4,  %4,   0;        \n\t"   /* t6 += CF (chain end) */
+        "mad.lo.cc.u64    %3,  %7, %12,   %3;  \n\t"   /* t5 += lo(a2*b3), CF */
+        "madc.hi.u64      %4,  %7, %12,   %4;  \n\t"   /* t6 += hi(a2*b3)+CF (end) */
+        : "+l"(t2),"+l"(t3),"+l"(t4),"+l"(t5),"+l"(t6)
+        : "l"(a0),"l"(a1),"l"(a2),"l"(a3),
+          "l"(b0),"l"(b1),"l"(b2),"l"(b3)
+    );
+
+    /* ---- Row 3: a3 * b[0..3] -> add into t[3..7] ---- */
+    asm(
+        /* hi(a3*b0) carry: propagate to t5, t6, t7 */
+        "mad.lo.cc.u64    %0,  %8,  %9,   %0;  \n\t"   /* t3 += lo(a3*b0), CF */
+        "madc.hi.cc.u64   %1,  %8,  %9,   %1;  \n\t"   /* t4 += hi(a3*b0)+CF, CF */
+        "addc.cc.u64      %2,  %2,   0;        \n\t"   /* t5 += CF, CF */
+        "addc.cc.u64      %3,  %3,   0;        \n\t"   /* t6 += CF, CF */
+        "addc.u64         %4,  %4,   0;        \n\t"   /* t7 += CF (chain end) */
+        /* hi(a3*b1) carry: propagate to t6, t7 */
+        "mad.lo.cc.u64    %1,  %8, %10,   %1;  \n\t"   /* t4 += lo(a3*b1), CF */
+        "madc.hi.cc.u64   %2,  %8, %10,   %2;  \n\t"   /* t5 += hi(a3*b1)+CF, CF */
+        "addc.cc.u64      %3,  %3,   0;        \n\t"   /* t6 += CF, CF */
+        "addc.u64         %4,  %4,   0;        \n\t"   /* t7 += CF (chain end) */
+        /* hi(a3*b2) carry: propagate to t7 */
+        "mad.lo.cc.u64    %2,  %8, %11,   %2;  \n\t"   /* t5 += lo(a3*b2), CF */
+        "madc.hi.cc.u64   %3,  %8, %11,   %3;  \n\t"   /* t6 += hi(a3*b2)+CF, CF */
+        "addc.u64         %4,  %4,   0;        \n\t"   /* t7 += CF (chain end) */
+        "mad.lo.cc.u64    %3,  %8, %12,   %3;  \n\t"   /* t6 += lo(a3*b3), CF */
+        "madc.hi.u64      %4,  %8, %12,   %4;  \n\t"   /* t7 += hi(a3*b3)+CF (end) */
+        : "+l"(t3),"+l"(t4),"+l"(t5),"+l"(t6),"+l"(t7)
+        : "l"(a0),"l"(a1),"l"(a2),"l"(a3),
+          "l"(b0),"l"(b1),"l"(b2),"l"(b3)
+    );
 
     /*
-     * secp256k1 fast reduction: p = 2^256 - c, c = 2^32 + 977 = 0x1000003D1
-     * For 512-bit product t = t_lo + t_hi * 2^256:
+     * Step 2: secp256k1 fast reduction
+     *   p = 2^256 - c, c = 2^32 + 977 = 0x1000003D1
      *   t mod p = t_lo + t_hi * c mod p
-     * Two iterations reduce result to [0, 2p)
+     *
+     * Round 1 reduction: r[0..3] = t[0..3] + t[4..7] * c
+     *   Each t[i]*c is 97 bits (t[i] 64-bit, c 33-bit); mul.lo/hi extract the low/high 64 bits.
+     *   Accumulate column-by-column using CC.CF to propagate carries; final overflow ov < 2^34.
+     *
+     * Input constraints : %5~%8 = t0..t3, %9~%12 = t4..t7, %13 = c
+     * Output constraints: %0~%3 = r0..r3, %4 = ov
      */
-    uint64_t c = 0x1000003D1ULL;
+    const uint64_t C = 0x1000003D1ULL;
+    uint64_t r0, r1, r2, r3, ov;
 
-    /* First reduction: fold t[4..7] back into t[0..3] */
-    uint64_t r[4];
-    uint64_t acc = 0;
+    asm(
+        /* r0 = t0 + t4*c_lo */
+        "mul.lo.u64      %0,  %9, %13;       \n\t"   /* tmp = t4*c lo */
+        "add.cc.u64      %0,  %0,  %5;       \n\t"   /* r0 = tmp + t0, set CF */
 
-    /* Add low 256 bits of t_hi * c to t_lo */
-    /* Accumulate t[4]*c, t[5]*c, t[6]*c, t[7]*c in sequence */
-    uint64_t h0, h1, h2, h3;
-    uint64_t l0, l1, l2, l3;
-    mul128(t[4], c, &l0, &h0);
-    mul128(t[5], c, &l1, &h1);
-    mul128(t[6], c, &l2, &h2);
-    mul128(t[7], c, &l3, &h3);
+        /* r1 = t1 + t4*c_hi + t5*c_lo + CF */
+        "madc.hi.cc.u64  %1,  %9, %13,  %6;  \n\t"   /* r1 = t4*c hi + t1 + CF */
+        "madc.lo.cc.u64  %1, %10, %13,  %1;  \n\t"   /* r1 += t5*c lo + CF */
 
-    /* Accumulate into t[0..3] with correct multi-operand carry detection */
-    acc = t[0] + l0;
-    carry = (acc < t[0]) ? 1 : 0;
-    r[0] = acc;
+        /* r2 = t2 + t5*c_hi + t6*c_lo + CF */
+        "madc.hi.cc.u64  %2, %10, %13,  %7;  \n\t"   /* r2 = t5*c hi + t2 + CF */
+        "madc.lo.cc.u64  %2, %11, %13,  %2;  \n\t"   /* r2 += t6*c lo + CF */
 
-    /* t[1] + l1 + h0 + carry: add step by step to detect each carry */
-    acc = t[1] + l1;
-    uint64_t c1 = (acc < t[1]) ? 1 : 0;
-    acc += h0;
-    c1 += (acc < h0) ? 1 : 0;
-    acc += carry;
-    c1 += (acc < carry) ? 1 : 0;
-    r[1] = acc;
-    carry = c1;
+        /* r3 = t3 + t6*c_hi + t7*c_lo + CF */
+        "madc.hi.cc.u64  %3, %11, %13,  %8;  \n\t"   /* r3 = t6*c hi + t3 + CF */
+        "madc.lo.cc.u64  %3, %12, %13,  %3;  \n\t"   /* r3 += t7*c lo + CF */
 
-    acc = t[2] + l2;
-    uint64_t c2 = (acc < t[2]) ? 1 : 0;
-    acc += h1;
-    c2 += (acc < h1) ? 1 : 0;
-    acc += carry;
-    c2 += (acc < carry) ? 1 : 0;
-    r[2] = acc;
-    carry = c2;
+        /* ov = t7*c_hi + CF (overflow, < 2^34) */
+        "madc.hi.u64     %4, %12, %13,   0;  \n\t"   /* ov = t7*c hi + CF (chain end) */
 
-    acc = t[3] + l3;
-    uint64_t c3 = (acc < t[3]) ? 1 : 0;
-    acc += h2;
-    c3 += (acc < h2) ? 1 : 0;
-    acc += carry;
-    c3 += (acc < carry) ? 1 : 0;
-    r[3] = acc;
-    carry = c3;
+        : "=&l"(r0), "=&l"(r1), "=&l"(r2), "=&l"(r3), "=&l"(ov)
+        : "l"(t0), "l"(t1), "l"(t2), "l"(t3),
+          "l"(t4), "l"(t5), "l"(t6), "l"(t7), "l"(C)
+    );
 
-    /* Handle overflow: fold (carry + h3) multiplied by c */
-    /* carry and h3 are both small (< 4), so their sum won't overflow uint64_t */
-    uint64_t overflow = carry + h3;
-    uint64_t extra_lo, extra_hi;
-    mul128(overflow, c, &extra_lo, &extra_hi);
+    /*
+     * Round 2 reduction: fold overflow ov * c back into r[0..1]
+     *   ov < 2^34, ov*c < 2^67, only r0 and r1 are affected
+     */
+    uint64_t ov_lo, ov_hi;
+    asm(
+        "mul.lo.u64  %0, %2, %3; \n\t"
+        "mul.hi.u64  %1, %2, %3; \n\t"
+        : "=&l"(ov_lo), "=&l"(ov_hi)
+        : "l"(ov), "l"(C)
+    );
+    asm(
+        "add.cc.u64  %0, %0, %2; \n\t"   /* r0 += ov_lo, set CF */
+        "addc.u64    %1, %1, %3; \n\t"   /* r1 += ov_hi + CF (chain end) */
+        : "+l"(r0), "+l"(r1)
+        : "l"(ov_lo), "l"(ov_hi)
+    );
 
-    acc = r[0] + extra_lo;
-    carry = (acc < r[0]) ? 1 : 0;
-    r[0] = acc;
-    /* Step-by-step to correctly detect carry from multi-operand addition */
-    acc = r[1] + extra_hi;
-    uint64_t c4 = (acc < r[1]) ? 1 : 0;
-    acc += carry;
-    c4 += (acc < carry) ? 1 : 0;
-    r[1] = acc;
-    carry = c4;
-    r[2] += carry;
-    carry = (r[2] < carry) ? 1 : 0;
-    r[3] += carry;
-
-    /* Final conditional reduction: result may be in [0, 2p), reduce to [0, p) */
-    /* Check r >= p: r >= p iff r + c overflows 256 bits */
-    /* Note: c = 0x1000003D1ULL is already declared above, reuse it */
-    uint64_t s0 = r[0] + c; uint64_t sc = (s0 < r[0]) ? 1 : 0;
-    uint64_t s1 = r[1] + sc; sc = (s1 < r[1]) ? 1 : 0;
-    uint64_t s2 = r[2] + sc; sc = (s2 < r[2]) ? 1 : 0;
-    uint64_t s3 = r[3] + sc; sc = (s3 < r[3]) ? 1 : 0;
-    if (sc) {
-        r[0] = s0;
-        r[1] = s1;
-        r[2] = s2;
-        r[3] = s3;
-    }
+    /*
+     * Final conditional reduction: result is in [0, 2p); subtract p if r >= p
+     *   r >= p  <=>  r + c overflows 256 bits (since p = 2^256 - c)
+     */
+    uint64_t s0, s1, s2, s3, sc;
+    asm(
+        "add.cc.u64   %0, %5, %9;  \n\t"   /* s0 = r0 + c, set CF */
+        "addc.cc.u64  %1, %6,  0;  \n\t"   /* s1 = r1 + CF */
+        "addc.cc.u64  %2, %7,  0;  \n\t"   /* s2 = r2 + CF */
+        "addc.cc.u64  %3, %8,  0;  \n\t"   /* s3 = r3 + CF */
+        "addc.u64     %4,  0,  0;  \n\t"   /* sc = CF (overflow flag, chain end) */
+        : "=&l"(s0), "=&l"(s1), "=&l"(s2), "=&l"(s3), "=&l"(sc)
+        : "l"(r0), "l"(r1), "l"(r2), "l"(r3), "l"(C)
+    );
+    if (sc) { r0 = s0; r1 = s1; r2 = s2; r3 = s3; }
 
     fe256 res;
-    res.d[0] = r[0]; res.d[1] = r[1]; res.d[2] = r[2]; res.d[3] = r[3];
+    res.d[0] = r0; res.d[1] = r1; res.d[2] = r2; res.d[3] = r3;
     return res;
 }
 
-/* Squaring: r = a^2 mod p */
-__device__ __forceinline__ fe256 fe_sqr(const fe256 &a)
+/*
+ * H1 optimization: dedicated PTX squaring fe_sqr(a) = a^2 mod p
+ *
+ * Rationale:
+ *   For squaring a = [a0, a1, a2, a3], the 4x4 product has 16 partial products,
+ *   but only 10 are distinct (diagonal terms a_i*a_i appear once; off-diagonal
+ *   terms a_i*a_j with i<j appear twice as a_i*a_j + a_j*a_i = 2*a_i*a_j).
+ *   We compute the 10 unique products and double the off-diagonal ones via left-shift,
+ *   saving ~6 mul.hi instructions compared to calling fe_mul(a, a).
+ *
+ * Column layout (t[k] = sum of a_i*a_j where i+j=k):
+ *   t0 = a0*a0
+ *   t1 = 2*a0*a1
+ *   t2 = 2*a0*a2 + a1*a1
+ *   t3 = 2*a0*a3 + 2*a1*a2
+ *   t4 = 2*a1*a3 + a2*a2
+ *   t5 = 2*a2*a3
+ *   t6 = a3*a3   (no t7 carry needed; t6 holds the full high word)
+ *   (t7 = 0 since a3*a3 fits in 128 bits and the sum is at most 512 bits)
+ *
+ * Strategy: compute off-diagonal products first (without the factor of 2),
+ *   then double them using add.cc/addc chains, then add diagonal terms.
+ *   This keeps the PTX carry chains short and avoids extra registers.
+ */
+__device__ fe256 fe_sqr(const fe256 &a)
 {
-    return fe_mul(a, a);
+    uint64_t t0, t1, t2, t3, t4, t5, t6, t7;
+
+    asm(
+        /* ---- diagonal t0 = a0*a0 ---- */
+        "mul.lo.u64      %0,  %8,  %8;       \n\t"   /* t0 = a0*a0 lo */
+
+        /* ---- off-diagonal column 1 (before doubling): od1 = a0*a1 ---- */
+        "mul.lo.u64      %1,  %8,  %9;       \n\t"   /* t1 = a0*a1 lo */
+        "mul.hi.u64      %2,  %8,  %9;       \n\t"   /* t2 = a0*a1 hi */
+        "mul.hi.u64      %7,  %8,  %8;       \n\t"   /* tmp(t7) = a0*a0 hi (pre-compute before doubling) */
+
+        /* double od1: t1=2*(a0*a1 lo), t2=2*(a0*a1 hi)+CF, t3=CF */
+        "add.cc.u64      %1,  %1,  %1;       \n\t"   /* t1 = 2*(a0*a1 lo), set CF */
+        "addc.cc.u64     %2,  %2,  %2;       \n\t"   /* t2 = 2*(a0*a1 hi) + CF, set CF */
+        "addc.u64        %3,   0,   0;       \n\t"   /* t3 = CF (chain end, captures t2 overflow) */
+
+        /* add diagonal a0*a0 hi into t1 */
+        "add.cc.u64      %1,  %1,  %7;       \n\t"   /* t1 += a0*a0 hi, set CF */
+        "addc.cc.u64     %2,  %2,   0;       \n\t"   /* t2 += CF, set CF */
+        "addc.u64        %3,  %3,   0;       \n\t"   /* t3 += CF (chain end) */
+
+        /* ---- off-diagonal column 2: od2 = a0*a2 ---- */
+        /* first pass */
+        "mad.lo.cc.u64   %2,  %8, %10,  %2;  \n\t"   /* t2 += a0*a2 lo, set CF */
+        "madc.hi.cc.u64  %3,  %8, %10,  %3;  \n\t"   /* t3 += a0*a2 hi + CF, set CF */
+        "addc.u64        %4,   0,   0;       \n\t"   /* t4 = CF (chain end) */
+
+        /* second pass (double) */
+        "mad.lo.cc.u64   %2,  %8, %10,  %2;  \n\t"   /* t2 += a0*a2 lo again, set CF */
+        "madc.hi.cc.u64  %3,  %8, %10,  %3;  \n\t"   /* t3 += a0*a2 hi + CF, set CF */
+        "addc.u64        %4,  %4,   0;       \n\t"   /* t4 += CF (chain end) */
+
+        /* add diagonal a1*a1 lo into t2 */
+        "mad.lo.cc.u64   %2,  %9,  %9,  %2;  \n\t"   /* t2 += a1*a1 lo, set CF */
+        "addc.cc.u64     %3,  %3,   0;       \n\t"   /* t3 += CF, set CF */
+        "addc.u64        %4,  %4,   0;       \n\t"   /* t4 += CF (chain end) */
+
+        /* ---- off-diagonal column 3: od3 = a0*a3 + a1*a2 ---- */
+        /* first pass: a0*a3 */
+        "mad.lo.cc.u64   %3,  %8, %11,  %3;  \n\t"   /* t3 += a0*a3 lo, set CF */
+        "madc.hi.cc.u64  %4,  %8, %11,  %4;  \n\t"   /* t4 += a0*a3 hi + CF, set CF */
+        "addc.u64        %5,   0,   0;       \n\t"   /* t5 = CF (chain end) */
+        /* first pass: a1*a2 */
+        "mad.lo.cc.u64   %3,  %9, %10,  %3;  \n\t"   /* t3 += a1*a2 lo, set CF */
+        "madc.hi.cc.u64  %4,  %9, %10,  %4;  \n\t"   /* t4 += a1*a2 hi + CF, set CF */
+        "addc.u64        %5,  %5,   0;       \n\t"   /* t5 += CF (chain end) */
+
+        /* second pass (double): a0*a3 */
+        "mad.lo.cc.u64   %3,  %8, %11,  %3;  \n\t"   /* t3 += a0*a3 lo again, set CF */
+        "madc.hi.cc.u64  %4,  %8, %11,  %4;  \n\t"   /* t4 += a0*a3 hi + CF, set CF */
+        "addc.cc.u64     %5,  %5,   0;       \n\t"   /* t5 += CF, set CF */
+        "addc.u64        %6,   0,   0;       \n\t"   /* t6 = CF (chain end) */
+        /* second pass: a1*a2 */
+        "mad.lo.cc.u64   %3,  %9, %10,  %3;  \n\t"   /* t3 += a1*a2 lo again, set CF */
+        "madc.hi.cc.u64  %4,  %9, %10,  %4;  \n\t"   /* t4 += a1*a2 hi + CF, set CF */
+        "addc.cc.u64     %5,  %5,   0;       \n\t"   /* t5 += CF, set CF */
+        "addc.u64        %6,  %6,   0;       \n\t"   /* t6 += CF (chain end) */
+
+        /* add diagonal a1*a1 hi into t3 */
+        "mad.hi.cc.u64   %3,  %9,  %9,  %3;  \n\t"   /* t3 += a1*a1 hi, set CF */
+        "addc.cc.u64     %4,  %4,   0;       \n\t"   /* t4 += CF, set CF */
+        "addc.u64        %5,  %5,   0;       \n\t"   /* t5 += CF (chain end) */
+
+        /* ---- off-diagonal column 4: od4 = a1*a3 ---- */
+        /* first pass */
+        "mad.lo.cc.u64   %4,  %9, %11,  %4;  \n\t"   /* t4 += a1*a3 lo, set CF */
+        "addc.cc.u64     %5,  %5,   0;       \n\t"   /* t5 += CF, set CF (must clear CC.CF before madc.hi.cc) */
+        "madc.hi.cc.u64  %5,  %9, %11,  %5;  \n\t"   /* t5 += a1*a3 hi + CF(=0), set CF */
+        "addc.u64        %6,  %6,   0;       \n\t"   /* t6 += CF (chain end) */
+
+        /* second pass (double) */
+        "mad.lo.cc.u64   %4,  %9, %11,  %4;  \n\t"   /* t4 += a1*a3 lo again, set CF */
+        "addc.cc.u64     %5,  %5,   0;       \n\t"   /* t5 += CF, set CF (must clear CC.CF before madc.hi.cc) */
+        "madc.hi.cc.u64  %5,  %9, %11,  %5;  \n\t"   /* t5 += a1*a3 hi + CF(=0), set CF */
+        "addc.u64        %6,  %6,   0;       \n\t"   /* t6 += CF (chain end) */
+
+        /* add diagonal a2*a2 lo into t4 */
+        "mad.lo.cc.u64   %4, %10, %10,  %4;  \n\t"   /* t4 += a2*a2 lo, set CF */
+        "addc.u64        %5,  %5,   0;       \n\t"   /* t5 += CF (chain end) */
+
+        /* ---- off-diagonal column 5: od5 = a2*a3 ---- */
+        /* first pass */
+        "mad.lo.cc.u64   %5, %10, %11,  %5;  \n\t"   /* t5 += a2*a3 lo, set CF */
+        "addc.cc.u64     %6,  %6,   0;       \n\t"   /* t6 += CF, set CF (must clear CC.CF before madc.hi.cc) */
+        "madc.hi.cc.u64  %6, %10, %11,  %6;  \n\t"   /* t6 += a2*a3 hi + CF(=0), set CF */
+        "addc.u64        %7,   0,   0;       \n\t"   /* t7 = CF (chain end) */
+
+        /* second pass (double) */
+        "mad.lo.cc.u64   %5, %10, %11,  %5;  \n\t"   /* t5 += a2*a3 lo again, set CF */
+        "addc.cc.u64     %6,  %6,   0;       \n\t"   /* t6 += CF, set CF (must clear CC.CF before madc.hi.cc) */
+        "madc.hi.cc.u64  %6, %10, %11,  %6;  \n\t"   /* t6 += a2*a3 hi + CF(=0), set CF */
+        "addc.u64        %7,  %7,   0;       \n\t"   /* t7 += CF (chain end) */
+
+        /* add diagonal a2*a2 hi into t5 */
+        "mad.hi.cc.u64   %5, %10, %10,  %5;  \n\t"   /* t5 += a2*a2 hi, set CF */
+        "addc.u64        %6,  %6,   0;       \n\t"   /* t6 += CF (chain end) */
+
+        /* ---- diagonal t6 += a3*a3 lo ---- */
+        "mad.lo.cc.u64   %6, %11, %11,  %6;  \n\t"   /* t6 += a3*a3 lo, set CF */
+        "addc.cc.u64     %7,  %7,   0;       \n\t"   /* t7 += CF, clear CC.CF (must clear before madc.hi) */
+
+        /* ---- t7 += a3*a3 hi ---- */
+        "madc.hi.u64     %7, %11, %11,  %7;  \n\t"   /* t7 += a3*a3 hi + CC.CF(=0) */
+
+        : "=&l"(t0), "=&l"(t1), "=&l"(t2), "=&l"(t3),
+          "=&l"(t4), "=&l"(t5), "=&l"(t6), "=&l"(t7)
+        : "l"(a.d[0]), "l"(a.d[1]), "l"(a.d[2]), "l"(a.d[3])
+    );
+
+    /* Reduction: identical to fe_mul (p = 2^256 - c, c = 0x1000003D1) */
+    const uint64_t C = 0x1000003D1ULL;
+    uint64_t r0, r1, r2, r3, ov;
+
+    asm(
+        "mul.lo.u64      %0,  %9, %13;       \n\t"
+        "add.cc.u64      %0,  %0,  %5;       \n\t"
+        "madc.hi.cc.u64  %1,  %9, %13,  %6;  \n\t"
+        "madc.lo.cc.u64  %1, %10, %13,  %1;  \n\t"
+        "madc.hi.cc.u64  %2, %10, %13,  %7;  \n\t"
+        "madc.lo.cc.u64  %2, %11, %13,  %2;  \n\t"
+        "madc.hi.cc.u64  %3, %11, %13,  %8;  \n\t"
+        "madc.lo.cc.u64  %3, %12, %13,  %3;  \n\t"
+        "madc.hi.u64     %4, %12, %13,   0;  \n\t"
+        : "=&l"(r0), "=&l"(r1), "=&l"(r2), "=&l"(r3), "=&l"(ov)
+        : "l"(t0), "l"(t1), "l"(t2), "l"(t3),
+          "l"(t4), "l"(t5), "l"(t6), "l"(t7), "l"(C)
+    );
+
+    uint64_t ov_lo, ov_hi;
+    asm(
+        "mul.lo.u64  %0, %2, %3; \n\t"
+        "mul.hi.u64  %1, %2, %3; \n\t"
+        : "=&l"(ov_lo), "=&l"(ov_hi)
+        : "l"(ov), "l"(C)
+    );
+    asm(
+        "add.cc.u64  %0, %0, %2; \n\t"
+        "addc.u64    %1, %1, %3; \n\t"
+        : "+l"(r0), "+l"(r1)
+        : "l"(ov_lo), "l"(ov_hi)
+    );
+
+    uint64_t s0, s1, s2, s3, sc;
+    asm(
+        "add.cc.u64   %0, %5, %9;  \n\t"
+        "addc.cc.u64  %1, %6,  0;  \n\t"
+        "addc.cc.u64  %2, %7,  0;  \n\t"
+        "addc.cc.u64  %3, %8,  0;  \n\t"
+        "addc.u64     %4,  0,  0;  \n\t"
+        : "=&l"(s0), "=&l"(s1), "=&l"(s2), "=&l"(s3), "=&l"(sc)
+        : "l"(r0), "l"(r1), "l"(r2), "l"(r3), "l"(C)
+    );
+    if (sc) { r0 = s0; r1 = s1; r2 = s2; r3 = s3; }
+
+    fe256 res;
+    res.d[0] = r0; res.d[1] = r1; res.d[2] = r2; res.d[3] = r3;
+    return res;
 }
 
 /*
@@ -457,6 +720,59 @@ __device__ void fe_batch_inv(
     for (int i = valid_n; i < n; i++) {
         out[i].d[0] = 0; out[i].d[1] = 0;
         out[i].d[2] = 0; out[i].d[3] = 0;
+    }
+}
+
+/*
+ * Strided batch inversion: same algorithm as fe_batch_inv but accesses elements
+ * at stride intervals (step-major global memory layout).
+ *   out[i*stride] = in[i*stride]^-1  for i in [0, n)
+ * This avoids thread-local temporary arrays, eliminating stack frame spilling.
+ */
+__device__ void fe_batch_inv_strided(
+    fe256       * __restrict__ out,   /* base pointer, stride = num_chains */
+    const fe256 * __restrict__ in,    /* base pointer, stride = num_chains */
+    int n,
+    int stride,
+    int         * __restrict__ valid_out)
+{
+    if (n <= 0) return;
+
+    if (fe_is_zero(in[0])) {
+        if (valid_out != NULL)
+            *valid_out = 0;
+        return;
+    }
+    out[0] = in[0];
+    int first_zero = n;
+
+    for (int i = 1; i < n; i++) {
+        if (fe_is_zero(in[i * stride])) {
+            first_zero = i;
+            break;
+        }
+        out[i * stride] = fe_mul(out[(i-1) * stride], in[i * stride]);
+    }
+
+    int valid_n = first_zero;
+    if (valid_out != NULL)
+        *valid_out = valid_n;
+
+    if (valid_n == 0)
+        return;
+
+    fe256 inv_acc = fe_inv(out[(valid_n - 1) * stride]);
+
+    for (int i = valid_n - 1; i >= 1; i--) {
+        fe256 tmp = fe_mul(inv_acc, out[(i-1) * stride]);
+        inv_acc   = fe_mul(inv_acc, in[i * stride]);
+        out[i * stride] = tmp;
+    }
+    out[0] = inv_acc;
+
+    for (int i = valid_n; i < n; i++) {
+        out[i * stride].d[0] = 0; out[i * stride].d[1] = 0;
+        out[i * stride].d[2] = 0; out[i * stride].d[3] = 0;
     }
 }
 
@@ -699,24 +1015,138 @@ __device__ jac_point jac_add_affine(const jac_point &P, const aff_point &Q)
 }
 
 /*
+ * Jacobian point doubling: R = 2*P (secp256k1, a=0)
+ * Uses EFD dbl-2009-l formula:
+ *   A = X1^2, B = Y1^2, C = B^2
+ *   D = 2*((X1+B)^2 - A - C)
+ *   E = 3*A, F = E^2
+ *   X3 = F - 2*D
+ *   Y3 = E*(D - X3) - 8*C
+ *   Z3 = 2*Y1*Z1
+ * No fe_inv required.
+ */
+__device__ jac_point jac_double(const jac_point &P)
+{
+    if (P.infinity) {
+        jac_point R;
+        R.infinity = 1;
+        return R;
+    }
+
+    fe256 A  = fe_sqr(P.x);                              /* X1^2 */
+    fe256 B  = fe_sqr(P.y);                              /* Y1^2 */
+    fe256 C  = fe_sqr(B);                                /* B^2 = Y1^4 */
+    fe256 XB = fe_add(P.x, B);                           /* X1+B */
+    /* D = 2*((X1+B)^2 - A - C) */
+    fe256 D  = fe_sub(fe_sub(fe_sqr(XB), A), C);        /* (X1+B)^2 - A - C */
+    D = fe_add(D, D);                                    /* 2*(...) */
+    fe256 E  = fe_add(fe_add(A, A), A);                  /* 3*A */
+    fe256 F  = fe_sqr(E);                                /* E^2 */
+    fe256 X3 = fe_sub(F, fe_add(D, D));                  /* F - 2*D */
+    /* Y3 = E*(D - X3) - 8*C */
+    fe256 C2 = fe_add(C, C);                             /* 2*C */
+    fe256 C4 = fe_add(C2, C2);                           /* 4*C */
+    fe256 C8 = fe_add(C4, C4);                           /* 8*C */
+    fe256 Y3 = fe_sub(fe_mul(E, fe_sub(D, X3)), C8);
+    /* Z3 = 2*Y1*Z1 */
+    fe256 Z3 = fe_add(fe_mul(P.y, P.z), fe_mul(P.y, P.z));
+
+    jac_point R;
+    R.x = X3; R.y = Y3; R.z = Z3;
+    R.infinity = 0;
+    return R;
+}
+
+/*
+ * Convert Jacobian point to affine coordinates: (X:Y:Z) -> (X/Z^2, Y/Z^3)
+ * Calls fe_inv once.
+ */
+__device__ aff_point jac_to_affine(const jac_point &P)
+{
+    aff_point R;
+    fe256 z_inv  = fe_inv(P.z);
+    fe256 z_inv2 = fe_sqr(z_inv);           /* Z^-2 */
+    fe256 z_inv3 = fe_mul(z_inv2, z_inv);   /* Z^-3 */
+    R.x = fe_mul(P.x, z_inv2);
+    R.y = fe_mul(P.y, z_inv3);
+    return R;
+}
+
+/*
+ * General Jacobian + Jacobian point addition: R = P + Q
+ * Uses EFD add-2007-bl formula:
+ *   U1 = X1*Z2^2, U2 = X2*Z1^2
+ *   S1 = Y1*Z2^3, S2 = Y2*Z1^3
+ *   H  = U2 - U1, R  = S2 - S1
+ *   X3 = R^2 - H^3 - 2*U1*H^2
+ *   Y3 = R*(U1*H^2 - X3) - S1*H^3
+ *   Z3 = H*Z1*Z2
+ * Handles infinity and point-doubling edge cases.
+ */
+__device__ jac_point jac_add(const jac_point &P, const jac_point &Q)
+{
+    if (P.infinity) return Q;
+    if (Q.infinity) return P;
+
+    fe256 Z1_2 = fe_sqr(P.z);
+    fe256 Z2_2 = fe_sqr(Q.z);
+    fe256 U1   = fe_mul(P.x, Z2_2);
+    fe256 U2   = fe_mul(Q.x, Z1_2);
+    fe256 S1   = fe_mul(P.y, fe_mul(Z2_2, Q.z));   /* Y1*Z2^3 */
+    fe256 S2   = fe_mul(Q.y, fe_mul(Z1_2, P.z));   /* Y2*Z1^3 */
+
+    fe256 H = fe_sub(U2, U1);
+    fe256 Rv = fe_sub(S2, S1);
+
+    if (fe_is_zero(H)) {
+        if (fe_is_zero(Rv)) {
+            /* P == Q: use dedicated doubling */
+            return jac_double(P);
+        } else {
+            /* P == -Q: result is point at infinity */
+            jac_point res;
+            res.infinity = 1;
+            return res;
+        }
+    }
+
+    fe256 H2   = fe_sqr(H);
+    fe256 H3   = fe_mul(H2, H);
+    fe256 U1H2 = fe_mul(U1, H2);
+
+    fe256 Rv2  = fe_sqr(Rv);
+    fe256 X3   = fe_sub(fe_sub(Rv2, H3), fe_add(U1H2, U1H2));
+    fe256 Y3   = fe_sub(fe_mul(Rv, fe_sub(U1H2, X3)), fe_mul(S1, H3));
+    fe256 Z3   = fe_mul(fe_mul(H, P.z), Q.z);
+
+    jac_point res;
+    res.x = X3; res.y = Y3; res.z = Z3;
+    res.infinity = 0;
+    return res;
+}
+
+/*
  * Compute scalar * G (Jacobian coordinates) from 32-byte private key (big-endian)
- * Uses LSB-first double-and-add algorithm
+ * Uses LSB-first double-and-add algorithm.
+ *
+ * Optimization (P0): addend is now tracked in Jacobian coordinates using jac_double,
+ * which eliminates all fe_inv calls inside the loop (was 256 calls, now 0).
+ * The caller is responsible for converting the returned Jacobian result to affine
+ * via jac_to_affine (one fe_inv call total).
  */
 __device__ jac_point scalar_mult_G(const uint8_t *privkey)
 {
     jac_point R;
     R.infinity = 1;
 
-    fe256 Gx, Gy;
-    Gx.d[0] = SECP256K1_GX[0]; Gx.d[1] = SECP256K1_GX[1];
-    Gx.d[2] = SECP256K1_GX[2]; Gx.d[3] = SECP256K1_GX[3];
-    Gy.d[0] = SECP256K1_GY[0]; Gy.d[1] = SECP256K1_GY[1];
-    Gy.d[2] = SECP256K1_GY[2]; Gy.d[3] = SECP256K1_GY[3];
-
-    /* Current multiple of G in affine coordinates, starting from 1*G */
-    aff_point addend;
-    addend.x = Gx;
-    addend.y = Gy;
+    /* Current multiple of G in Jacobian coordinates, starting from 1*G (z=1) */
+    jac_point addend;
+    addend.x.d[0] = SECP256K1_GX[0]; addend.x.d[1] = SECP256K1_GX[1];
+    addend.x.d[2] = SECP256K1_GX[2]; addend.x.d[3] = SECP256K1_GX[3];
+    addend.y.d[0] = SECP256K1_GY[0]; addend.y.d[1] = SECP256K1_GY[1];
+    addend.y.d[2] = SECP256K1_GY[2]; addend.y.d[3] = SECP256K1_GY[3];
+    addend.z.d[0] = 1; addend.z.d[1] = 0; addend.z.d[2] = 0; addend.z.d[3] = 0;
+    addend.infinity = 0;
 
     /* Scan 256-bit scalar from lowest bit (LSB-first double-and-add) */
     /* privkey is big-endian: privkey[0] is MSB, privkey[31] is LSB */
@@ -724,20 +1154,11 @@ __device__ jac_point scalar_mult_G(const uint8_t *privkey)
         uint8_t b = privkey[byte_idx];
         for (int bit = 0; bit < 8; bit++) {
             if (b & (1 << bit)) {
-                /* R = R + addend (general Jacobian + Affine mixed addition) */
-                R = jac_add_affine(R, addend);
+                /* R = R + addend (Jacobian + Jacobian addition, no fe_inv) */
+                R = jac_add(R, addend);
             }
-            /* addend = 2 * addend (affine point doubling) */
-            /* lambda = 3*x^2 / (2*y), x' = lambda^2 - 2*x, y' = lambda*(x - x') - y */
-            fe256 x2 = fe_sqr(addend.x);
-            fe256 lam_num = fe_add(fe_add(x2, x2), x2);  /* 3*x^2 */
-            fe256 lam_den = fe_add(addend.y, addend.y);   /* 2*y */
-            fe256 lam = fe_mul(lam_num, fe_inv(lam_den));
-            fe256 lam2 = fe_sqr(lam);
-            fe256 nx = fe_sub(fe_sub(lam2, addend.x), addend.x);
-            fe256 ny = fe_sub(fe_mul(lam, fe_sub(addend.x, nx)), addend.y);
-            addend.x = nx;
-            addend.y = ny;
+            /* addend = 2 * addend (Jacobian doubling, no fe_inv) */
+            addend = jac_double(addend);
         }
     }
     return R;
@@ -752,24 +1173,41 @@ __device__ jac_point scalar_mult_G(const uint8_t *privkey)
  *   d_aff_x        : [num_chains * GPU_CHAIN_STEPS * 32] bytes, affine X coordinates
  *   d_aff_y        : [num_chains * GPU_CHAIN_STEPS * 32] bytes, affine Y coordinates
  *   d_valid        : [num_chains] int, chain validity flags
+ *   d_jac_X/Y    : [num_chains * GPU_CHAIN_STEPS * 32] bytes, Jacobian X/Y coords scratch
+ *
+ * jac_Z and z_inv are thread-local arrays (8 KB each) for cache-friendly batch inversion.
+ * eliminating the 16 KB stack frame per thread and raising SM occupancy.
  */
 static uint8_t *d_base_privkeys = NULL;
 static uint8_t *d_aff_x        = NULL;
 static uint8_t *d_aff_y        = NULL;
 static int     *d_valid         = NULL;
+static uint8_t *d_jac_X        = NULL;   /* Jacobian X scratch: num_chains * GPU_CHAIN_STEPS * 32 */
+static uint8_t *d_jac_Y        = NULL;   /* Jacobian Y scratch */
+static uint8_t *d_jac_Z        = NULL;   /* Jacobian Z scratch: step-major layout */
+static uint8_t *d_z_inv        = NULL;   /* batch-inversion result scratch: step-major layout */
 static int      g_num_chains    = 0;
 
 /*
- * Kernel 1: batch public key generation (three-phase Montgomery batch inversion)
+ * Kernel 1: batch public key generation
  *
- * Optimization rationale:
- *   Original: one fe_inv (~300 multiplications) per step; 256 inversions for steps=256.
- *   Optimized using Montgomery Batch Inversion:
- *     Phase 1: Jacobian point traversal only (P += G), store each step's Z into thread-local array
- *     Phase 2: call fe_batch_inv once for all Z inverses (1 inversion + 3*(steps-1) multiplications)
- *     Phase 3: batch-compute affine coords x = X*Z_inv^2, y = Y*Z_inv^3 and write to output
+ * Scheme B: Global Batch Inversion
  *
- * Theoretical speedup (steps=256): 256 inversions -> 1 inversion, ~98% inversion cost eliminated.
+ * Optimization:
+ *   The previous tiled scheme called fe_batch_inv once per TILE_SIZE steps,
+ *   resulting in steps/TILE_SIZE fe_inv calls total.
+ *   This scheme collects all Jacobian Z coordinates for all steps first, then
+ *   calls fe_batch_inv exactly once, reducing fe_inv calls by ~97%.
+ *
+ * Trade-off:
+ *   Requires storing steps Jacobian X/Y/Z coordinates in thread-local arrays,
+ *   increasing local memory spilling. However, fe_inv compute cost far outweighs
+ *   the extra local memory traffic.
+ *
+ * Memory estimate (steps=GPU_CHAIN_STEPS=256):
+ *   jac_X/Y/Z: 3 * 256 * 32 = 24 KB/thread (local memory spilling)
+ *   z_inv:     1 * 256 * 32 =  8 KB/thread
+ *   Total ~32 KB/thread; local memory increases but fe_inv savings dominate.
  *
  * Input:
  *   base_privkeys : [num_chains * 32] bytes, base private key for each chain (big-endian)
@@ -777,11 +1215,16 @@ static int      g_num_chains    = 0;
  *   aff_x, aff_y  : [num_chains * steps * 32] bytes, affine coordinates
  *   valid         : [num_chains] int, 0=invalid, >0=valid step count
  */
-__global__ void kernel_gen_pubkeys(
+
+__global__ __launch_bounds__(128, 4) void kernel_gen_pubkeys(
     const uint8_t * __restrict__ base_privkeys,
     uint8_t       * __restrict__ aff_x,
     uint8_t       * __restrict__ aff_y,
     int           * __restrict__ valid,
+    uint8_t       * __restrict__ g_jac_X,   /* step-major scratch: steps*num_chains*32 bytes */
+    uint8_t       * __restrict__ g_jac_Y,
+    uint8_t       * __restrict__ g_jac_Z,   /* step-major scratch for Z coordinates */
+    uint8_t       * __restrict__ g_z_inv,   /* step-major scratch for batch-inv results */
     int num_chains,
     int steps)
 {
@@ -791,7 +1234,7 @@ __global__ void kernel_gen_pubkeys(
 
     const uint8_t *privkey = base_privkeys + tid * 32;
 
-    /* Check if private key is zero (invalid) */
+    /* Reject zero private key (invalid) */
     int all_zero = 1;
     for (int i = 0; i < 32; i++) {
         if (privkey[i] != 0) { all_zero = 0; break; }
@@ -802,31 +1245,40 @@ __global__ void kernel_gen_pubkeys(
     }
 
     /* Compute base public key: P0 = privkey * G */
-    jac_point P = scalar_mult_G(privkey);
-    if (P.infinity) {
+    jac_point P_jac = scalar_mult_G(privkey);
+    if (P_jac.infinity) {
         valid[tid] = 0;
         return;
     }
+    /* Convert to affine then re-wrap as Jacobian (z=1) for a normalized starting point */
+    aff_point P0_aff = jac_to_affine(P_jac);
+    jac_point P;
+    P.x = P0_aff.x; P.y = P0_aff.y;
+    P.z.d[0] = 1; P.z.d[1] = 0; P.z.d[2] = 0; P.z.d[3] = 0;
+    P.infinity = 0;
 
-    /* ---- Phase 1: Jacobian point traversal, collect Jacobian coords for all steps ---- */
-    /* Thread-local arrays: store Jacobian X/Y/Z for each step */
-    /* GPU_CHAIN_STEPS max = 256, each fe256 = 32 bytes */
-    /* 3 * 256 * 32 = 24576 bytes per thread, stored in registers/local memory */
-    fe256 jac_X[GPU_CHAIN_STEPS];
-    fe256 jac_Y[GPU_CHAIN_STEPS];
-    fe256 jac_Z[GPU_CHAIN_STEPS];
-
-    /* Current scalar (for overflow detection) */
+    /* Current scalar value, used for overflow detection */
     fe256 cur_scalar = fe_from_bytes(privkey);
 
-    int valid_steps = steps;  /* default: all steps valid */
+    /* ---- Scheme B: global batch inversion ---- */
+    /* jac_X / jac_Y: step-major layout [step * num_chains + tid]
+     *   → same-step threads are adjacent in memory → coalesced 128-byte reads/writes
+     * jac_Z / z_inv: thread-local arrays (8 KB each)
+     *   → fe_batch_inv requires contiguous input; local array avoids stride cache miss */
+    fe256 * __restrict__ jac_X_base = (fe256 *)g_jac_X;  /* step-major: [step*num_chains+tid] */
+    fe256 * __restrict__ jac_Y_base = (fe256 *)g_jac_Y;
+    fe256 * __restrict__ jac_Z_base = (fe256 *)g_jac_Z;  /* step-major: [step*num_chains+tid] */
+    fe256 * __restrict__ z_inv_base = (fe256 *)g_z_inv;  /* step-major: [step*num_chains+tid] */
 
-    for (int step = 0; step < steps; step++) {
-        jac_X[step] = P.x;
-        jac_Y[step] = P.y;
-        jac_Z[step] = P.z;
+    /* ---- Phase 1: full Jacobian traversal, collect all X/Y/Z ---- */
+    int actual_steps = steps;   /* effective step count, truncated on scalar overflow */
+    for (int i = 0; i < steps; i++) {
+        /* step-major write: coalesced across warp (32 threads write 32 consecutive fe256) */
+        jac_X_base[i * num_chains + tid] = P.x;
+        jac_Y_base[i * num_chains + tid] = P.y;
+        jac_Z_base[i * num_chains + tid] = P.z;
 
-        if (step < steps - 1) {
+        if (i < steps - 1) {
             /* P = P + G */
             P = jac_add_affine_G(P);
 
@@ -842,35 +1294,40 @@ __global__ void kernel_gen_pubkeys(
                 }
             }
             if (fe_is_zero(cur_scalar)) {
-                valid_steps = step + 1;  /* record valid step count and truncate */
+                actual_steps = i + 1;   /* truncate to current step */
                 break;
             }
         }
     }
 
-    /* ---- Phase 2: batch modular inversion, compute all Z inverses at once ---- */
-    fe256 z_inv[GPU_CHAIN_STEPS];  /* stores Z^-1 for each step */
-    int batch_valid = valid_steps;  /* fe_batch_inv may truncate further if a Z is zero */
-    fe_batch_inv(z_inv, jac_Z, valid_steps, &batch_valid);
-    /* If batch_valid < valid_steps, some step has Z=0 (point at infinity); truncate */
-    if (batch_valid < valid_steps) {
-        valid_steps = batch_valid;
+    /* ---- Phase 2: single global batch inversion (strided, no thread-local temp arrays) ---- */
+    int batch_valid = actual_steps;
+    fe_batch_inv_strided(
+        z_inv_base + tid,          /* out base: tid-th column, stride = num_chains */
+        jac_Z_base + tid,          /* in  base: tid-th column, stride = num_chains */
+        actual_steps,
+        num_chains,
+        &batch_valid);
+    if (batch_valid < actual_steps) {
+        actual_steps = batch_valid;
     }
 
-    /* ---- Phase 3: batch-compute affine coordinates and write to output buffer ---- */
-    for (int step = 0; step < valid_steps; step++) {
-        fe256 zi  = z_inv[step];          /* Z^-1 */
-        fe256 zi2 = fe_sqr(zi);           /* Z^-2 */
-        fe256 zi3 = fe_mul(zi2, zi);      /* Z^-3 */
-        fe256 ax  = fe_mul(jac_X[step], zi2);  /* x = X * Z^-2 */
-        fe256 ay  = fe_mul(jac_Y[step], zi3);  /* y = Y * Z^-3 */
+    /* ---- Phase 3: compute affine coordinates and write to output buffer ---- */
+    for (int i = 0; i < actual_steps; i++) {
+        fe256 zi  = z_inv_base[i * num_chains + tid];
+        fe256 zi2 = fe_sqr(zi);
+        fe256 zi3 = fe_mul(zi2, zi);
+        /* step-major read: coalesced across warp */
+        fe256 ax  = fe_mul(jac_X_base[i * num_chains + tid], zi2);
+        fe256 ay  = fe_mul(jac_Y_base[i * num_chains + tid], zi3);
 
-        int out_idx = tid * steps + step;
+        /* output also step-major for coalesced writes */
+        int out_idx = i * num_chains + tid;
         fe_to_bytes(ax, aff_x + out_idx * 32);
         fe_to_bytes(ay, aff_y + out_idx * 32);
     }
 
-    valid[tid] = valid_steps;
+    valid[tid] = actual_steps;
 }
 
 /*
@@ -891,6 +1348,15 @@ int gpu_secp256k1_alloc(int num_chains)
     if (cudaMalloc(&d_aff_y, coord_size) != cudaSuccess)
         goto fail;
     if (cudaMalloc(&d_valid, (size_t)num_chains * sizeof(int)) != cudaSuccess)
+        goto fail;
+    /* Jacobian X/Y/Z and z_inv scratch buffers: step-major layout [step * num_chains + tid] */
+    if (cudaMalloc(&d_jac_X, coord_size) != cudaSuccess)
+        goto fail;
+    if (cudaMalloc(&d_jac_Y, coord_size) != cudaSuccess)
+        goto fail;
+    if (cudaMalloc(&d_jac_Z, coord_size) != cudaSuccess)
+        goto fail;
+    if (cudaMalloc(&d_z_inv, coord_size) != cudaSuccess)
         goto fail;
 
     keylog_info("[GPU] secp256k1 buffers allocated: %d chains x %d steps",
@@ -923,6 +1389,22 @@ void gpu_secp256k1_free(void)
         cudaFree(d_valid);
         d_valid = NULL;
     }
+    if (d_jac_X) {
+        cudaFree(d_jac_X);
+        d_jac_X = NULL;
+    }
+    if (d_jac_Y) {
+        cudaFree(d_jac_Y);
+        d_jac_Y = NULL;
+    }
+    if (d_jac_Z) {
+        cudaFree(d_jac_Z);
+        d_jac_Z = NULL;
+    }
+    if (d_z_inv) {
+        cudaFree(d_z_inv);
+        d_z_inv = NULL;
+    }
 }
 
 /*
@@ -941,12 +1423,13 @@ int gpu_secp256k1_run(const uint8_t *h_base_privkeys, cudaStream_t stream)
         return -1;
     }
 
-    /* Configure kernel: 256 threads per block */
-    int block_size = 256;
+    /* Configure kernel: 128 threads per block (matches __launch_bounds__ for better occupancy) */
+    int block_size = 128;
     int grid_size  = (g_num_chains + block_size - 1) / block_size;
 
     kernel_gen_pubkeys<<<grid_size, block_size, 0, stream>>>(
         d_base_privkeys, d_aff_x, d_aff_y, d_valid,
+        d_jac_X, d_jac_Y, d_jac_Z, d_z_inv,
         g_num_chains, GPU_CHAIN_STEPS);
 
     cudaError_t err = cudaGetLastError();

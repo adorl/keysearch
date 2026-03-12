@@ -39,20 +39,20 @@ static void format_mem(size_t bytes, char *buf, size_t buf_size)
 /*
  * Estimate VRAM required per batch (bytes):
  *   - GPU work buffer (pubkey affine coordinates): batch_size * 64 bytes (X+Y each 32 bytes)
- *   - Hash160 result buffer: batch_size * 2 * 20 bytes (compressed + uncompressed)
  *   - Hit result buffer: GPU_MAX_HITS * sizeof(gpu_hit_result_t)
  *   - Hash table: ht_capacity * 24 bytes (fp 4 + h160 20)
+ * Note: hash160 results are computed in registers and probed directly (fused kernel),
+ *       no hash160 result buffer is written to VRAM.
  * Note: secp256k1 intermediate Jacobian coordinate buffers managed separately in gpu_secp256k1.cu
  */
 static size_t estimate_gpu_mem(int batch_size, uint32_t ht_capacity)
 {
     size_t pubkey_buf = (size_t)batch_size * 64;
-    size_t hash160_buf = (size_t)batch_size * 2 * 20;
     size_t hit_buf = GPU_MAX_HITS * sizeof(gpu_hit_result_t);
     size_t ht_buf = (size_t)ht_capacity * 24;
     /* Reserve 128MB for CUDA runtime and driver */
     size_t overhead = 128ULL * 1024 * 1024;
-    return pubkey_buf + hash160_buf + hit_buf + ht_buf + overhead;
+    return pubkey_buf + hit_buf + ht_buf + overhead;
 }
 
 /* External Interface */
