@@ -13,16 +13,64 @@ void sha256_compress_avx512(uint32_t *states[16], const uint8_t *blocks[16]);
 /* Forward declaration of ripemd160_compress_avx512 */
 void ripemd160_compress_avx512(uint32_t *states[16], const uint8_t *blocks[16]);
 
-/* SHA256 initial state constants */
-static const uint32_t sha256_init_state[8] = {
-    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+/* SHA256 initial state pre-expanded to 16 lanes to avoid per-loop copying */
+static const uint32_t sha256_init_state_16way[16][8] = {
+    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
+    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
+    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
+    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
+    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
+    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
+    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
+    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
+    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
+    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
+    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
+    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
+    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
+    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
+    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
+    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
 };
 
-/* RIPEMD160 initial state constants */
-static const uint32_t rmd160_init_state[5] = {
-    0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0
+/* RIPEMD160 initial state pre-expanded to 16 lanes to avoid per-loop copying */
+static const uint32_t rmd160_init_state_16way[16][5] = {
+    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
+    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
+    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
+    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
+    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
+    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
+    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
+    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
+    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
+    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
+    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
+    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
+    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
+    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
+    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
+    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
 };
+
+/*
+ * Pre-filled RIPEMD160 blocks template for 32-byte messages (SHA256 digests).
+ * Each block[16][64] has bytes [32..63] pre-filled with RIPEMD160 padding:
+ *   block[32]    = 0x80 (padding marker)
+ *   block[33..55]= 0x00 (23 zero bytes)
+ *   block[56..63]= LE64(256) (bit length = 32*8 = 256)
+ * Only the first 32 bytes need to be written per invocation.
+ */
+#define RMD_BLK_TEMPLATE_ROW    \
+    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+     0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x01, 0, 0, 0, 0, 0, 0 }
+static const uint8_t rmd_blocks_template_16way[16][64] = {
+    RMD_BLK_TEMPLATE_ROW, RMD_BLK_TEMPLATE_ROW, RMD_BLK_TEMPLATE_ROW, RMD_BLK_TEMPLATE_ROW,
+    RMD_BLK_TEMPLATE_ROW, RMD_BLK_TEMPLATE_ROW, RMD_BLK_TEMPLATE_ROW, RMD_BLK_TEMPLATE_ROW,
+    RMD_BLK_TEMPLATE_ROW, RMD_BLK_TEMPLATE_ROW, RMD_BLK_TEMPLATE_ROW, RMD_BLK_TEMPLATE_ROW,
+    RMD_BLK_TEMPLATE_ROW, RMD_BLK_TEMPLATE_ROW, RMD_BLK_TEMPLATE_ROW, RMD_BLK_TEMPLATE_ROW
+};
+#undef RMD_BLK_TEMPLATE_ROW
 
 /* Construct SHA256 padded block (single block, message <= 55 bytes) */
 static void make_sha256_block(const uint8_t *msg, size_t msglen, uint8_t block[64])
@@ -75,23 +123,6 @@ static void sha256_state_to_bytes(const uint32_t state[8], uint8_t out[32])
     }
 }
 
-/* Construct RIPEMD160 padded block (single block, message <= 55 bytes) */
-static void make_rmd160_block(const uint8_t *msg, size_t msglen, uint8_t block[64])
-{
-    memset(block, 0, 64);
-    memcpy(block, msg, msglen);
-    block[msglen] = 0x80;
-    uint64_t bitlen = (uint64_t)msglen * 8;
-    block[56] = (uint8_t)(bitlen);
-    block[57] = (uint8_t)(bitlen >> 8);
-    block[58] = (uint8_t)(bitlen >> 16);
-    block[59] = (uint8_t)(bitlen >> 24);
-    block[60] = (uint8_t)(bitlen >> 32);
-    block[61] = (uint8_t)(bitlen >> 40);
-    block[62] = (uint8_t)(bitlen >> 48);
-    block[63] = (uint8_t)(bitlen >> 56);
-}
-
 /* Convert RIPEMD160 state[5] to 20-byte little-endian digest */
 static void rmd160_state_to_bytes(const uint32_t state[5], uint8_t out[20])
 {
@@ -101,6 +132,56 @@ static void rmd160_state_to_bytes(const uint32_t state[5], uint8_t out[20])
         out[i * 4 + 2] = (uint8_t)(state[i] >> 16);
         out[i * 4 + 3] = (uint8_t)(state[i] >> 24);
     }
+}
+
+static void hash160_16way_sha_init(uint32_t sha_states[16][8], uint32_t *sha_state_ptrs[16])
+{
+    /* Single memcpy(512 bytes) replaces 16x memcpy(32 bytes), more vectorization-friendly */
+    memcpy(sha_states, sha256_init_state_16way, sizeof(sha256_init_state_16way));
+    for (int i = 0; i < 16; i++) {
+        sha_state_ptrs[i] = sha_states[i];
+    }
+}
+
+static void hash160_16way_finalize_from_sha(uint32_t sha_states[16][8], uint8_t hash160s[16][20])
+{
+    /* Copy template with pre-filled padding; only first 32 bytes per row need updating */
+    uint8_t rmd_blocks[16][64];
+    memcpy(rmd_blocks, rmd_blocks_template_16way, sizeof(rmd_blocks_template_16way));
+
+    uint32_t rmd_states[16][5];
+    uint32_t *rmd_state_ptrs[16];
+    const uint8_t *rmd_block_ptrs[16];
+
+    memcpy(rmd_states, rmd160_init_state_16way, sizeof(rmd160_init_state_16way));
+    for (int i = 0; i < 16; i++) {
+        sha256_state_to_bytes(sha_states[i], rmd_blocks[i]);
+        rmd_state_ptrs[i] = rmd_states[i];
+        rmd_block_ptrs[i] = rmd_blocks[i];
+    }
+
+    ripemd160_compress_avx512(rmd_state_ptrs, rmd_block_ptrs);
+
+    for (int i = 0; i < 16; i++) {
+        rmd160_state_to_bytes(rmd_states[i], hash160s[i]);
+    }
+}
+
+static void hash160_16way_prepadded_sha(const uint8_t *blocks1[16],
+                                        const uint8_t *blocks2[16],
+                                        uint8_t hash160s[16][20])
+{
+    uint32_t sha_states[16][8];
+    uint32_t *sha_state_ptrs[16];
+
+    hash160_16way_sha_init(sha_states, sha_state_ptrs);
+    sha256_compress_avx512(sha_state_ptrs, blocks1);
+
+    if (blocks2 != NULL) {
+        sha256_compress_avx512(sha_state_ptrs, blocks2);
+    }
+
+    hash160_16way_finalize_from_sha(sha_states, hash160s);
 }
 
 /*
@@ -114,28 +195,26 @@ void hash160_16way_compressed(const uint8_t *pubkeys[16], uint8_t hash160s[16][2
     uint32_t *sha_state_ptrs[16];
     const uint8_t *sha_block_ptrs[16];
 
+    memcpy(sha_states, sha256_init_state_16way, sizeof(sha256_init_state_16way));
     for (int i = 0; i < 16; i++) {
         make_sha256_block(pubkeys[i], 33, sha_blocks[i]);
-        memcpy(sha_states[i], sha256_init_state, 32);
         sha_state_ptrs[i] = sha_states[i];
         sha_block_ptrs[i] = sha_blocks[i];
     }
 
     sha256_compress_avx512(sha_state_ptrs, sha_block_ptrs);
 
-    uint8_t sha_digests[16][32];
-    for (int i = 0; i < 16; i++) {
-        sha256_state_to_bytes(sha_states[i], sha_digests[i]);
-    }
-
+    /* Reuse pre-filled template: only write first 32 bytes per block */
     uint8_t rmd_blocks[16][64];
+    memcpy(rmd_blocks, rmd_blocks_template_16way, sizeof(rmd_blocks_template_16way));
+
     uint32_t rmd_states[16][5];
     uint32_t *rmd_state_ptrs[16];
     const uint8_t *rmd_block_ptrs[16];
 
+    memcpy(rmd_states, rmd160_init_state_16way, sizeof(rmd160_init_state_16way));
     for (int i = 0; i < 16; i++) {
-        make_rmd160_block(sha_digests[i], 32, rmd_blocks[i]);
-        memcpy(rmd_states[i], rmd160_init_state, 20);
+        sha256_state_to_bytes(sha_states[i], rmd_blocks[i]);
         rmd_state_ptrs[i] = rmd_states[i];
         rmd_block_ptrs[i] = rmd_blocks[i];
     }
@@ -154,42 +233,7 @@ void hash160_16way_compressed(const uint8_t *pubkeys[16], uint8_t hash160s[16][2
 __attribute__((target("avx512f")))
 void hash160_16way_compressed_prepadded(const uint8_t *blocks[16], uint8_t hash160s[16][20])
 {
-    uint32_t sha_states[16][8];
-    uint32_t *sha_state_ptrs[16];
-
-    for (int i = 0; i < 16; i++) {
-        memcpy(sha_states[i], sha256_init_state, 32);
-        sha_state_ptrs[i] = sha_states[i];
-    }
-
-    sha256_compress_avx512(sha_state_ptrs, blocks);
-
-    /* sha_digests extended to 64 bytes, SHA256 digest written to first 32 bytes, last 32 bytes construct RIPEMD160 padding in-place */
-    uint8_t sha_digests[16][64];
-    uint32_t rmd_states[16][5];
-    uint32_t *rmd_state_ptrs[16];
-    const uint8_t *rmd_block_ptrs[16];
-
-    for (int i = 0; i < 16; i++) {
-        sha256_state_to_bytes(sha_states[i], sha_digests[i]);
-        /* Construct RIPEMD160 padded block in-place: 32-byte message, little-endian bit length 256 */
-        sha_digests[i][32] = 0x80;
-        memset(&sha_digests[i][33], 0, 23);
-        /* Little-endian bit length 256 = 0x0000000000000100 */
-        sha_digests[i][56] = 0x00; sha_digests[i][57] = 0x01;
-        sha_digests[i][58] = 0x00; sha_digests[i][59] = 0x00;
-        sha_digests[i][60] = 0x00; sha_digests[i][61] = 0x00;
-        sha_digests[i][62] = 0x00; sha_digests[i][63] = 0x00;
-        memcpy(rmd_states[i], rmd160_init_state, 20);
-        rmd_state_ptrs[i] = rmd_states[i];
-        rmd_block_ptrs[i] = sha_digests[i];
-    }
-
-    ripemd160_compress_avx512(rmd_state_ptrs, rmd_block_ptrs);
-
-    for (int i = 0; i < 16; i++) {
-        rmd160_state_to_bytes(rmd_states[i], hash160s[i]);
-    }
+    hash160_16way_prepadded_sha(blocks, NULL, hash160s);
 }
 
 /*
@@ -201,52 +245,13 @@ void hash160_16way_compressed_prepadded(const uint8_t *blocks[16], uint8_t hash1
 __attribute__((target("avx512f")))
 void hash160_16way_uncompressed_prepadded(const uint8_t *bufs[16], uint8_t hash160s[16][20])
 {
-    uint32_t sha_states[16][8];
-    uint32_t *sha_state_ptrs[16];
-    const uint8_t *sha_block_ptrs[16];
-
-    /* First pass: process block1 (buf[0..63]) */
-    for (int i = 0; i < 16; i++) {
-        memcpy(sha_states[i], sha256_init_state, 32);
-        sha_state_ptrs[i] = sha_states[i];
-        sha_block_ptrs[i] = bufs[i];
-    }
-
-    sha256_compress_avx512(sha_state_ptrs, sha_block_ptrs);
-
-    /* Second pass: process block2 (buf[64..127]) */
-    for (int i = 0; i < 16; i++) {
-        sha_block_ptrs[i] = bufs[i] + 64;
-    }
-
-    sha256_compress_avx512(sha_state_ptrs, sha_block_ptrs);
-
-    /* sha_digests extended to 64 bytes, construct RIPEMD160 padding in-place */
-    uint8_t sha_digests[16][64];
-    uint32_t rmd_states[16][5];
-    uint32_t *rmd_state_ptrs[16];
-    const uint8_t *rmd_block_ptrs[16];
+    const uint8_t *blocks2[16];
 
     for (int i = 0; i < 16; i++) {
-        sha256_state_to_bytes(sha_states[i], sha_digests[i]);
-        /* Construct RIPEMD160 padded block in-place: 32-byte message, little-endian bit length 256 */
-        sha_digests[i][32] = 0x80;
-        memset(&sha_digests[i][33], 0, 23);
-        /* Little-endian bit length 256 = 0x0000000000000100 */
-        sha_digests[i][56] = 0x00; sha_digests[i][57] = 0x01;
-        sha_digests[i][58] = 0x00; sha_digests[i][59] = 0x00;
-        sha_digests[i][60] = 0x00; sha_digests[i][61] = 0x00;
-        sha_digests[i][62] = 0x00; sha_digests[i][63] = 0x00;
-        memcpy(rmd_states[i], rmd160_init_state, 20);
-        rmd_state_ptrs[i] = rmd_states[i];
-        rmd_block_ptrs[i] = sha_digests[i];
+        blocks2[i] = bufs[i] + 64;
     }
 
-    ripemd160_compress_avx512(rmd_state_ptrs, rmd_block_ptrs);
-
-    for (int i = 0; i < 16; i++) {
-        rmd160_state_to_bytes(rmd_states[i], hash160s[i]);
-    }
+    hash160_16way_prepadded_sha(bufs, blocks2, hash160s);
 }
 
 /*
@@ -260,9 +265,9 @@ void hash160_16way_uncompressed(const uint8_t *pubkeys[16], uint8_t hash160s[16]
     uint32_t *sha_state_ptrs[16];
     const uint8_t *sha_block_ptrs[16];
 
+    memcpy(sha_states, sha256_init_state_16way, sizeof(sha256_init_state_16way));
     for (int i = 0; i < 16; i++) {
         make_sha256_block_raw(pubkeys[i], sha_blocks1[i]);
-        memcpy(sha_states[i], sha256_init_state, 32);
         sha_state_ptrs[i] = sha_states[i];
         sha_block_ptrs[i] = sha_blocks1[i];
     }
@@ -277,19 +282,17 @@ void hash160_16way_uncompressed(const uint8_t *pubkeys[16], uint8_t hash160s[16]
 
     sha256_compress_avx512(sha_state_ptrs, sha_block_ptrs);
 
-    uint8_t sha_digests[16][32];
-    for (int i = 0; i < 16; i++) {
-        sha256_state_to_bytes(sha_states[i], sha_digests[i]);
-    }
-
+    /* Reuse pre-filled template: only write first 32 bytes per block */
     uint8_t rmd_blocks[16][64];
+    memcpy(rmd_blocks, rmd_blocks_template_16way, sizeof(rmd_blocks_template_16way));
+
     uint32_t rmd_states[16][5];
     uint32_t *rmd_state_ptrs[16];
     const uint8_t *rmd_block_ptrs[16];
 
+    memcpy(rmd_states, rmd160_init_state_16way, sizeof(rmd160_init_state_16way));
     for (int i = 0; i < 16; i++) {
-        make_rmd160_block(sha_digests[i], 32, rmd_blocks[i]);
-        memcpy(rmd_states[i], rmd160_init_state, 20);
+        sha256_state_to_bytes(sha_states[i], rmd_blocks[i]);
         rmd_state_ptrs[i] = rmd_states[i];
         rmd_block_ptrs[i] = rmd_blocks[i];
     }
@@ -347,4 +350,3 @@ uint16_t ht_contains_16way(const uint8_t *h160s[16])
 }
 
 #endif /* __AVX512F__ */
-

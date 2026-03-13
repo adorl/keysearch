@@ -13,16 +13,23 @@
 #include <immintrin.h>
 #include <stdint.h>
 #include "ripemd160.h"
+#include "avx512_common.h"
 
 /* Left rotation */
 #define V_ROL(x, n) _mm512_or_si512(_mm512_slli_epi32((x), (n)), _mm512_srli_epi32((x), 32 - (n)))
 
-/* RIPEMD160 auxiliary functions (vectorized versions) */
-#define V_F(x, y, z)    _mm512_xor_si512(_mm512_xor_si512((x), (y)), (z))
-#define V_G(x, y, z)    _mm512_or_si512(_mm512_and_si512((x), (y)), _mm512_andnot_si512((x), (z)))
-#define V_H(x, y, z)    _mm512_xor_si512(_mm512_or_si512((x), _mm512_xor_si512(_mm512_set1_epi32(-1), (y))), (z))
-#define V_I(x, y, z)    _mm512_or_si512(_mm512_and_si512((x), (z)), _mm512_andnot_si512((z), (y)))
-#define V_J(x, y, z)    _mm512_xor_si512((x), _mm512_or_si512((y), _mm512_xor_si512(_mm512_set1_epi32(-1), (z))))
+/*
+ * RIPEMD160 auxiliary functions (vectorized, single-instruction via AVX-512 ternarylogic)
+ *
+ * Each V_* compresses a 3-input boolean function into one vpternlogd instruction.
+ * Truth table derivation: for each output bit, evaluate f(x,y,z) over all 8 input
+ * combinations (x=bit7..0 of 0xF0, y=0xCC, z=0xAA), pack results into an 8-bit imm8.
+ */
+#define V_F(x, y, z)    _mm512_ternarylogic_epi32((x), (y), (z), 0x96) /* x ^ y ^ z */
+#define V_G(x, y, z)    _mm512_ternarylogic_epi32((x), (y), (z), 0xCA) /* (x & y) | (~x & z) */
+#define V_H(x, y, z)    _mm512_ternarylogic_epi32((x), (y), (z), 0x59) /* (x | ~y) ^ z */
+#define V_I(x, y, z)    _mm512_ternarylogic_epi32((x), (y), (z), 0xE4) /* (x & z) | (y & ~z) */
+#define V_J(x, y, z)    _mm512_ternarylogic_epi32((x), (y), (z), 0x2D) /* x ^ (y | ~z) */
 
 /* Left chain step macros */
 #define VRL_STEP(a, b, c, d, e, func_val, s)                                                \
@@ -50,34 +57,35 @@
 #define VRR_F(a, b, c, d, e, x, s)  VRL_STEP(a, b, c, d, e, _mm512_add_epi32(V_F(b, c, d), (x)), s)
 
 /* Load the i-th uint32_t (little-endian) from each of 16 blocks into a __m512i */
-static inline __m512i load_le32_16way(const uint8_t *const blocks[16], int i)
+static inline __attribute__((always_inline)) __m512i load_le32_16way(const uint8_t *const blocks[16], int i)
 {
-    int off = i * 4;
-    uint32_t v0 = (uint32_t)blocks[0][off] | ((uint32_t)blocks[0][off + 1] << 8) | ((uint32_t)blocks[0][off + 2] << 16) | ((uint32_t)blocks[0][off + 3] << 24);
-    uint32_t v1 = (uint32_t)blocks[1][off] | ((uint32_t)blocks[1][off + 1] << 8) | ((uint32_t)blocks[1][off + 2] << 16) | ((uint32_t)blocks[1][off + 3] << 24);
-    uint32_t v2 = (uint32_t)blocks[2][off] | ((uint32_t)blocks[2][off + 1] << 8) | ((uint32_t)blocks[2][off + 2] << 16) | ((uint32_t)blocks[2][off + 3] << 24);
-    uint32_t v3 = (uint32_t)blocks[3][off] | ((uint32_t)blocks[3][off + 1] << 8) | ((uint32_t)blocks[3][off + 2] << 16) | ((uint32_t)blocks[3][off + 3] << 24);
-    uint32_t v4 = (uint32_t)blocks[4][off] | ((uint32_t)blocks[4][off + 1] << 8) | ((uint32_t)blocks[4][off + 2] << 16) | ((uint32_t)blocks[4][off + 3] << 24);
-    uint32_t v5 = (uint32_t)blocks[5][off] | ((uint32_t)blocks[5][off + 1] << 8) | ((uint32_t)blocks[5][off + 2] << 16) | ((uint32_t)blocks[5][off + 3] << 24);
-    uint32_t v6 = (uint32_t)blocks[6][off] | ((uint32_t)blocks[6][off + 1] << 8) | ((uint32_t)blocks[6][off + 2] << 16) | ((uint32_t)blocks[6][off + 3] << 24);
-    uint32_t v7 = (uint32_t)blocks[7][off] | ((uint32_t)blocks[7][off + 1] << 8) | ((uint32_t)blocks[7][off + 2] << 16) | ((uint32_t)blocks[7][off + 3] << 24);
-    uint32_t v8 = (uint32_t)blocks[8][off] | ((uint32_t)blocks[8][off + 1] << 8) | ((uint32_t)blocks[8][off + 2] << 16) | ((uint32_t)blocks[8][off + 3] << 24);
-    uint32_t v9 = (uint32_t)blocks[9][off] | ((uint32_t)blocks[9][off + 1] << 8) | ((uint32_t)blocks[9][off + 2] << 16) | ((uint32_t)blocks[9][off + 3] << 24);
-    uint32_t v10 = (uint32_t)blocks[10][off] | ((uint32_t)blocks[10][off + 1] << 8) | ((uint32_t)blocks[10][off + 2] << 16) | ((uint32_t)blocks[10][off + 3] << 24);
-    uint32_t v11 = (uint32_t)blocks[11][off] | ((uint32_t)blocks[11][off + 1] << 8) | ((uint32_t)blocks[11][off + 2] << 16) | ((uint32_t)blocks[11][off + 3] << 24);
-    uint32_t v12 = (uint32_t)blocks[12][off] | ((uint32_t)blocks[12][off + 1] << 8) | ((uint32_t)blocks[12][off + 2] << 16) | ((uint32_t)blocks[12][off + 3] << 24);
-    uint32_t v13 = (uint32_t)blocks[13][off] | ((uint32_t)blocks[13][off + 1] << 8) | ((uint32_t)blocks[13][off + 2] << 16) | ((uint32_t)blocks[13][off + 3] << 24);
-    uint32_t v14 = (uint32_t)blocks[14][off] | ((uint32_t)blocks[14][off + 1] << 8) | ((uint32_t)blocks[14][off + 2] << 16) | ((uint32_t)blocks[14][off + 3] << 24);
-    uint32_t v15 = (uint32_t)blocks[15][off] | ((uint32_t)blocks[15][off + 1] << 8) | ((uint32_t)blocks[15][off + 2] << 16) | ((uint32_t)blocks[15][off + 3] << 24);
-    return _mm512_set_epi32((int)v15, (int)v14, (int)v13, (int)v12, (int)v11, (int)v10, (int)v9, (int)v8,
-                            (int)v7, (int)v6, (int)v5, (int)v4, (int)v3, (int)v2, (int)v1, (int)v0);
+    const int off = i * 4;
+    uint32_t lanes[16] __attribute__((aligned(64))) = {
+        load_u32_unaligned(blocks[0] + off),
+        load_u32_unaligned(blocks[1] + off),
+        load_u32_unaligned(blocks[2] + off),
+        load_u32_unaligned(blocks[3] + off),
+        load_u32_unaligned(blocks[4] + off),
+        load_u32_unaligned(blocks[5] + off),
+        load_u32_unaligned(blocks[6] + off),
+        load_u32_unaligned(blocks[7] + off),
+        load_u32_unaligned(blocks[8] + off),
+        load_u32_unaligned(blocks[9] + off),
+        load_u32_unaligned(blocks[10] + off),
+        load_u32_unaligned(blocks[11] + off),
+        load_u32_unaligned(blocks[12] + off),
+        load_u32_unaligned(blocks[13] + off),
+        load_u32_unaligned(blocks[14] + off),
+        load_u32_unaligned(blocks[15] + off)
+    };
+    return _mm512_load_si512((const void *)lanes);
 }
 
 /* Write the 16 lanes of a __m512i back to the i-th element of each of 16 states */
 static inline void rmd_store_16way(uint32_t *const states[16], int i, __m512i v)
 {
-    uint32_t tmp[16];
-    _mm512_storeu_si512((__m512i *)tmp, v);
+    uint32_t tmp[16] __attribute__((aligned(64)));
+    _mm512_store_si512((__m512i *)tmp, v);
     states[0][i] = tmp[0];
     states[1][i] = tmp[1];
     states[2][i] = tmp[2];
@@ -105,26 +113,11 @@ __attribute__((target("avx512f")))
 void ripemd160_compress_avx512(uint32_t *states[16], const uint8_t *blocks[16])
 {
     /* Load 16-lane initial state */
-    __m512i al = _mm512_set_epi32((int)states[15][0], (int)states[14][0], (int)states[13][0], (int)states[12][0],
-                                  (int)states[11][0], (int)states[10][0], (int)states[9][0], (int)states[8][0],
-                                  (int)states[7][0], (int)states[6][0], (int)states[5][0], (int)states[4][0],
-                                  (int)states[3][0], (int)states[2][0], (int)states[1][0], (int)states[0][0]);
-    __m512i bl = _mm512_set_epi32((int)states[15][1], (int)states[14][1], (int)states[13][1], (int)states[12][1],
-                                  (int)states[11][1], (int)states[10][1], (int)states[9][1], (int)states[8][1],
-                                  (int)states[7][1], (int)states[6][1], (int)states[5][1], (int)states[4][1],
-                                  (int)states[3][1], (int)states[2][1], (int)states[1][1], (int)states[0][1]);
-    __m512i cl = _mm512_set_epi32((int)states[15][2], (int)states[14][2], (int)states[13][2], (int)states[12][2],
-                                  (int)states[11][2], (int)states[10][2], (int)states[9][2], (int)states[8][2],
-                                  (int)states[7][2], (int)states[6][2], (int)states[5][2], (int)states[4][2],
-                                  (int)states[3][2], (int)states[2][2], (int)states[1][2], (int)states[0][2]);
-    __m512i dl = _mm512_set_epi32((int)states[15][3], (int)states[14][3], (int)states[13][3], (int)states[12][3],
-                                  (int)states[11][3], (int)states[10][3], (int)states[9][3], (int)states[8][3],
-                                  (int)states[7][3], (int)states[6][3], (int)states[5][3], (int)states[4][3],
-                                  (int)states[3][3], (int)states[2][3], (int)states[1][3], (int)states[0][3]);
-    __m512i el = _mm512_set_epi32((int)states[15][4], (int)states[14][4], (int)states[13][4], (int)states[12][4],
-                                  (int)states[11][4], (int)states[10][4], (int)states[9][4], (int)states[8][4],
-                                  (int)states[7][4], (int)states[6][4], (int)states[5][4], (int)states[4][4],
-                                  (int)states[3][4], (int)states[2][4], (int)states[1][4], (int)states[0][4]);
+    __m512i al = load_state_word_16way(states, 0);
+    __m512i bl = load_state_word_16way(states, 1);
+    __m512i cl = load_state_word_16way(states, 2);
+    __m512i dl = load_state_word_16way(states, 3);
+    __m512i el = load_state_word_16way(states, 4);
     __m512i ar = al, br = bl, cr = cl, dr = dl, er = el;
 
     /* Save initial state */
@@ -334,4 +327,3 @@ void ripemd160_compress_avx512(uint32_t *states[16], const uint8_t *blocks[16])
 }
 
 #endif /* __AVX512F__ */
-

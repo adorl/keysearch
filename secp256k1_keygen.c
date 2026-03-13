@@ -176,6 +176,10 @@ void keygen_batch_normalize(const secp256k1_gej *gej_in,
         secp256k1_fe_mul(&ge_out[i].x, &gej_in[i].x, &inv_zi2);
         secp256k1_fe_mul(&inv_zi2, &inv_zi2, &inv_zi);   /* inv_zi^3 */
         secp256k1_fe_mul(&ge_out[i].y, &gej_in[i].y, &inv_zi2);
+
+        /* Pre-normalize x and y for downstream secp256k1_fe_get_b32 */
+        secp256k1_fe_normalize_var(&ge_out[i].x);
+        secp256k1_fe_normalize_var(&ge_out[i].y);
         ge_out[i].infinity = 0;
     }
 }
@@ -226,6 +230,15 @@ void keygen_batch_normalize_rzr(const secp256k1_gej *gej_in,
         secp256k1_fe_mul(&ge_out[i].x, &gej_in[i].x, &inv_zi2);     /* X/Z^2 */
         secp256k1_fe_mul(&inv_zi2, &inv_zi2, &inv);                 /* inv_zi^3 */
         secp256k1_fe_mul(&ge_out[i].y, &gej_in[i].y, &inv_zi2);     /* Y/Z^3 */
+
+        /*
+         * Pre-normalize x and y so that downstream keygen_ge_to_pubkey_bytes
+         * can call secp256k1_fe_get_b32 without redundant normalize.
+         * secp256k1_fe_mul output has magnitude=1 but normalized=0;
+         * normalize_var is the cheapest full normalization path.
+         */
+        secp256k1_fe_normalize_var(&ge_out[i].x);
+        secp256k1_fe_normalize_var(&ge_out[i].y);
         ge_out[i].infinity = 0;
 
         /* Forward propagation: inv = 1/Z[i-1] = (1/Z[i]) * rzr[i-1] */
@@ -242,21 +255,26 @@ void keygen_ge_to_pubkey_bytes(const secp256k1_ge *ge,
     if (ge->infinity)
         return;
 
-    secp256k1_fe x = ge->x;
-    secp256k1_fe y = ge->y;
-
+    /*
+     * Assumes ge->x and ge->y are already normalized by keygen_batch_normalize_rzr
+     * or keygen_batch_normalize (via secp256k1_fe_normalize_var).
+     * secp256k1_fe_get_b32 requires normalized input; in non-VERIFY builds it
+     * maps directly to secp256k1_fe_impl_get_b32 (pure shift+mask, no normalize).
+     *
+     * x_bytes is computed once and shared by both compressed and uncompressed paths.
+     */
     uint8_t x_bytes[32];
-    uint8_t y_bytes[32];
-    secp256k1_fe_get_b32(x_bytes, &x);
+    secp256k1_fe_get_b32(x_bytes, &ge->x);
 
     if (compressed_out != NULL) {
         /* Compressed pubkey: prefix 0x02 (Y even) or 0x03 (Y odd) + X (32 bytes) */
-        compressed_out[0] = secp256k1_fe_is_odd(&y) ? 0x03 : 0x02;
+        compressed_out[0] = secp256k1_fe_is_odd(&ge->y) ? 0x03 : 0x02;
         memcpy(compressed_out + 1, x_bytes, 32);
     }
 
     if (uncompressed_out != NULL) {
-        secp256k1_fe_get_b32(y_bytes, &y);
+        uint8_t y_bytes[32];
+        secp256k1_fe_get_b32(y_bytes, &ge->y);
         /* Uncompressed pubkey: 0x04 + X (32 bytes) + Y (32 bytes) */
         uncompressed_out[0] = 0x04;
         memcpy(uncompressed_out + 1, x_bytes, 32);

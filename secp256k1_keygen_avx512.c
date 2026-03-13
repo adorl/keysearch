@@ -37,43 +37,35 @@ typedef struct {
 
 /*
  * fe_16x_load: convert 16 secp256k1_fe elements to SoA layout
+ * Uses aligned buffer + _mm512_load_si512 to avoid _mm512_set_epi64 overhead.
  */
 static void fe_16x_load(secp256k1_fe_16x *dst, const secp256k1_fe src[16])
 {
     for (int i = 0; i < 5; i++) {
-        dst->n[i][0] = _mm512_set_epi64(
-            (int64_t)src[7].n[i],
-            (int64_t)src[6].n[i],
-            (int64_t)src[5].n[i],
-            (int64_t)src[4].n[i],
-            (int64_t)src[3].n[i],
-            (int64_t)src[2].n[i],
-            (int64_t)src[1].n[i],
-            (int64_t)src[0].n[i]
-        );
-        dst->n[i][1] = _mm512_set_epi64(
-            (int64_t)src[15].n[i],
-            (int64_t)src[14].n[i],
-            (int64_t)src[13].n[i],
-            (int64_t)src[12].n[i],
-            (int64_t)src[11].n[i],
-            (int64_t)src[10].n[i],
-            (int64_t)src[9].n[i],
-            (int64_t)src[8].n[i]
-        );
+        uint64_t lo[8] __attribute__((aligned(64))) = {
+            src[0].n[i], src[1].n[i], src[2].n[i], src[3].n[i],
+            src[4].n[i], src[5].n[i], src[6].n[i], src[7].n[i]
+        };
+        uint64_t hi[8] __attribute__((aligned(64))) = {
+            src[8].n[i], src[9].n[i], src[10].n[i], src[11].n[i],
+            src[12].n[i], src[13].n[i], src[14].n[i], src[15].n[i]
+        };
+        dst->n[i][0] = _mm512_load_si512((const void *)lo);
+        dst->n[i][1] = _mm512_load_si512((const void *)hi);
     }
 }
 
 /*
  * fe_16x_store: convert SoA layout back to 16 secp256k1_fe elements
+ * Uses aligned buffers + _mm512_store_si512 for efficient writeback.
  */
 static void fe_16x_store(secp256k1_fe dst[16], const secp256k1_fe_16x *src)
 {
-    uint64_t lo[5][8];
-    uint64_t hi[5][8];
+    uint64_t lo[5][8] __attribute__((aligned(64)));
+    uint64_t hi[5][8] __attribute__((aligned(64)));
     for (int i = 0; i < 5; i++) {
-        _mm512_storeu_si512((__m512i *)lo[i], src->n[i][0]);
-        _mm512_storeu_si512((__m512i *)hi[i], src->n[i][1]);
+        _mm512_store_si512((__m512i *)lo[i], src->n[i][0]);
+        _mm512_store_si512((__m512i *)hi[i], src->n[i][1]);
     }
     for (int j = 0; j < 8; j++) {
         for (int i = 0; i < 5; i++) {
@@ -555,26 +547,34 @@ void gej_add_ge_var_16way(secp256k1_gej r[16],
     secp256k1_fe_16x t;
     fe_16x_mul(&t, &ax, &h2);
 
-    /* r.x = i^2 + h3 + 2*t */
+    /* r.x = i^2 + h3 + 2*t
+     * fi^2 output magnitude=1, h3 magnitude=1, t magnitude=1
+     * After 3 additions: magnitude=4, still within safe range (< 2^56) */
     secp256k1_fe_16x rx;
     fe_16x_sqr(&rx, &fi);
     fe_16x_add(&rx, &rx, &h3);
     fe_16x_add(&rx, &rx, &t);
     fe_16x_add(&rx, &rx, &t);
 
-    /* r.y = (t + r.x) * i + h3 * s1 */
+    /* r.y = (t + r.x) * i + h3 * s1
+     * t2 = t + rx: t magnitude=1, rx magnitude=4 => t2 magnitude=5
+     * Must normalize before IFMA multiply (magnitude must be <= 1) */
     secp256k1_fe_16x ry;
     secp256k1_fe_16x t2 = t;
     fe_16x_add(&t2, &t2, &rx);
-    /* t2 = t + rx, limbs may exceed 52 bits, must normalize before IFMA multiply */
     fe_16x_normalize_weak(&t2);
     fe_16x_mul(&ry, &t2, &fi);
     secp256k1_fe_16x h3s1;
     fe_16x_mul(&h3s1, &h3, &ay);
     fe_16x_add(&ry, &ry, &h3s1);
 
-    /* Normalize rz, rx, ry */
-    fe_16x_normalize_weak(&rz);
+    /*
+     * Output normalization: rz, rx, ry are fed back as inputs to next
+     * gej_add_ge_var_16way (when normed=1). fe_16x_mul output has
+     * magnitude=1 which is fine for IFMA. Only rx (magnitude=4) and
+     * ry (magnitude=2, from mul+add) need normalize_weak.
+     * rz was produced by fe_16x_mul, magnitude=1, skip normalize.
+     */
     fe_16x_normalize_weak(&rx);
     fe_16x_normalize_weak(&ry);
 

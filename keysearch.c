@@ -66,6 +66,46 @@ struct thread_args
 };
 
 
+#ifndef USE_PUBKEY_API_ONLY
+/*
+ * Fast scalar increment by 1: directly add 1 to d[0] and propagate carry.
+ * Avoids the overhead of full 128-bit addition in secp256k1_scalar_add.
+ * Returns 1 if the result reduces to zero (i.e., input was N-1).
+ *
+ * The secp256k1 order N = {0xBFD25E8CD0364141, 0xBAAEDCE6AF48A03B,
+ *   0xFFFFFFFFFFFFFFFE, 0xFFFFFFFFFFFFFFFF}.
+ * N_0 = 0xBFD25E8CD0364141, so d[0] wraps only when old d[0] = 0xFFFFFFFFFFFFFFFF.
+ * Most increments (>99.99%) hit the fast path: ++d[0], check_overflow, done.
+ *
+ * Note: we MUST check overflow even on the fast path, because s could be N-1
+ * where ++d[0] does not wrap but the result equals N.
+ */
+static inline int scalar_increment(secp256k1_scalar *s) {
+    int overflow;
+    if (__builtin_expect(++s->d[0] != 0, 1)) {
+        /* Fast path: no carry propagation needed, just check overflow */
+        overflow = secp256k1_scalar_check_overflow(s);
+        if (__builtin_expect(overflow, 0)) {
+            secp256k1_scalar_reduce(s, overflow);
+            return secp256k1_scalar_is_zero(s);
+        }
+        return 0;
+    }
+    if (__builtin_expect(++s->d[1] != 0, 1))
+        goto check;
+    if (__builtin_expect(++s->d[2] != 0, 1))
+        goto check;
+    ++s->d[3];
+check:
+    overflow = secp256k1_scalar_check_overflow(s);
+    if (overflow) {
+        secp256k1_scalar_reduce(s, overflow);
+        return secp256k1_scalar_is_zero(s);
+    }
+    return 0;
+}
+#endif /* USE_PUBKEY_API_ONLY */
+
 static void *search_key(void *arg)
 {
     struct thread_args *args = (struct thread_args *)arg;
@@ -162,8 +202,7 @@ static void *search_key(void *arg)
                 rzr_buf[ch][step] = step_rzr[ch];
 
                 /* Update each chain state (scalar+1, detect overflow to zero) */
-                secp256k1_scalar_add(&chain_scalar[ch], &chain_scalar[ch], &tweak_scalar);
-                if (secp256k1_scalar_is_zero(&chain_scalar[ch])) {
+                if (__builtin_expect(scalar_increment(&chain_scalar[ch]), 0)) {
                     chain_valid_steps[ch] = step + 1;
                 } else {
                     chain_gej[ch] = next_gej_16[ch];
@@ -322,8 +361,7 @@ avx512_thread_exit:
                 break;
 
             /* Incremental derivation: private key scalar+1, public key point add G (direct point addition, no ecmult) */
-            secp256k1_scalar_add(&cur_privkey_scalar, &cur_privkey_scalar, &tweak_scalar);
-            if (secp256k1_scalar_is_zero(&cur_privkey_scalar)) {
+            if (__builtin_expect(scalar_increment(&cur_privkey_scalar), 0)) {
                 /* Very rare: scalar overflows to zero, break inner loop and regenerate base private key */
                 inner_overflow = 1;
                 break;
