@@ -3018,19 +3018,789 @@ static void test_gej_add_ge_var_16way(void) {
 }
 
 /* ------------------------------------------------------------------
+ * test_gej_add_ge_var_16way_soa
+ *
+ * Verify functional correctness of gej_add_ge_var_16way_soa (SoA persistent version).
+ * Coverage scenarios:
+ *   8.4  Single-step SoA correctness: SoA output vs scalar reference
+ *   8.5  Multi-step SoA continuous advance (simulating keysearch hot loop)
+ *   8.6  Edge cases: point doubling (a=b) and point at infinity via SoA
+ *   8.7  SoA vs AoS bit-exact consistency
+ * ------------------------------------------------------------------ */
+static void test_gej_add_ge_var_16way_soa(void) {
+    printf("\n=== gej_add_ge_var_16way_soa functional correctness tests ===\n");
+
+    /* ------------------------------------------------------------------ */
+    /* 8.4  Single-step SoA correctness: 16-way parallel point addition      */
+    /*      vs scalar secp256k1_gej_add_ge_var                               */
+    /* ------------------------------------------------------------------ */
+    {
+        printf("  [8.4 single-step SoA verification: 16-way parallel point addition vs scalar]\n");
+        int all_pass = 1;
+
+        int base_vals[16] = {3, 7, 11, 17, 23, 31, 37, 41,
+                             43, 47, 53, 59, 61, 67, 71, 73};
+        secp256k1_gej chain_gej[16];
+
+        for (int ch = 0; ch < 16; ch++) {
+            uint8_t pk[32] = {0};
+            pk[31] = (uint8_t)base_vals[ch];
+            keygen_privkey_to_gej(secp_ctx, pk, &chain_gej[ch]);
+        }
+
+        /* Load AoS -> SoA */
+        secp256k1_gej_16x a_soa;
+        gej_16x_load(&a_soa, chain_gej);
+
+        /* Call SoA version with normed=0 */
+        secp256k1_gej_16x r_soa;
+        secp256k1_gej r_aos[16];
+        secp256k1_fe  rzr_out[16];
+        gej_add_ge_var_16way_soa(&r_soa, &a_soa, &G_affine, r_aos, rzr_out, 0);
+
+        /* Scalar reference */
+        secp256k1_gej ref_next[16];
+        secp256k1_fe  ref_rzr[16];
+        for (int ch = 0; ch < 16; ch++)
+            secp256k1_gej_add_ge_var(&ref_next[ch], &chain_gej[ch], &G_affine, &ref_rzr[ch]);
+
+        /* Verification 1: r_aos compressed pubkey vs scalar reference */
+        secp256k1_ge avx512_ge[16], ref_ge[16];
+        keygen_batch_normalize(r_aos,    avx512_ge, 16);
+        keygen_batch_normalize(ref_next, ref_ge,    16);
+
+        for (int ch = 0; ch < 16; ch++) {
+            uint8_t avx512_comp[33], ref_comp[33];
+            keygen_ge_to_pubkey_bytes(&avx512_ge[ch], avx512_comp, NULL);
+            keygen_ge_to_pubkey_bytes(&ref_ge[ch],    ref_comp,    NULL);
+            if (memcmp(avx512_comp, ref_comp, 33) != 0) {
+                char avx512_hex[67], ref_hex[67];
+                bytes_to_hex_helper(avx512_comp, 33, avx512_hex);
+                bytes_to_hex_helper(ref_comp,    33, ref_hex);
+                printf("  [FAIL] 8.4a lane%d (base=%d+1): SoA_AoS=%s REF=%s\n",
+                       ch, base_vals[ch], avx512_hex, ref_hex);
+                all_pass = 0;
+                fail_count++;
+            }
+        }
+
+        /* Verification 2: r_soa -> gej_16x_store vs r_aos, bit-exact comparison */
+        secp256k1_gej r_from_soa[16];
+        gej_16x_store(r_from_soa, &r_soa);
+
+        int soa_aos_match = 1;
+        for (int ch = 0; ch < 16; ch++) {
+            secp256k1_fe fx1, fy1, fz1, fx2, fy2, fz2;
+            fx1 = r_from_soa[ch].x; secp256k1_fe_normalize(&fx1);
+            fy1 = r_from_soa[ch].y; secp256k1_fe_normalize(&fy1);
+            fz1 = r_from_soa[ch].z; secp256k1_fe_normalize(&fz1);
+            fx2 = r_aos[ch].x; secp256k1_fe_normalize(&fx2);
+            fy2 = r_aos[ch].y; secp256k1_fe_normalize(&fy2);
+            fz2 = r_aos[ch].z; secp256k1_fe_normalize(&fz2);
+
+            if (!secp256k1_fe_equal(&fx1, &fx2) ||
+                !secp256k1_fe_equal(&fy1, &fy2) ||
+                !secp256k1_fe_equal(&fz1, &fz2)) {
+                printf("  [FAIL] 8.4b lane%d (base=%d): SoA->AoS mismatch with direct r_aos\n",
+                       ch, base_vals[ch]);
+                soa_aos_match = 0;
+                all_pass = 0;
+                fail_count++;
+            }
+        }
+        if (soa_aos_match) {
+            printf("  [PASS] 8.4b SoA->AoS output matches direct r_aos for all 16 lanes\n");
+            pass_count++;
+        }
+
+        if (all_pass) {
+            printf("  [PASS] 8.4 single-step SoA verification: fully consistent with scalar\n");
+            pass_count++;
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 8.5  Multi-step SoA continuous advance: simulating keysearch hot loop  */
+    /*      step=0 normed=0, step>0 normed=1, 200 steps total                */
+    /* ------------------------------------------------------------------ */
+    {
+        const int STEPS = 200;
+        printf("  [8.5 multi-step SoA advance: compare with standard API after %d steps]\n", STEPS);
+        int all_pass = 1;
+
+        uint32_t base_vals[16] = {
+            1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000,
+            9000,10000,11000,12000,13000,14000,15000,16000
+        };
+        secp256k1_gej chain_gej[16];
+
+        for (int ch = 0; ch < 16; ch++) {
+            uint8_t pk[32] = {0};
+            pk[29] = (uint8_t)(base_vals[ch] >> 16);
+            pk[30] = (uint8_t)(base_vals[ch] >> 8);
+            pk[31] = (uint8_t)(base_vals[ch]);
+            keygen_privkey_to_gej(secp_ctx, pk, &chain_gej[ch]);
+        }
+
+        /* Load initial AoS -> SoA */
+        secp256k1_gej_16x a_soa;
+        gej_16x_load(&a_soa, chain_gej);
+
+        /* Simulate keysearch hot loop: step=0 normed=0, step>0 normed=1 */
+        int soa_aos_mismatch_count = 0;
+        for (int step = 0; step < STEPS; step++) {
+            secp256k1_gej_16x r_soa;
+            secp256k1_gej r_aos[16];
+            secp256k1_fe  rzr[16];
+            int normed = (step == 0) ? 0 : 1;
+            gej_add_ge_var_16way_soa(&r_soa, &a_soa, &G_affine, r_aos, rzr, normed);
+
+            /* Every 50 steps: verify SoA->AoS matches r_aos */
+            if (step % 50 == 0 || step == STEPS - 1) {
+                secp256k1_gej r_from_soa[16];
+                gej_16x_store(r_from_soa, &r_soa);
+                for (int ch = 0; ch < 16; ch++) {
+                    secp256k1_fe fx1, fy1, fz1, fx2, fy2, fz2;
+                    fx1 = r_from_soa[ch].x; secp256k1_fe_normalize(&fx1);
+                    fy1 = r_from_soa[ch].y; secp256k1_fe_normalize(&fy1);
+                    fz1 = r_from_soa[ch].z; secp256k1_fe_normalize(&fz1);
+                    fx2 = r_aos[ch].x; secp256k1_fe_normalize(&fx2);
+                    fy2 = r_aos[ch].y; secp256k1_fe_normalize(&fy2);
+                    fz2 = r_aos[ch].z; secp256k1_fe_normalize(&fz2);
+                    if (!secp256k1_fe_equal(&fx1, &fx2) ||
+                        !secp256k1_fe_equal(&fy1, &fy2) ||
+                        !secp256k1_fe_equal(&fz1, &fz2)) {
+                        if (soa_aos_mismatch_count == 0) {
+                            printf("  [FAIL] 8.5b SoA->AoS mismatch at step=%d lane%d\n",
+                                   step, ch);
+                            fail_count++;
+                        }
+                        soa_aos_mismatch_count++;
+                        all_pass = 0;
+                    }
+                }
+            }
+
+            /* Pass SoA output as next input */
+            a_soa = r_soa;
+        }
+
+        if (soa_aos_mismatch_count == 0) {
+            printf("  [PASS] 8.5b SoA->AoS consistency at sampled steps for all lanes\n");
+            pass_count++;
+        } else if (soa_aos_mismatch_count > 1) {
+            printf("  [INFO] 8.5b total SoA->AoS mismatches: %d (only first reported)\n",
+                   soa_aos_mismatch_count);
+        }
+
+        /* Verification 1: final pubkey vs API */
+        /* Need to get final AoS from SoA for batch_normalize */
+        secp256k1_gej final_aos[16];
+        gej_16x_store(final_aos, &a_soa);
+
+        secp256k1_ge chain_ge[16];
+        keygen_batch_normalize(final_aos, chain_ge, 16);
+
+        for (int ch = 0; ch < 16; ch++) {
+            uint32_t expected_k = base_vals[ch] + (uint32_t)STEPS;
+            uint8_t  expected_privkey[32] = {0};
+            expected_privkey[29] = (uint8_t)(expected_k >> 16);
+            expected_privkey[30] = (uint8_t)(expected_k >> 8);
+            expected_privkey[31] = (uint8_t)(expected_k);
+
+            secp256k1_pubkey api_pubkey;
+            secp256k1_ec_pubkey_create(secp_ctx, &api_pubkey, expected_privkey);
+            uint8_t api_comp[33];
+            size_t  api_len = 33;
+            secp256k1_ec_pubkey_serialize(secp_ctx, api_comp, &api_len,
+                                          &api_pubkey, SECP256K1_EC_COMPRESSED);
+
+            uint8_t avx512_comp[33];
+            keygen_ge_to_pubkey_bytes(&chain_ge[ch], avx512_comp, NULL);
+
+            if (memcmp(avx512_comp, api_comp, 33) != 0) {
+                char avx512_hex[67], api_hex[67];
+                bytes_to_hex_helper(avx512_comp, 33, avx512_hex);
+                bytes_to_hex_helper(api_comp,    33, api_hex);
+                printf("  [FAIL] 8.5a lane%d (base=%u + %d steps): SoA=%s API=%s\n",
+                       ch, base_vals[ch], STEPS, avx512_hex, api_hex);
+                all_pass = 0;
+                fail_count++;
+            }
+        }
+        if (all_pass) {
+            printf("  [PASS] 8.5 multi-step SoA advance: 16 chains fully consistent with standard API after %d steps\n", STEPS);
+            pass_count++;
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 8.6  Edge cases: point doubling (a=b) via SoA                           */
+    /* ------------------------------------------------------------------ */
+    {
+        printf("  [8.6 edge cases: SoA point doubling (a=b)]\n");
+        int all_pass = 1;
+
+        /* 8.6a: lane0 = 1*G = b (triggers point doubling h=0), rest are normal */
+        {
+            secp256k1_gej chain_gej[16];
+            uint8_t privkey_1[32] = {0}; privkey_1[31] = 1;
+            keygen_privkey_to_gej(secp_ctx, privkey_1, &chain_gej[0]);
+            for (int ch = 1; ch < 16; ch++) {
+                uint8_t pk[32] = {0};
+                pk[31] = (uint8_t)(10 + ch);
+                keygen_privkey_to_gej(secp_ctx, pk, &chain_gej[ch]);
+            }
+
+            secp256k1_gej_16x a_soa;
+            gej_16x_load(&a_soa, chain_gej);
+
+            secp256k1_gej_16x r_soa;
+            secp256k1_gej r_aos[16];
+            secp256k1_fe  rzr[16];
+            gej_add_ge_var_16way_soa(&r_soa, &a_soa, &G_affine, r_aos, rzr, 0);
+
+            secp256k1_ge next_ge[16];
+            keygen_batch_normalize(r_aos, next_ge, 16);
+
+            /* lane0 should be 2*G */
+            uint8_t privkey_2[32] = {0}; privkey_2[31] = 2;
+            secp256k1_pubkey api_pubkey;
+            secp256k1_ec_pubkey_create(secp_ctx, &api_pubkey, privkey_2);
+            uint8_t api_comp[33];
+            size_t  api_len = 33;
+            secp256k1_ec_pubkey_serialize(secp_ctx, api_comp, &api_len,
+                                          &api_pubkey, SECP256K1_EC_COMPRESSED);
+
+            uint8_t avx512_comp[33];
+            keygen_ge_to_pubkey_bytes(&next_ge[0], avx512_comp, NULL);
+
+            if (memcmp(avx512_comp, api_comp, 33) != 0) {
+                char avx512_hex[67], api_hex[67];
+                bytes_to_hex_helper(avx512_comp, 33, avx512_hex);
+                bytes_to_hex_helper(api_comp,    33, api_hex);
+                printf("  [FAIL] 8.6a point doubling (a=1*G, b=G): SoA=%s expected=%s\n",
+                       avx512_hex, api_hex);
+                all_pass = 0;
+                fail_count++;
+            }
+
+            /* Verify remaining lanes are still correct */
+            for (int ch = 1; ch < 16; ch++) {
+                uint32_t expected_k = 10 + ch + 1;
+                uint8_t  epk[32] = {0};
+                epk[31] = (uint8_t)(expected_k);
+
+                secp256k1_pubkey ep;
+                secp256k1_ec_pubkey_create(secp_ctx, &ep, epk);
+                uint8_t ec[33];
+                size_t  el = 33;
+                secp256k1_ec_pubkey_serialize(secp_ctx, ec, &el,
+                                              &ep, SECP256K1_EC_COMPRESSED);
+
+                uint8_t ac[33];
+                keygen_ge_to_pubkey_bytes(&next_ge[ch], ac, NULL);
+                if (memcmp(ac, ec, 33) != 0) {
+                    char ah[67], eh[67];
+                    bytes_to_hex_helper(ac, 33, ah);
+                    bytes_to_hex_helper(ec, 33, eh);
+                    printf("  [FAIL] 8.6a lane%d (base=%d+1): SoA=%s expected=%s\n",
+                           ch, 10 + ch, ah, eh);
+                    all_pass = 0;
+                    fail_count++;
+                }
+            }
+        }
+
+        /* 8.6b: multiple lanes trigger point doubling simultaneously */
+        /*        lane0=1*G, lane4=1*G, lane8=1*G, lane12=1*G, rest normal */
+        {
+            secp256k1_gej chain_gej[16];
+            int doubling_lanes[4] = {0, 4, 8, 12};
+            for (int ch = 0; ch < 16; ch++) {
+                uint8_t pk[32] = {0};
+                int is_doubling = 0;
+                for (int d = 0; d < 4; d++) {
+                    if (ch == doubling_lanes[d]) { is_doubling = 1; break; }
+                }
+                if (is_doubling) {
+                    pk[31] = 1; /* 1*G => triggers doubling since b=G */
+                } else {
+                    pk[31] = (uint8_t)(50 + ch);
+                }
+                keygen_privkey_to_gej(secp_ctx, pk, &chain_gej[ch]);
+            }
+
+            secp256k1_gej_16x a_soa;
+            gej_16x_load(&a_soa, chain_gej);
+
+            secp256k1_gej_16x r_soa;
+            secp256k1_gej r_aos[16];
+            secp256k1_fe  rzr[16];
+            gej_add_ge_var_16way_soa(&r_soa, &a_soa, &G_affine, r_aos, rzr, 0);
+
+            secp256k1_ge next_ge[16];
+            keygen_batch_normalize(r_aos, next_ge, 16);
+
+            for (int ch = 0; ch < 16; ch++) {
+                int is_doubling = 0;
+                for (int d = 0; d < 4; d++) {
+                    if (ch == doubling_lanes[d]) { is_doubling = 1; break; }
+                }
+                uint32_t expected_k = is_doubling ? 2 : (uint32_t)(50 + ch + 1);
+                uint8_t  epk[32] = {0};
+                epk[31] = (uint8_t)(expected_k);
+
+                secp256k1_pubkey ep;
+                secp256k1_ec_pubkey_create(secp_ctx, &ep, epk);
+                uint8_t ec[33]; size_t el = 33;
+                secp256k1_ec_pubkey_serialize(secp_ctx, ec, &el, &ep, SECP256K1_EC_COMPRESSED);
+
+                uint8_t ac[33];
+                keygen_ge_to_pubkey_bytes(&next_ge[ch], ac, NULL);
+                if (memcmp(ac, ec, 33) != 0) {
+                    char ah[67], eh[67];
+                    bytes_to_hex_helper(ac, 33, ah);
+                    bytes_to_hex_helper(ec, 33, eh);
+                    printf("  [FAIL] 8.6b lane%d (%s, expected_k=%u): SoA=%s expected=%s\n",
+                           ch, is_doubling ? "doubling" : "normal",
+                           expected_k, ah, eh);
+                    all_pass = 0;
+                    fail_count++;
+                }
+            }
+        }
+
+        /* 8.6c: all 16 lanes trigger point doubling (worst case: all a=1*G) */
+        {
+            secp256k1_gej chain_gej[16];
+            uint8_t privkey_1[32] = {0}; privkey_1[31] = 1;
+            for (int ch = 0; ch < 16; ch++) {
+                keygen_privkey_to_gej(secp_ctx, privkey_1, &chain_gej[ch]);
+            }
+
+            secp256k1_gej_16x a_soa;
+            gej_16x_load(&a_soa, chain_gej);
+
+            secp256k1_gej_16x r_soa;
+            secp256k1_gej r_aos[16];
+            secp256k1_fe  rzr[16];
+            gej_add_ge_var_16way_soa(&r_soa, &a_soa, &G_affine, r_aos, rzr, 0);
+
+            secp256k1_ge next_ge[16];
+            keygen_batch_normalize(r_aos, next_ge, 16);
+
+            /* All lanes should be 2*G */
+            uint8_t privkey_2[32] = {0}; privkey_2[31] = 2;
+            secp256k1_pubkey ep;
+            secp256k1_ec_pubkey_create(secp_ctx, &ep, privkey_2);
+            uint8_t ec[33]; size_t el = 33;
+            secp256k1_ec_pubkey_serialize(secp_ctx, ec, &el, &ep, SECP256K1_EC_COMPRESSED);
+
+            for (int ch = 0; ch < 16; ch++) {
+                uint8_t ac[33];
+                keygen_ge_to_pubkey_bytes(&next_ge[ch], ac, NULL);
+                if (memcmp(ac, ec, 33) != 0) {
+                    char ah[67], eh[67];
+                    bytes_to_hex_helper(ac, 33, ah);
+                    bytes_to_hex_helper(ec, 33, eh);
+                    printf("  [FAIL] 8.6c all-doubling lane%d: SoA=%s expected=%s\n",
+                           ch, ah, eh);
+                    all_pass = 0;
+                    fail_count++;
+                }
+            }
+        }
+
+        if (all_pass) {
+            printf("  [PASS] 8.6 edge cases: SoA point doubling handled correctly\n");
+            pass_count++;
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 8.7  SoA vs AoS bit-exact consistency                                 */
+    /* ------------------------------------------------------------------ */
+    {
+        printf("  [8.7 SoA vs AoS bit-exact consistency]\n");
+        int all_pass = 1;
+
+        int base_vals[16] = {3, 7, 11, 17, 23, 31, 37, 41,
+                             43, 47, 53, 59, 61, 67, 71, 73};
+        secp256k1_gej chain_gej[16];
+
+        for (int ch = 0; ch < 16; ch++) {
+            uint8_t pk[32] = {0};
+            pk[31] = (uint8_t)base_vals[ch];
+            keygen_privkey_to_gej(secp_ctx, pk, &chain_gej[ch]);
+        }
+
+        /* --- Verification 1: normed=0 --- */
+        {
+            /* AoS version */
+            secp256k1_gej aos_result[16];
+            secp256k1_fe  aos_rzr[16];
+            gej_add_ge_var_16way(aos_result, chain_gej, &G_affine, aos_rzr, 0);
+
+            /* SoA version */
+            secp256k1_gej_16x a_soa;
+            gej_16x_load(&a_soa, chain_gej);
+            secp256k1_gej_16x r_soa;
+            secp256k1_gej soa_result[16];
+            secp256k1_fe  soa_rzr[16];
+            gej_add_ge_var_16way_soa(&r_soa, &a_soa, &G_affine, soa_result, soa_rzr, 0);
+
+            for (int ch = 0; ch < 16; ch++) {
+                secp256k1_fe ax1, ay1, az1, ax2, ay2, az2;
+                ax1 = aos_result[ch].x; secp256k1_fe_normalize(&ax1);
+                ay1 = aos_result[ch].y; secp256k1_fe_normalize(&ay1);
+                az1 = aos_result[ch].z; secp256k1_fe_normalize(&az1);
+                ax2 = soa_result[ch].x; secp256k1_fe_normalize(&ax2);
+                ay2 = soa_result[ch].y; secp256k1_fe_normalize(&ay2);
+                az2 = soa_result[ch].z; secp256k1_fe_normalize(&az2);
+
+                if (!secp256k1_fe_equal(&ax1, &ax2) ||
+                    !secp256k1_fe_equal(&ay1, &ay2) ||
+                    !secp256k1_fe_equal(&az1, &az2)) {
+                    printf("  [FAIL] 8.7a lane%d (base=%d, normed=0): r_aos x/y/z mismatch between AoS and SoA\n",
+                           ch, base_vals[ch]);
+                    all_pass = 0;
+                    fail_count++;
+                }
+
+                /* Compare rzr */
+                secp256k1_fe r1 = aos_rzr[ch], r2 = soa_rzr[ch];
+                secp256k1_fe_normalize(&r1);
+                secp256k1_fe_normalize(&r2);
+                if (!secp256k1_fe_equal(&r1, &r2)) {
+                    printf("  [FAIL] 8.7a lane%d (base=%d, normed=0): rzr mismatch between AoS and SoA\n",
+                           ch, base_vals[ch]);
+                    all_pass = 0;
+                    fail_count++;
+                }
+            }
+        }
+
+        /* --- Verification 2: normed=1 (requires one step of normed=0 first) --- */
+        {
+            /* First step: normed=0 to produce normalized output as input for normed=1 */
+            secp256k1_gej aos_step1[16], soa_step1[16];
+            secp256k1_fe  aos_rzr1[16], soa_rzr1[16];
+
+            gej_add_ge_var_16way(aos_step1, chain_gej, &G_affine, aos_rzr1, 0);
+
+            secp256k1_gej_16x a_soa, r_soa_step1;
+            gej_16x_load(&a_soa, chain_gej);
+            gej_add_ge_var_16way_soa(&r_soa_step1, &a_soa, &G_affine, soa_step1, soa_rzr1, 0);
+
+            /* Second step: normed=1 */
+            secp256k1_gej aos_step2[16], soa_step2[16];
+            secp256k1_fe  aos_rzr2[16], soa_rzr2[16];
+
+            gej_add_ge_var_16way(aos_step2, aos_step1, &G_affine, aos_rzr2, 1);
+
+            secp256k1_gej_16x r_soa_step2;
+            gej_add_ge_var_16way_soa(&r_soa_step2, &r_soa_step1, &G_affine, soa_step2, soa_rzr2, 1);
+
+            for (int ch = 0; ch < 16; ch++) {
+                secp256k1_fe ax1, ay1, az1, ax2, ay2, az2;
+                ax1 = aos_step2[ch].x; secp256k1_fe_normalize(&ax1);
+                ay1 = aos_step2[ch].y; secp256k1_fe_normalize(&ay1);
+                az1 = aos_step2[ch].z; secp256k1_fe_normalize(&az1);
+                ax2 = soa_step2[ch].x; secp256k1_fe_normalize(&ax2);
+                ay2 = soa_step2[ch].y; secp256k1_fe_normalize(&ay2);
+                az2 = soa_step2[ch].z; secp256k1_fe_normalize(&az2);
+
+                if (!secp256k1_fe_equal(&ax1, &ax2) ||
+                    !secp256k1_fe_equal(&ay1, &ay2) ||
+                    !secp256k1_fe_equal(&az1, &az2)) {
+                    printf("  [FAIL] 8.7b lane%d (base=%d, normed=1): r_aos x/y/z mismatch between AoS and SoA\n",
+                           ch, base_vals[ch]);
+                    all_pass = 0;
+                    fail_count++;
+                }
+
+                /* Compare rzr */
+                secp256k1_fe r1 = aos_rzr2[ch], r2 = soa_rzr2[ch];
+                secp256k1_fe_normalize(&r1);
+                secp256k1_fe_normalize(&r2);
+                if (!secp256k1_fe_equal(&r1, &r2)) {
+                    printf("  [FAIL] 8.7b lane%d (base=%d, normed=1): rzr mismatch between AoS and SoA\n",
+                           ch, base_vals[ch]);
+                    all_pass = 0;
+                    fail_count++;
+                }
+            }
+        }
+
+        if (all_pass) {
+            printf("  [PASS] 8.7 SoA vs AoS bit-exact consistency: fully matched\n");
+            pass_count++;
+        }
+    }
+}
+
+/* ------------------------------------------------------------------
+ * test_keygen_ge_to_pubkey_bytes_16way
+ *
+ * Verify keygen_ge_to_pubkey_bytes_16way (AVX-512 batch pubkey byte conversion)
+ * produces bit-exact results compared with scalar keygen_ge_to_pubkey_bytes and
+ * the secp256k1 public API.
+ *
+ * Coverage scenarios:
+ *   8.8a  Compressed format: 16way vs scalar, 33-byte compressed pubkey bit-exact
+ *   8.8b  Uncompressed format: 16way vs scalar, 65-byte uncompressed pubkey bit-exact
+ *   8.8c  Public API comparison: 16way output vs secp256k1_ec_pubkey_serialize
+ *   8.8d  NULL pointer skip: compressed_out or uncompressed_out partially NULL
+ * ------------------------------------------------------------------ */
+static void test_keygen_ge_to_pubkey_bytes_16way(void) {
+    printf("\n=== keygen_ge_to_pubkey_bytes_16way tests ===\n");
+
+    /* Use 16 distinct known private keys to generate ge points */
+    static const int base_keys[16] = {
+        3, 7, 11, 17, 23, 31, 37, 41,
+        43, 47, 53, 59, 61, 67, 71, 73
+    };
+
+    secp256k1_scalar tweak;
+    secp256k1_scalar_set_int(&tweak, 1);
+
+    secp256k1_ge ge_points[16];
+    secp256k1_scalar scalars[16];
+
+    /* Generate 16 ge points */
+    for (int i = 0; i < 16; i++) {
+        secp256k1_scalar s;
+        secp256k1_scalar_set_int(&s, (unsigned int)base_keys[i]);
+        scalars[i] = s;
+
+        uint8_t pk[32];
+        secp256k1_scalar_get_b32(pk, &s);
+
+        secp256k1_gej gej;
+        keygen_privkey_to_gej(secp_ctx, pk, &gej);
+
+        /* Single-point normalization */
+        secp256k1_ge_set_gej(&ge_points[i], &gej);
+    }
+
+    /* ---- 8.8a compressed format: 16way vs scalar ---- */
+    {
+        int pass = 1;
+        uint8_t comp_16way[16][33];
+        uint8_t uncomp_16way[16][65];
+        uint8_t *comp_ptrs[16], *uncomp_ptrs[16];
+        for (int i = 0; i < 16; i++) {
+            comp_ptrs[i] = comp_16way[i];
+            uncomp_ptrs[i] = uncomp_16way[i];
+        }
+        keygen_ge_to_pubkey_bytes_16way(ge_points, comp_ptrs, uncomp_ptrs);
+
+        for (int i = 0; i < 16; i++) {
+            uint8_t comp_scalar[33];
+            uint8_t uncomp_scalar[65];
+            keygen_ge_to_pubkey_bytes(&ge_points[i], comp_scalar, uncomp_scalar);
+
+            if (memcmp(comp_16way[i], comp_scalar, 33) != 0) {
+                char hex16[67], hexsc[67];
+                bytes_to_hex_helper(comp_16way[i], 33, hex16);
+                bytes_to_hex_helper(comp_scalar, 33, hexsc);
+                printf("  [FAIL] 8.8a lane%d compressed: 16way=%s scalar=%s\n",
+                       i, hex16, hexsc);
+                pass = 0;
+                fail_count++;
+            }
+        }
+        if (pass) {
+            printf("  [PASS] 8.8a compressed format: 16way vs scalar bit-exact for all 16 lanes\n");
+            pass_count++;
+        }
+    }
+
+    /* ---- 8.8b uncompressed format: 16way vs scalar ---- */
+    {
+        int pass = 1;
+        uint8_t comp_16way[16][33];
+        uint8_t uncomp_16way[16][65];
+        uint8_t *comp_ptrs[16], *uncomp_ptrs[16];
+        for (int i = 0; i < 16; i++) {
+            comp_ptrs[i] = comp_16way[i];
+            uncomp_ptrs[i] = uncomp_16way[i];
+        }
+        keygen_ge_to_pubkey_bytes_16way(ge_points, comp_ptrs, uncomp_ptrs);
+
+        for (int i = 0; i < 16; i++) {
+            uint8_t comp_scalar[33];
+            uint8_t uncomp_scalar[65];
+            keygen_ge_to_pubkey_bytes(&ge_points[i], comp_scalar, uncomp_scalar);
+
+            if (memcmp(uncomp_16way[i], uncomp_scalar, 65) != 0) {
+                char hex16[131], hexsc[131];
+                bytes_to_hex_helper(uncomp_16way[i], 65, hex16);
+                bytes_to_hex_helper(uncomp_scalar, 65, hexsc);
+                printf("  [FAIL] 8.8b lane%d uncompressed: 16way=%s scalar=%s\n",
+                       i, hex16, hexsc);
+                pass = 0;
+                fail_count++;
+            }
+        }
+        if (pass) {
+            printf("  [PASS] 8.8b uncompressed format: 16way vs scalar bit-exact for all 16 lanes\n");
+            pass_count++;
+        }
+    }
+
+    /* ---- 8.8c public API comparison: 16way output vs secp256k1_ec_pubkey_serialize ---- */
+    {
+        int pass = 1;
+        uint8_t comp_16way[16][33];
+        uint8_t uncomp_16way[16][65];
+        uint8_t *comp_ptrs[16], *uncomp_ptrs[16];
+        for (int i = 0; i < 16; i++) {
+            comp_ptrs[i] = comp_16way[i];
+            uncomp_ptrs[i] = uncomp_16way[i];
+        }
+        keygen_ge_to_pubkey_bytes_16way(ge_points, comp_ptrs, uncomp_ptrs);
+
+        for (int i = 0; i < 16; i++) {
+            uint8_t pk[32];
+            secp256k1_scalar_get_b32(pk, &scalars[i]);
+
+            secp256k1_pubkey api_pubkey;
+            secp256k1_ec_pubkey_create(secp_ctx, &api_pubkey, pk);
+
+            uint8_t api_comp[33], api_uncomp[65];
+            size_t len_c = 33, len_u = 65;
+            secp256k1_ec_pubkey_serialize(secp_ctx, api_comp, &len_c,
+                                          &api_pubkey, SECP256K1_EC_COMPRESSED);
+            secp256k1_ec_pubkey_serialize(secp_ctx, api_uncomp, &len_u,
+                                          &api_pubkey, SECP256K1_EC_UNCOMPRESSED);
+
+            if (memcmp(comp_16way[i], api_comp, 33) != 0) {
+                char hex16[67], hexapi[67];
+                bytes_to_hex_helper(comp_16way[i], 33, hex16);
+                bytes_to_hex_helper(api_comp, 33, hexapi);
+                printf("  [FAIL] 8.8c lane%d compressed vs API: 16way=%s API=%s\n",
+                       i, hex16, hexapi);
+                pass = 0;
+                fail_count++;
+            }
+
+            if (memcmp(uncomp_16way[i], api_uncomp, 65) != 0) {
+                char hex16[131], hexapi[131];
+                bytes_to_hex_helper(uncomp_16way[i], 65, hex16);
+                bytes_to_hex_helper(api_uncomp, 65, hexapi);
+                printf("  [FAIL] 8.8c lane%d uncompressed vs API: 16way=%s API=%s\n",
+                       i, hex16, hexapi);
+                pass = 0;
+                fail_count++;
+            }
+        }
+        if (pass) {
+            printf("  [PASS] 8.8c public API comparison: 16way output matches secp256k1 API for all 16 lanes\n");
+            pass_count++;
+        }
+    }
+
+    /* ---- 8.8d NULL pointer skip test ---- */
+    {
+        int pass = 1;
+
+        /* Test 1: pass NULL for all compressed_out, only output uncompressed */
+        {
+            uint8_t uncomp_16way[16][65];
+            uint8_t *uncomp_ptrs[16];
+            for (int i = 0; i < 16; i++)
+                uncomp_ptrs[i] = uncomp_16way[i];
+            keygen_ge_to_pubkey_bytes_16way(ge_points, NULL, uncomp_ptrs);
+
+            for (int i = 0; i < 16; i++) {
+                uint8_t uncomp_scalar[65];
+                keygen_ge_to_pubkey_bytes(&ge_points[i], NULL, uncomp_scalar);
+                if (memcmp(uncomp_16way[i], uncomp_scalar, 65) != 0) {
+                    printf("  [FAIL] 8.8d NULL compressed: lane%d uncompressed mismatch\n", i);
+                    pass = 0;
+                    fail_count++;
+                }
+            }
+        }
+
+        /* Test 2: pass NULL for all uncompressed_out, only output compressed */
+        {
+            uint8_t comp_16way[16][33];
+            uint8_t *comp_ptrs[16];
+            for (int i = 0; i < 16; i++)
+                comp_ptrs[i] = comp_16way[i];
+            keygen_ge_to_pubkey_bytes_16way(ge_points, comp_ptrs, NULL);
+
+            for (int i = 0; i < 16; i++) {
+                uint8_t comp_scalar[33];
+                keygen_ge_to_pubkey_bytes(&ge_points[i], comp_scalar, NULL);
+                if (memcmp(comp_16way[i], comp_scalar, 33) != 0) {
+                    printf("  [FAIL] 8.8d NULL uncompressed: lane%d compressed mismatch\n", i);
+                    pass = 0;
+                    fail_count++;
+                }
+            }
+        }
+
+        /* Test 3: partial lane NULL pointers (even lanes NULL, odd lanes valid) */
+        {
+            uint8_t comp_16way[16][33];
+            uint8_t uncomp_16way[16][65];
+            uint8_t *comp_ptrs[16], *uncomp_ptrs[16];
+            for (int i = 0; i < 16; i++) {
+                comp_ptrs[i]   = (i % 2 == 0) ? NULL : comp_16way[i];
+                uncomp_ptrs[i] = (i % 2 == 0) ? uncomp_16way[i] : NULL;
+            }
+            keygen_ge_to_pubkey_bytes_16way(ge_points, comp_ptrs, uncomp_ptrs);
+
+            for (int i = 0; i < 16; i++) {
+                if (i % 2 == 0) {
+                    /* Even lane: uncompressed should be correct */
+                    uint8_t uncomp_scalar[65];
+                    keygen_ge_to_pubkey_bytes(&ge_points[i], NULL, uncomp_scalar);
+                    if (memcmp(uncomp_16way[i], uncomp_scalar, 65) != 0) {
+                        printf("  [FAIL] 8.8d partial NULL: lane%d uncompressed mismatch\n", i);
+                        pass = 0;
+                        fail_count++;
+                    }
+                } else {
+                    /* Odd lane: compressed should be correct */
+                    uint8_t comp_scalar[33];
+                    keygen_ge_to_pubkey_bytes(&ge_points[i], comp_scalar, NULL);
+                    if (memcmp(comp_16way[i], comp_scalar, 33) != 0) {
+                        printf("  [FAIL] 8.8d partial NULL: lane%d compressed mismatch\n", i);
+                        pass = 0;
+                        fail_count++;
+                    }
+                }
+            }
+        }
+
+        if (pass) {
+            printf("  [PASS] 8.8d NULL pointer skip: all combinations handled correctly\n");
+            pass_count++;
+        }
+    }
+}
+
+/* ------------------------------------------------------------------
  * test_avx512ifma_16way_full_pipeline
  *
- * Verify end-to-end correctness of the entire 16-way concurrent pipeline under __AVX512IFMA__:
- *   gej_add_ge_var_16way  →  keygen_batch_normalize
- *   →  keygen_ge_to_pubkey_bytes  →  hash160_16way_compressed_prepadded
+ * Verify end-to-end correctness of the entire 16-way concurrent pipeline under __AVX512IFMA__,
+ * using the exact same interface chain as keysearch.c IFMA path:
+ *   gej_add_ge_var_16way_soa  →  keygen_batch_normalize_rzr
+ *   →  keygen_ge_to_pubkey_bytes_16way  →  hash160_16way_compressed_prepadded
  *   →  hash160_16way_uncompressed_prepadded
  *
  * Final hash160 (compressed/uncompressed) compared with secp256k1 API lane by lane.
  *
  * Coverage scenarios:
  *   9.1  Single batch (BATCH_SIZE=16 steps): each of 16 chains advances 16 steps,
- *        each step uses gej_add_ge_var_16way (step0 normed=0, others normed=1),
- *        keygen_batch_normalize at end of batch,
+ *        each step uses gej_add_ge_var_16way_soa (step0 normed=0, others normed=1),
+ *        keygen_batch_normalize_rzr at end of batch,
+ *        keygen_ge_to_pubkey_bytes_16way for pubkey conversion,
  *        hash160 compared with API lane by lane, step by step.
  *   9.2  Multi-batch (3 batches): each batch with independent random base privkey,
  *        verify no state pollution between batches.
@@ -3043,8 +3813,9 @@ static void test_avx512ifma_16way_full_pipeline(void) {
 
     int all_pass = 1;
 
-    /* Store gej for each step of each chain in each batch */
+    /* Same as keysearch.c: gej_buf + rzr_buf + ge_buf */
     secp256k1_gej gej_buf[16][PIPE_STEPS];
+    secp256k1_fe  rzr_buf[16][PIPE_STEPS];
     secp256k1_ge  ge_buf[16][PIPE_STEPS];
 
     secp256k1_scalar tweak;
@@ -3078,34 +3849,68 @@ static void test_avx512ifma_16way_full_pipeline(void) {
             keygen_privkey_to_gej(secp_ctx, pk, &chain_gej[ch]);
         }
 
-        /* Advance PIPE_STEPS steps, accumulate gej_buf */
+        /* Same as keysearch.c IFMA path: SoA persistent layout + rzr collection
+         *
+         * Storage convention (must match keygen_batch_normalize_rzr expectation):
+         *   gej_buf[ch][step] = INPUT point before add (same as non-IFMA path)
+         *   rzr_buf[ch][step] = Z(output) / Z(input) = Z(gej_buf[ch][step+1]) / Z(gej_buf[ch][step])
+         */
+        secp256k1_gej_16x chain_soa, next_soa;
+        secp256k1_gej next_gej_16[16];  /* must persist across iterations for input storage */
         for (int step = 0; step < PIPE_STEPS; step++) {
-            secp256k1_gej next_gej[16];
-            gej_add_ge_var_16way(next_gej, chain_gej, &G_affine, NULL,
-                                 (step == 0) ? 0 : 1);
+            secp256k1_fe step_rzr[16];
+
+            if (step == 0) {
+                /* First step: AoS->SoA conversion, normed=0 */
+                gej_16x_load(&chain_soa, chain_gej);
+                /* Store input point BEFORE add (non-IFMA convention) */
+                for (int ch = 0; ch < 16; ch++)
+                    gej_buf[ch][0] = chain_gej[ch];
+                gej_add_ge_var_16way_soa(&next_soa, &chain_soa, &G_affine,
+                                         next_gej_16, step_rzr, 0);
+            } else {
+                /* Store input point BEFORE add: previous output = current input */
+                for (int ch = 0; ch < 16; ch++)
+                    gej_buf[ch][step] = next_gej_16[ch];
+                /* Subsequent steps: SoA input already available, normed=1 */
+                gej_add_ge_var_16way_soa(&next_soa, &chain_soa, &G_affine,
+                                         next_gej_16, step_rzr, 1);
+            }
+
             for (int ch = 0; ch < 16; ch++) {
-                gej_buf[ch][step] = next_gej[ch];
-                chain_gej[ch] = next_gej[ch];
+                rzr_buf[ch][step] = step_rzr[ch];
                 secp256k1_scalar_add(&chain_scalar[ch], &chain_scalar[ch], &tweak);
             }
+
+            /* Persist SoA state for next iteration */
+            chain_soa = next_soa;
         }
 
-        /* Batch normalize: call keygen_batch_normalize for each chain */
+        /* Same as keysearch.c: use keygen_batch_normalize_rzr */
         for (int ch = 0; ch < 16; ch++) {
-            keygen_batch_normalize(gej_buf[ch], ge_buf[ch], (size_t)PIPE_STEPS);
+            keygen_batch_normalize_rzr(gej_buf[ch], ge_buf[ch], rzr_buf[ch],
+                                       (size_t)PIPE_STEPS);
         }
 
         /* Verify hash160 step by step, lane by lane */
         for (int step = 0; step < PIPE_STEPS; step++) {
-            /* Build 16-way pre-filled pubkey buffer */
+            /* Same as keysearch.c: use keygen_ge_to_pubkey_bytes_16way for batch conversion */
             uint8_t comp_bufs[16][64];
             uint8_t uncomp_bufs[16][128];
             const uint8_t *comp_ptrs[16];
             const uint8_t *uncomp_ptrs[16];
 
+            secp256k1_ge ge_16[16];
+            uint8_t *comp_out[16];
+            uint8_t *uncomp_out[16];
             for (int lane = 0; lane < 16; lane++) {
-                keygen_ge_to_pubkey_bytes(&ge_buf[lane][step],
-                                         comp_bufs[lane], uncomp_bufs[lane]);
+                ge_16[lane] = ge_buf[lane][step];
+                comp_out[lane] = comp_bufs[lane];
+                uncomp_out[lane] = uncomp_bufs[lane];
+            }
+            keygen_ge_to_pubkey_bytes_16way(ge_16, comp_out, uncomp_out);
+
+            for (int lane = 0; lane < 16; lane++) {
                 sha256_pad_block_33(comp_bufs[lane]);
                 sha256_pad_block2_65(uncomp_bufs[lane]);
                 comp_ptrs[lane]   = comp_bufs[lane];
@@ -3118,11 +3923,12 @@ static void test_avx512ifma_16way_full_pipeline(void) {
             hash160_16way_compressed_prepadded(comp_ptrs,   avx_h160_comp);
             hash160_16way_uncompressed_prepadded(uncomp_ptrs, avx_h160_uncomp);
 
-        /* Compare with API lane by lane */
+            /* Compare with API lane by lane */
             for (int lane = 0; lane < 16; lane++) {
-                /* Compute reference hash160 via API: privkey = init_scalar[lane] + step + 1 */
+                /* Compute reference hash160 via API: privkey = init_scalar[lane] + step
+                 * (gej_buf stores INPUT before add, so ge_buf[step] = (init_scalar+step)*G) */
                 secp256k1_scalar ref_scalar = init_scalar[lane];
-                for (int i = 0; i <= step; i++)
+                for (int i = 0; i < step; i++)
                     secp256k1_scalar_add(&ref_scalar, &ref_scalar, &tweak);
                 uint8_t ref_pk[32];
                 secp256k1_scalar_get_b32(ref_pk, &ref_scalar);
@@ -3591,6 +4397,8 @@ int main(void) {
 #ifdef __AVX512IFMA__
         if (__builtin_cpu_supports("avx512ifma")) {
             test_gej_add_ge_var_16way();
+            test_gej_add_ge_var_16way_soa();
+            test_keygen_ge_to_pubkey_bytes_16way();
             test_avx512ifma_16way_full_pipeline();
         }
 #endif

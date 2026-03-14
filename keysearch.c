@@ -183,14 +183,35 @@ static void *search_key(void *arg)
             chain_valid_steps[ch] = BATCH_SIZE;
         }
 
-        /* Inner loop: advance 16 chains one step each, BATCH_SIZE steps total, accumulate without normalizing */
+        /* Inner loop: advance 16 chains one step each, BATCH_SIZE steps total, accumulate without normalizing
+         * Uses SoA persistent layout to eliminate AoS<->SoA conversion in the hot path
+         *
+         * Storage convention (must match keygen_batch_normalize_rzr expectation):
+         *   gej_buf[ch][step] = INPUT point before add (same as non-IFMA path)
+         *   rzr_buf[ch][step] = Z(output) / Z(input) = Z(gej_buf[ch][step+1]) / Z(gej_buf[ch][step])
+         * This way rzr[i] relates gej[i] to gej[i+1], and the backward pass
+         *   inv = inv * rzr[i-1] correctly computes 1/Z[i-1] from 1/Z[i].
+         */
+        secp256k1_gej_16x chain_soa, next_soa;
+        secp256k1_gej next_gej_16[16];  /* must persist across iterations for input storage */
         for (int step = 0; step < BATCH_SIZE; step++) {
             secp256k1_fe step_rzr[16];
-            secp256k1_gej next_gej_16[16];
-            if (step == 0)
-                gej_add_ge_var_16way(next_gej_16, chain_gej, &G_affine, step_rzr, 0);
-            else
-                gej_add_ge_var_16way(next_gej_16, chain_gej, &G_affine, step_rzr, 1);
+            if (step == 0) {
+                /* First step: convert AoS chain_gej to SoA, apply normalize_weak */
+                gej_16x_load(&chain_soa, chain_gej);
+                /* Store input point BEFORE add (non-IFMA convention) */
+                for (int ch = 0; ch < 16; ch++)
+                    gej_buf[ch][0] = chain_gej[ch];
+                gej_add_ge_var_16way_soa(&next_soa, &chain_soa, &G_affine,
+                                         next_gej_16, step_rzr, 0);
+            } else {
+                /* Store input point BEFORE add: previous output = current input */
+                for (int ch = 0; ch < 16; ch++)
+                    gej_buf[ch][step] = next_gej_16[ch];
+                /* Subsequent steps: SoA input already available, skip normalize_weak */
+                gej_add_ge_var_16way_soa(&next_soa, &chain_soa, &G_affine,
+                                         next_gej_16, step_rzr, 1);
+            }
 
             for (int ch = 0; ch < 16; ch++) {
                 /* chain has already overflowed to zero */
@@ -198,16 +219,16 @@ static void *search_key(void *arg)
                     continue;
                 }
 
-                gej_buf[ch][step] = next_gej_16[ch];
                 rzr_buf[ch][step] = step_rzr[ch];
 
                 /* Update each chain state (scalar+1, detect overflow to zero) */
                 if (__builtin_expect(scalar_increment(&chain_scalar[ch]), 0)) {
                     chain_valid_steps[ch] = step + 1;
-                } else {
-                    chain_gej[ch] = next_gej_16[ch];
                 }
             }
+
+            /* Persist SoA state for next iteration (no AoS copy needed) */
+            chain_soa = next_soa;
         }
 
         /* Batch normalize: call keygen_batch_normalize_rzr for each chain */
@@ -223,20 +244,47 @@ static void *search_key(void *arg)
             const uint8_t *comp_ptrs[16];
             const uint8_t *uncomp_ptrs[16];
 
+            /* Collect 16 ge points for this step and detect infinity */
+            secp256k1_ge ge_16[16];
+            int has_infinity = 0;
             for (int lane = 0; lane < 16; lane++) {
                 if (step >= chain_valid_steps[lane] || ge_buf[lane][step].infinity) {
-                    memset(comp_bufs[lane], 0, 64);
-                    memset(uncomp_bufs[lane], 0, 128);
-                    sha256_pad_block_33(comp_bufs[lane]);
-                    sha256_pad_block2_65(uncomp_bufs[lane]);
+                    has_infinity = 1;
+                    ge_16[lane].infinity = 1;
                 } else {
-                    keygen_ge_to_pubkey_bytes(&ge_buf[lane][step],
-                                             comp_bufs[lane], uncomp_bufs[lane]);
+                    ge_16[lane] = ge_buf[lane][step];
+                }
+            }
+
+            if (has_infinity) {
+                /* Slow path: some lanes are infinity, fall back to per-lane processing */
+                for (int lane = 0; lane < 16; lane++) {
+                    if (ge_16[lane].infinity) {
+                        memset(comp_bufs[lane], 0, 64);
+                        memset(uncomp_bufs[lane], 0, 128);
+                    } else {
+                        keygen_ge_to_pubkey_bytes(&ge_16[lane], comp_bufs[lane], uncomp_bufs[lane]);
+                    }
                     sha256_pad_block_33(comp_bufs[lane]);
                     sha256_pad_block2_65(uncomp_bufs[lane]);
+                    comp_ptrs[lane] = comp_bufs[lane];
+                    uncomp_ptrs[lane] = uncomp_bufs[lane];
                 }
-                comp_ptrs[lane] = comp_bufs[lane];
-                uncomp_ptrs[lane] = uncomp_bufs[lane];
+            } else {
+                /* Fast path: all lanes valid, batch convert pubkey bytes via AVX-512 */
+                uint8_t *comp_out[16];
+                uint8_t *uncomp_out[16];
+                for (int lane = 0; lane < 16; lane++) {
+                    comp_out[lane] = comp_bufs[lane];
+                    uncomp_out[lane] = uncomp_bufs[lane];
+                }
+                keygen_ge_to_pubkey_bytes_16way(ge_16, comp_out, uncomp_out);
+                for (int lane = 0; lane < 16; lane++) {
+                    sha256_pad_block_33(comp_bufs[lane]);
+                    sha256_pad_block2_65(uncomp_bufs[lane]);
+                    comp_ptrs[lane] = comp_bufs[lane];
+                    uncomp_ptrs[lane] = uncomp_bufs[lane];
+                }
             }
 
             /* 16-way parallel hash160 computation */
@@ -275,6 +323,8 @@ static void *search_key(void *arg)
                         continue;
 
                     found_flag = 1;
+                    /* gej_buf[lane][step] stores INPUT point = (base + step)*G,
+                     * so the private key is base + step */
                     secp256k1_scalar hit_scalar = chain_base_scalar[lane];
                     for (int i = 0; i < step; i++) {
                         secp256k1_scalar_add(&hit_scalar, &hit_scalar, &tweak_scalar);
@@ -391,21 +441,45 @@ avx512_thread_exit:
             const uint8_t *comp_ptrs[16];
             const uint8_t *uncomp_ptrs[16];
 
+            /* Prepare ge array for batch conversion (pad invalid lanes with last valid point) */
+            secp256k1_ge ge_16[16];
+            int has_infinity = 0;
             for (int lane = 0; lane < 16; lane++) {
                 int idx = b + (lane < valid_count ? lane : valid_count - 1);
-                if (ge_batch[idx].infinity) {
-                    memset(comp_bufs[lane], 0, 64);
-                    memset(uncomp_bufs[lane], 0, 128);
+                ge_16[lane] = ge_batch[idx];
+                if (ge_batch[idx].infinity)
+                    has_infinity = 1;
+            }
+
+            if (has_infinity) {
+                /* Rare path: some lanes are infinity, fall back to per-lane processing */
+                for (int lane = 0; lane < 16; lane++) {
+                    if (ge_16[lane].infinity) {
+                        memset(comp_bufs[lane], 0, 64);
+                        memset(uncomp_bufs[lane], 0, 128);
+                    } else {
+                        keygen_ge_to_pubkey_bytes(&ge_16[lane], comp_bufs[lane], uncomp_bufs[lane]);
+                    }
                     sha256_pad_block_33(comp_bufs[lane]);
                     sha256_pad_block2_65(uncomp_bufs[lane]);
+                    comp_ptrs[lane] = comp_bufs[lane];
+                    uncomp_ptrs[lane] = uncomp_bufs[lane];
                 }
-                else {
-                    keygen_ge_to_pubkey_bytes(&ge_batch[idx], comp_bufs[lane], uncomp_bufs[lane]);
+            } else {
+                /* Fast path: all lanes valid, batch convert pubkey bytes */
+                uint8_t *comp_out[16];
+                uint8_t *uncomp_out[16];
+                for (int lane = 0; lane < 16; lane++) {
+                    comp_out[lane] = comp_bufs[lane];
+                    uncomp_out[lane] = uncomp_bufs[lane];
+                }
+                keygen_ge_to_pubkey_bytes_16way(ge_16, comp_out, uncomp_out);
+                for (int lane = 0; lane < 16; lane++) {
                     sha256_pad_block_33(comp_bufs[lane]);
                     sha256_pad_block2_65(uncomp_bufs[lane]);
+                    comp_ptrs[lane] = comp_bufs[lane];
+                    uncomp_ptrs[lane] = uncomp_bufs[lane];
                 }
-                comp_ptrs[lane] = comp_bufs[lane];
-                uncomp_ptrs[lane] = uncomp_bufs[lane];
             }
 
             /* 16-way parallel hash160 computation (both compressed/uncompressed use pre-padded interface, zero-copy) */
@@ -896,4 +970,5 @@ int main(int argc, char *argv[])
     log_close();
     return 0;
 }
+
 
