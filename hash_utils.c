@@ -448,12 +448,7 @@ static void make_rmd160_block(const uint8_t *msg, size_t msglen, uint8_t block[6
  */
 static void rmd160_state_to_bytes(const uint32_t state[5], uint8_t out[20])
 {
-    for (int i = 0; i < 5; i++) {
-        out[i * 4 + 0] = (uint8_t)(state[i]);
-        out[i * 4 + 1] = (uint8_t)(state[i] >> 8);
-        out[i * 4 + 2] = (uint8_t)(state[i] >> 16);
-        out[i * 4 + 3] = (uint8_t)(state[i] >> 24);
-    }
+    memcpy(out, state, 20);
 }
 
 /*

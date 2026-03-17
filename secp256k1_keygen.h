@@ -103,7 +103,21 @@ void keygen_ge_to_pubkey_bytes(const secp256k1_ge *ge,
                                uint8_t *uncompressed_out);
 
 #ifdef __AVX512IFMA__
-/* AVX-512 IFMA 16-way parallel point addition
+
+#include <immintrin.h>
+
+/* Forward declaration of SoA types used in AVX-512 IFMA path */
+typedef struct {
+    __m512i n[5][2];
+} secp256k1_fe_16x;
+
+typedef struct {
+    secp256k1_fe_16x x;
+    secp256k1_fe_16x y;
+    secp256k1_fe_16x z;
+} secp256k1_gej_16x;
+
+/* AVX-512 IFMA 16-way parallel point addition (AoS interface)
  * normed=0: apply normalize_weak to input coordinates (used for first step)
  * normed=1: skip normalize_weak (caller guarantees magnitude=1, used for subsequent steps)
  */
@@ -112,6 +126,31 @@ void gej_add_ge_var_16way(secp256k1_gej r[16],
                           const secp256k1_ge *b,
                           secp256k1_fe rzr[16],
                           int normed);
+
+/* AVX-512 IFMA 16-way parallel point addition (SoA persistent interface)
+ * Operates directly on SoA layout, eliminating AoS<->SoA conversion in hot loops.
+ * r_aos may be NULL if AoS output is not needed for that call.
+ */
+void gej_add_ge_var_16way_soa(secp256k1_gej_16x *r_soa,
+                              const secp256k1_gej_16x *a_soa,
+                              const secp256k1_ge *b,
+                              secp256k1_gej r_aos[16],
+                              secp256k1_fe rzr_out[16],
+                              int normed);
+
+/* Convert 16 secp256k1_gej elements (AoS) to SoA layout */
+void gej_16x_load(secp256k1_gej_16x *dst, const secp256k1_gej src[16]);
+
+/* Convert SoA layout back to 16 secp256k1_gej elements (AoS) */
+void gej_16x_store(secp256k1_gej dst[16], const secp256k1_gej_16x *src);
+
+/* Batch convert 16 normalized secp256k1_fe to 32-byte big-endian using AVX-512 */
+void fe_get_b32_16way(uint8_t out[16][32], const secp256k1_fe fe_arr[16]);
+
+/* Batch convert 16 affine points to compressed/uncompressed pubkey bytes using AVX-512 */
+void keygen_ge_to_pubkey_bytes_16way(const secp256k1_ge ge[16],
+                                     uint8_t *compressed_out[16],
+                                     uint8_t *uncompressed_out[16]);
 
 #endif /* __AVX512IFMA__ */
 

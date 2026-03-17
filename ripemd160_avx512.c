@@ -326,4 +326,227 @@ void ripemd160_compress_avx512(uint32_t *states[16], const uint8_t *blocks[16])
     rmd_store_16way(states, 4, new4);
 }
 
+/*
+ * ripemd160_compress_avx512_contig — gather-optimized variant for contiguous block arrays.
+ *
+ * When the 16 message blocks reside in a contiguous array (e.g. blocks[16][64]),
+ * this function uses _mm512_i32gather_epi32 to collect each message word from all
+ * 16 blocks in a single instruction, replacing the 16-scalar-load + aligned-buffer
+ * + _mm512_load_si512 path used by load_le32_16way.
+ *
+ * Parameters:
+ *   states : array of 16 pointers to uint32_t[5] state arrays
+ *   base   : pointer to blocks[0][0] (start of contiguous block memory)
+ *   stride : byte distance between consecutive blocks (e.g. 64)
+ */
+__attribute__((target("avx512f,avx512bw")))
+void ripemd160_compress_avx512_contig(uint32_t *states[16], const uint8_t *base, int stride)
+{
+    /* Load 16-lane initial state */
+    __m512i al = load_state_word_16way(states, 0);
+    __m512i bl = load_state_word_16way(states, 1);
+    __m512i cl = load_state_word_16way(states, 2);
+    __m512i dl = load_state_word_16way(states, 3);
+    __m512i el = load_state_word_16way(states, 4);
+    __m512i ar = al, br = bl, cr = cl, dr = dl, er = el;
+
+    /* Save initial state */
+    __m512i s0 = al, s1 = bl, s2 = cl, s3 = dl, s4 = el;
+
+    /* Load 16-lane message words using gather (little-endian, no byte-swap needed) */
+    __m512i w0 = load_le32_contig(base, stride, 0), w1 = load_le32_contig(base, stride, 1);
+    __m512i w2 = load_le32_contig(base, stride, 2), w3 = load_le32_contig(base, stride, 3);
+    __m512i w4 = load_le32_contig(base, stride, 4), w5 = load_le32_contig(base, stride, 5);
+    __m512i w6 = load_le32_contig(base, stride, 6), w7 = load_le32_contig(base, stride, 7);
+    __m512i w8 = load_le32_contig(base, stride, 8), w9 = load_le32_contig(base, stride, 9);
+    __m512i w10 = load_le32_contig(base, stride, 10), w11 = load_le32_contig(base, stride, 11);
+    __m512i w12 = load_le32_contig(base, stride, 12), w13 = load_le32_contig(base, stride, 13);
+    __m512i w14 = load_le32_contig(base, stride, 14), w15 = load_le32_contig(base, stride, 15);
+
+    /* Left chain: rounds 0-15, F */
+    VRL_F(al, bl, cl, dl, el, w0, 11);
+    VRL_F(al, bl, cl, dl, el, w1, 14);
+    VRL_F(al, bl, cl, dl, el, w2, 15);
+    VRL_F(al, bl, cl, dl, el, w3, 12);
+    VRL_F(al, bl, cl, dl, el, w4, 5);
+    VRL_F(al, bl, cl, dl, el, w5, 8);
+    VRL_F(al, bl, cl, dl, el, w6, 7);
+    VRL_F(al, bl, cl, dl, el, w7, 9);
+    VRL_F(al, bl, cl, dl, el, w8, 11);
+    VRL_F(al, bl, cl, dl, el, w9, 13);
+    VRL_F(al, bl, cl, dl, el, w10, 14);
+    VRL_F(al, bl, cl, dl, el, w11, 15);
+    VRL_F(al, bl, cl, dl, el, w12, 6);
+    VRL_F(al, bl, cl, dl, el, w13, 7);
+    VRL_F(al, bl, cl, dl, el, w14, 9);
+    VRL_F(al, bl, cl, dl, el, w15, 8);
+    /* Left chain: rounds 16-31, G */
+    VRL_G(al, bl, cl, dl, el, w7, 7);
+    VRL_G(al, bl, cl, dl, el, w4, 6);
+    VRL_G(al, bl, cl, dl, el, w13, 8);
+    VRL_G(al, bl, cl, dl, el, w1, 13);
+    VRL_G(al, bl, cl, dl, el, w10, 11);
+    VRL_G(al, bl, cl, dl, el, w6, 9);
+    VRL_G(al, bl, cl, dl, el, w15, 7);
+    VRL_G(al, bl, cl, dl, el, w3, 15);
+    VRL_G(al, bl, cl, dl, el, w12, 7);
+    VRL_G(al, bl, cl, dl, el, w0, 12);
+    VRL_G(al, bl, cl, dl, el, w9, 15);
+    VRL_G(al, bl, cl, dl, el, w5, 9);
+    VRL_G(al, bl, cl, dl, el, w2, 11);
+    VRL_G(al, bl, cl, dl, el, w14, 7);
+    VRL_G(al, bl, cl, dl, el, w11, 13);
+    VRL_G(al, bl, cl, dl, el, w8, 12);
+    /* Left chain: rounds 32-47, H */
+    VRL_H(al, bl, cl, dl, el, w3, 11);
+    VRL_H(al, bl, cl, dl, el, w10, 13);
+    VRL_H(al, bl, cl, dl, el, w14, 6);
+    VRL_H(al, bl, cl, dl, el, w4, 7);
+    VRL_H(al, bl, cl, dl, el, w9, 14);
+    VRL_H(al, bl, cl, dl, el, w15, 9);
+    VRL_H(al, bl, cl, dl, el, w8, 13);
+    VRL_H(al, bl, cl, dl, el, w1, 15);
+    VRL_H(al, bl, cl, dl, el, w2, 14);
+    VRL_H(al, bl, cl, dl, el, w7, 8);
+    VRL_H(al, bl, cl, dl, el, w0, 13);
+    VRL_H(al, bl, cl, dl, el, w6, 6);
+    VRL_H(al, bl, cl, dl, el, w13, 5);
+    VRL_H(al, bl, cl, dl, el, w11, 12);
+    VRL_H(al, bl, cl, dl, el, w5, 7);
+    VRL_H(al, bl, cl, dl, el, w12, 5);
+    /* Left chain: rounds 48-63, I */
+    VRL_I(al, bl, cl, dl, el, w1, 11);
+    VRL_I(al, bl, cl, dl, el, w9, 12);
+    VRL_I(al, bl, cl, dl, el, w11, 14);
+    VRL_I(al, bl, cl, dl, el, w10, 15);
+    VRL_I(al, bl, cl, dl, el, w0, 14);
+    VRL_I(al, bl, cl, dl, el, w8, 15);
+    VRL_I(al, bl, cl, dl, el, w12, 9);
+    VRL_I(al, bl, cl, dl, el, w4, 8);
+    VRL_I(al, bl, cl, dl, el, w13, 9);
+    VRL_I(al, bl, cl, dl, el, w3, 14);
+    VRL_I(al, bl, cl, dl, el, w7, 5);
+    VRL_I(al, bl, cl, dl, el, w15, 6);
+    VRL_I(al, bl, cl, dl, el, w14, 8);
+    VRL_I(al, bl, cl, dl, el, w5, 6);
+    VRL_I(al, bl, cl, dl, el, w6, 5);
+    VRL_I(al, bl, cl, dl, el, w2, 12);
+    /* Left chain: rounds 64-79, J */
+    VRL_J(al, bl, cl, dl, el, w4, 9);
+    VRL_J(al, bl, cl, dl, el, w0, 15);
+    VRL_J(al, bl, cl, dl, el, w5, 5);
+    VRL_J(al, bl, cl, dl, el, w9, 11);
+    VRL_J(al, bl, cl, dl, el, w7, 6);
+    VRL_J(al, bl, cl, dl, el, w12, 8);
+    VRL_J(al, bl, cl, dl, el, w2, 13);
+    VRL_J(al, bl, cl, dl, el, w10, 12);
+    VRL_J(al, bl, cl, dl, el, w14, 5);
+    VRL_J(al, bl, cl, dl, el, w1, 12);
+    VRL_J(al, bl, cl, dl, el, w3, 13);
+    VRL_J(al, bl, cl, dl, el, w8, 14);
+    VRL_J(al, bl, cl, dl, el, w11, 11);
+    VRL_J(al, bl, cl, dl, el, w6, 8);
+    VRL_J(al, bl, cl, dl, el, w15, 5);
+    VRL_J(al, bl, cl, dl, el, w13, 6);
+
+    /* Right chain: rounds 0-15, J */
+    VRR_J(ar, br, cr, dr, er, w5, 8);
+    VRR_J(ar, br, cr, dr, er, w14, 9);
+    VRR_J(ar, br, cr, dr, er, w7, 9);
+    VRR_J(ar, br, cr, dr, er, w0, 11);
+    VRR_J(ar, br, cr, dr, er, w9, 13);
+    VRR_J(ar, br, cr, dr, er, w2, 15);
+    VRR_J(ar, br, cr, dr, er, w11, 15);
+    VRR_J(ar, br, cr, dr, er, w4, 5);
+    VRR_J(ar, br, cr, dr, er, w13, 7);
+    VRR_J(ar, br, cr, dr, er, w6, 7);
+    VRR_J(ar, br, cr, dr, er, w15, 8);
+    VRR_J(ar, br, cr, dr, er, w8, 11);
+    VRR_J(ar, br, cr, dr, er, w1, 14);
+    VRR_J(ar, br, cr, dr, er, w10, 14);
+    VRR_J(ar, br, cr, dr, er, w3, 12);
+    VRR_J(ar, br, cr, dr, er, w12, 6);
+    /* Right chain: rounds 16-31, I */
+    VRR_I(ar, br, cr, dr, er, w6, 9);
+    VRR_I(ar, br, cr, dr, er, w11, 13);
+    VRR_I(ar, br, cr, dr, er, w3, 15);
+    VRR_I(ar, br, cr, dr, er, w7, 7);
+    VRR_I(ar, br, cr, dr, er, w0, 12);
+    VRR_I(ar, br, cr, dr, er, w13, 8);
+    VRR_I(ar, br, cr, dr, er, w5, 9);
+    VRR_I(ar, br, cr, dr, er, w10, 11);
+    VRR_I(ar, br, cr, dr, er, w14, 7);
+    VRR_I(ar, br, cr, dr, er, w15, 7);
+    VRR_I(ar, br, cr, dr, er, w8, 12);
+    VRR_I(ar, br, cr, dr, er, w12, 7);
+    VRR_I(ar, br, cr, dr, er, w4, 6);
+    VRR_I(ar, br, cr, dr, er, w9, 15);
+    VRR_I(ar, br, cr, dr, er, w1, 13);
+    VRR_I(ar, br, cr, dr, er, w2, 11);
+    /* Right chain: rounds 32-47, H */
+    VRR_H(ar, br, cr, dr, er, w15, 9);
+    VRR_H(ar, br, cr, dr, er, w5, 7);
+    VRR_H(ar, br, cr, dr, er, w1, 15);
+    VRR_H(ar, br, cr, dr, er, w3, 11);
+    VRR_H(ar, br, cr, dr, er, w7, 8);
+    VRR_H(ar, br, cr, dr, er, w14, 6);
+    VRR_H(ar, br, cr, dr, er, w6, 6);
+    VRR_H(ar, br, cr, dr, er, w9, 14);
+    VRR_H(ar, br, cr, dr, er, w11, 12);
+    VRR_H(ar, br, cr, dr, er, w8, 13);
+    VRR_H(ar, br, cr, dr, er, w12, 5);
+    VRR_H(ar, br, cr, dr, er, w2, 14);
+    VRR_H(ar, br, cr, dr, er, w10, 13);
+    VRR_H(ar, br, cr, dr, er, w0, 13);
+    VRR_H(ar, br, cr, dr, er, w4, 7);
+    VRR_H(ar, br, cr, dr, er, w13, 5);
+    /* Right chain: rounds 48-63, G */
+    VRR_G(ar, br, cr, dr, er, w8, 15);
+    VRR_G(ar, br, cr, dr, er, w6, 5);
+    VRR_G(ar, br, cr, dr, er, w4, 8);
+    VRR_G(ar, br, cr, dr, er, w1, 11);
+    VRR_G(ar, br, cr, dr, er, w3, 14);
+    VRR_G(ar, br, cr, dr, er, w11, 14);
+    VRR_G(ar, br, cr, dr, er, w15, 6);
+    VRR_G(ar, br, cr, dr, er, w0, 14);
+    VRR_G(ar, br, cr, dr, er, w5, 6);
+    VRR_G(ar, br, cr, dr, er, w12, 9);
+    VRR_G(ar, br, cr, dr, er, w2, 12);
+    VRR_G(ar, br, cr, dr, er, w13, 9);
+    VRR_G(ar, br, cr, dr, er, w9, 12);
+    VRR_G(ar, br, cr, dr, er, w7, 5);
+    VRR_G(ar, br, cr, dr, er, w10, 15);
+    VRR_G(ar, br, cr, dr, er, w14, 8);
+    /* Right chain: rounds 64-79, F */
+    VRR_F(ar, br, cr, dr, er, w12, 8);
+    VRR_F(ar, br, cr, dr, er, w15, 5);
+    VRR_F(ar, br, cr, dr, er, w10, 12);
+    VRR_F(ar, br, cr, dr, er, w4, 9);
+    VRR_F(ar, br, cr, dr, er, w1, 12);
+    VRR_F(ar, br, cr, dr, er, w5, 5);
+    VRR_F(ar, br, cr, dr, er, w8, 14);
+    VRR_F(ar, br, cr, dr, er, w7, 6);
+    VRR_F(ar, br, cr, dr, er, w6, 8);
+    VRR_F(ar, br, cr, dr, er, w2, 13);
+    VRR_F(ar, br, cr, dr, er, w13, 6);
+    VRR_F(ar, br, cr, dr, er, w14, 5);
+    VRR_F(ar, br, cr, dr, er, w0, 15);
+    VRR_F(ar, br, cr, dr, er, w3, 13);
+    VRR_F(ar, br, cr, dr, er, w9, 11);
+    VRR_F(ar, br, cr, dr, er, w11, 11);
+
+    /* Merge left and right chains, update state */
+    __m512i new0 = _mm512_add_epi32(_mm512_add_epi32(s1, cl), dr);
+    __m512i new1 = _mm512_add_epi32(_mm512_add_epi32(s2, dl), er);
+    __m512i new2 = _mm512_add_epi32(_mm512_add_epi32(s3, el), ar);
+    __m512i new3 = _mm512_add_epi32(_mm512_add_epi32(s4, al), br);
+    __m512i new4 = _mm512_add_epi32(_mm512_add_epi32(s0, bl), cr);
+
+    rmd_store_16way(states, 0, new0);
+    rmd_store_16way(states, 1, new1);
+    rmd_store_16way(states, 2, new2);
+    rmd_store_16way(states, 3, new3);
+    rmd_store_16way(states, 4, new4);
+}
+
 #endif /* __AVX512F__ */

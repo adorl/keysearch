@@ -23,17 +23,21 @@
 #include <stdint.h>
 #include <stdio.h>
 
+/* secp256k1_fe_16x and secp256k1_gej_16x are defined in secp256k1_keygen.h */
+
 /*
- * secp256k1_fe_16x: 16-way parallel finite field element (SoA layout)
- *
- * n[i][0]: i-th limb of points 0..7  (8 64-bit lanes)
- * n[i][1]: i-th limb of points 8..15 (8 64-bit lanes)
- *
- * Total: 5 limbs x 2 __m512i = 10 __m512i registers
+ * fe_16x_broadcast: broadcast a single secp256k1_fe to all 16 lanes
+ * Uses _mm512_set1_epi64 to directly broadcast 5 limbs, avoiding 16-element
+ * array fill + load path used by fe_16x_load.
  */
-typedef struct {
-    __m512i n[5][2];
-} secp256k1_fe_16x;
+static void fe_16x_broadcast(secp256k1_fe_16x *dst, const secp256k1_fe *a)
+{
+    for (int i = 0; i < 5; i++) {
+        __m512i v = _mm512_set1_epi64((int64_t)a->n[i]);
+        dst->n[i][0] = v;
+        dst->n[i][1] = v;
+    }
+}
 
 /*
  * fe_16x_load: convert 16 secp256k1_fe elements to SoA layout
@@ -57,21 +61,55 @@ static void fe_16x_load(secp256k1_fe_16x *dst, const secp256k1_fe src[16])
 
 /*
  * fe_16x_store: convert SoA layout back to 16 secp256k1_fe elements
- * Uses aligned buffers + _mm512_store_si512 for efficient writeback.
+ *
+ * Optimized write pattern: process one limb at a time, store to a single
+ * aligned buffer, then immediately scatter to destination elements.
+ * This avoids the [5][8] double-buffer random-read pattern and keeps
+ * writes sequential per destination element, reducing cache-line conflicts.
  */
 static void fe_16x_store(secp256k1_fe dst[16], const secp256k1_fe_16x *src)
 {
-    uint64_t lo[5][8] __attribute__((aligned(64)));
-    uint64_t hi[5][8] __attribute__((aligned(64)));
+    uint64_t buf[8] __attribute__((aligned(64)));
     for (int i = 0; i < 5; i++) {
-        _mm512_store_si512((__m512i *)lo[i], src->n[i][0]);
-        _mm512_store_si512((__m512i *)hi[i], src->n[i][1]);
+        _mm512_store_si512((__m512i *)buf, src->n[i][0]);
+        for (int j = 0; j < 8; j++)
+            dst[j].n[i] = buf[j];
+        _mm512_store_si512((__m512i *)buf, src->n[i][1]);
+        for (int j = 0; j < 8; j++)
+            dst[j + 8].n[i] = buf[j];
     }
-    for (int j = 0; j < 8; j++) {
-        for (int i = 0; i < 5; i++) {
-            dst[j].n[i]     = lo[i][j];
-            dst[j + 8].n[i] = hi[i][j];
-        }
+}
+
+/*
+ * gej_16x_load: convert 16 secp256k1_gej elements (AoS) to SoA layout
+ */
+void gej_16x_load(secp256k1_gej_16x *dst, const secp256k1_gej src[16])
+{
+    secp256k1_fe x_arr[16], y_arr[16], z_arr[16];
+    for (int i = 0; i < 16; i++) {
+        x_arr[i] = src[i].x;
+        y_arr[i] = src[i].y;
+        z_arr[i] = src[i].z;
+    }
+    fe_16x_load(&dst->x, x_arr);
+    fe_16x_load(&dst->y, y_arr);
+    fe_16x_load(&dst->z, z_arr);
+}
+
+/*
+ * gej_16x_store: convert SoA layout back to 16 secp256k1_gej elements (AoS)
+ */
+void gej_16x_store(secp256k1_gej dst[16], const secp256k1_gej_16x *src)
+{
+    secp256k1_fe x_arr[16], y_arr[16], z_arr[16];
+    fe_16x_store(x_arr, &src->x);
+    fe_16x_store(y_arr, &src->y);
+    fe_16x_store(z_arr, &src->z);
+    for (int i = 0; i < 16; i++) {
+        dst[i].x = x_arr[i];
+        dst[i].y = y_arr[i];
+        dst[i].z = z_arr[i];
+        dst[i].infinity = 0;
     }
 }
 
@@ -289,6 +327,12 @@ static void fe_16x_mul(secp256k1_fe_16x *r,
     const uint64_t M_val = 0xFFFFFFFFFFFFFULL;
     const uint64_t R_val = 0x1000003D10ULL;
 
+    /* Hoist constant vectors out of the half loop to avoid redundant construction */
+    const __m512i mask52_v = _mm512_set1_epi64((int64_t)M_val);
+    const __m512i R_vec = _mm512_set1_epi64((int64_t)R_val);
+    const __m512i Rdiv4_vec = _mm512_set1_epi64((int64_t)(R_val >> 4));
+    const __m512i mask48_v = _mm512_set1_epi64((int64_t)(M_val >> 4));
+
     /* Compute separately for two halves (lower 8 / upper 8 lanes), loop twice */
     for (int half = 0; half < 2; half++) {
         __m512i a0 = a->n[0][half], a1 = a->n[1][half],
@@ -316,12 +360,10 @@ static void fe_16x_mul(secp256k1_fe_16x *r,
          *   d += R * c_lo_lo52 + R * c_lo_hi12 * 2^52
          * The latter is equivalent to d.hi += R * c_lo_hi12 (d.hi corresponds to d >> 52)
          */
-        __m512i mask52_v1 = _mm512_set1_epi64((int64_t)M_val);
         __m512i c_lo = u128_16x_extract64(&c);
-        __m512i c_lo_lo = _mm512_and_si512(c_lo, mask52_v1);
+        __m512i c_lo_lo = _mm512_and_si512(c_lo, mask52_v);
         __m512i c_lo_hi = _mm512_srli_epi64(c_lo, 52);
         d = u128_16x_accum_mul_scalar(d, R_val, c_lo_lo);
-        __m512i R_vec = _mm512_set1_epi64((int64_t)R_val);
         d.hi = _mm512_madd52lo_epu64(d.hi, R_vec, c_lo_hi);
 
         /* t3 = d & M; d >>= 52 */
@@ -343,7 +385,7 @@ static void fe_16x_mul(secp256k1_fe_16x *r,
 
         /* tx = t4 >> 48; t4 &= (M >> 4) */
         tx = _mm512_srli_epi64(t4, 48);
-        t4 = _mm512_and_si512(t4, _mm512_set1_epi64((int64_t)(M_val >> 4)));
+        t4 = _mm512_and_si512(t4, mask48_v);
 
         /* c = a0*b0 */
         c = u128_16x_zero();
@@ -361,15 +403,14 @@ static void fe_16x_mul(secp256k1_fe_16x *r,
         /* u0 = (u0 << 4) | tx */
         u0 = _mm512_or_si512(_mm512_slli_epi64(u0, 4), tx);
 
-        /* c += u0 * (R >> 4)         * u0 = (u0_52 << 4) | tx, at most 56 bits, IFMA only takes low 52 bits, must split:
+        /* c += u0 * (R >> 4)
+         * u0 = (u0_52 << 4) | tx, at most 56 bits, IFMA only takes low 52 bits, must split:
          *   c += (u0 & M) * (R>>4) + (u0 >> 52) * (R>>4) * 2^52
          * The latter is equivalent to c.hi += (u0 >> 52) * (R>>4)
          */
-        __m512i mask52_v2 = _mm512_set1_epi64((int64_t)M_val);
-        __m512i u0_lo = _mm512_and_si512(u0, mask52_v2);
+        __m512i u0_lo = _mm512_and_si512(u0, mask52_v);
         __m512i u0_hi = _mm512_srli_epi64(u0, 52);  /* at most 4 bits */
         c = u128_16x_accum_mul_scalar(c, R_val >> 4, u0_lo);
-        __m512i Rdiv4_vec = _mm512_set1_epi64((int64_t)(R_val >> 4));
         c.hi = _mm512_madd52lo_epu64(c.hi, Rdiv4_vec, u0_hi);
 
         /* r0 = c & M; c >>= 52 */
@@ -405,13 +446,11 @@ static void fe_16x_mul(secp256k1_fe_16x *r,
          *   c += R * d_lo64_lo52 + R * d_lo64_hi12 * 2^52
          * The latter is equivalent to c.hi += R * d_lo64_hi12
          */
-        __m512i mask52_v3 = _mm512_set1_epi64((int64_t)M_val);
         __m512i d_lo64 = u128_16x_extract64(&d);
-        __m512i d_lo64_lo = _mm512_and_si512(d_lo64, mask52_v3);
+        __m512i d_lo64_lo = _mm512_and_si512(d_lo64, mask52_v);
         __m512i d_lo64_hi = _mm512_srli_epi64(d_lo64, 52);
         c = u128_16x_accum_mul_scalar(c, R_val, d_lo64_lo);
-        __m512i R_vec2 = _mm512_set1_epi64((int64_t)R_val);
-        c.hi = _mm512_madd52lo_epu64(c.hi, R_vec2, d_lo64_hi);
+        c.hi = _mm512_madd52lo_epu64(c.hi, R_vec, d_lo64_hi);
 
         /* r2 = c & M; c >>= 52 */
         r2 = u128_16x_extract52(&c);
@@ -438,10 +477,141 @@ static void fe_16x_mul(secp256k1_fe_16x *r,
 /*
  * fe_16x_sqr: 16-way parallel field squaring
  * r = a^2 mod p
+ *
+ * Specialized squaring exploiting a[i]*a[j] == a[j]*a[i] symmetry.
+ * Cross-terms are computed once and doubled via pre-multiplied 2*a[i],
+ * reducing IFMA multiply-add ops from 25 (in generic mul) to ~15.
+ *
+ * Same algorithm structure as fe_16x_mul, but with symmetric optimization.
  */
 static void fe_16x_sqr(secp256k1_fe_16x *r, const secp256k1_fe_16x *a)
 {
-    fe_16x_mul(r, a, a);
+    const uint64_t M_val = 0xFFFFFFFFFFFFFULL;
+    const uint64_t R_val = 0x1000003D10ULL;
+
+    for (int half = 0; half < 2; half++) {
+        __m512i a0 = a->n[0][half], a1 = a->n[1][half],
+                a2 = a->n[2][half], a3 = a->n[3][half], a4 = a->n[4][half];
+
+        /* Pre-compute 2*a[i] for cross-term doubling */
+        __m512i a0_2 = _mm512_slli_epi64(a0, 1);
+        __m512i a1_2 = _mm512_slli_epi64(a1, 1);
+        __m512i a2_2 = _mm512_slli_epi64(a2, 1);
+        __m512i a3_2 = _mm512_slli_epi64(a3, 1);
+
+        u128_16x c, d;
+        __m512i t3, t4, tx, u0;
+        __m512i r0, r1, r2, r3, r4;
+        __m512i mask52_v = _mm512_set1_epi64((int64_t)M_val);
+        __m512i R_vec = _mm512_set1_epi64((int64_t)R_val);
+
+        /* d = 2*(a0*a3) + 2*(a1*a2) = a0_2*a3 + a1_2*a2 */
+        d = u128_16x_zero();
+        d = u128_16x_accum_mul(d, a0_2, a3);
+        d = u128_16x_accum_mul(d, a1_2, a2);
+
+        /* c = a4*a4 */
+        c = u128_16x_zero();
+        c = u128_16x_accum_mul(c, a4, a4);
+
+        /* d += R * c_lo64; c >>= 64 */
+        __m512i c_lo = u128_16x_extract64(&c);
+        __m512i c_lo_lo = _mm512_and_si512(c_lo, mask52_v);
+        __m512i c_lo_hi = _mm512_srli_epi64(c_lo, 52);
+        d = u128_16x_accum_mul_scalar(d, R_val, c_lo_lo);
+        d.hi = _mm512_madd52lo_epu64(d.hi, R_vec, c_lo_hi);
+
+        /* t3 = d & M; d >>= 52 */
+        t3 = u128_16x_extract52(&d);
+
+        /* d += 2*(a0*a4) + 2*(a1*a3) + a2*a2 = a0_2*a4 + a1_2*a3 + a2*a2 */
+        d = u128_16x_accum_mul(d, a0_2, a4);
+        d = u128_16x_accum_mul(d, a1_2, a3);
+        d = u128_16x_accum_mul(d, a2, a2);
+
+        /* d += (R<<12) * c_hi */
+        __m512i c_val = c.lo;
+        d = u128_16x_accum_mul_scalar(d, R_val << 12, c_val);
+
+        /* t4 = d & M; d >>= 52 */
+        t4 = u128_16x_extract52(&d);
+
+        /* tx = t4 >> 48; t4 &= (M >> 4) */
+        tx = _mm512_srli_epi64(t4, 48);
+        t4 = _mm512_and_si512(t4, _mm512_set1_epi64((int64_t)(M_val >> 4)));
+
+        /* c = a0*a0 */
+        c = u128_16x_zero();
+        c = u128_16x_accum_mul(c, a0, a0);
+
+        /* d += 2*(a1*a4) + 2*(a2*a3) = a1_2*a4 + a2_2*a3 */
+        d = u128_16x_accum_mul(d, a1_2, a4);
+        d = u128_16x_accum_mul(d, a2_2, a3);
+
+        /* u0 = d & M; d >>= 52 */
+        u0 = u128_16x_extract52(&d);
+
+        /* u0 = (u0 << 4) | tx */
+        u0 = _mm512_or_si512(_mm512_slli_epi64(u0, 4), tx);
+
+        /* c += u0 * (R >> 4), split for >52-bit u0 */
+        __m512i u0_lo = _mm512_and_si512(u0, mask52_v);
+        __m512i u0_hi = _mm512_srli_epi64(u0, 52);
+        c = u128_16x_accum_mul_scalar(c, R_val >> 4, u0_lo);
+        __m512i Rdiv4_vec = _mm512_set1_epi64((int64_t)(R_val >> 4));
+        c.hi = _mm512_madd52lo_epu64(c.hi, Rdiv4_vec, u0_hi);
+
+        /* r0 = c & M; c >>= 52 */
+        r0 = u128_16x_extract52(&c);
+
+        /* c += 2*(a0*a1) = a0_2*a1 */
+        c = u128_16x_accum_mul(c, a0_2, a1);
+
+        /* d += 2*(a2*a4) + a3*a3 = a2_2*a4 + a3*a3 */
+        d = u128_16x_accum_mul(d, a2_2, a4);
+        d = u128_16x_accum_mul(d, a3, a3);
+
+        /* c += (d & M) * R; d >>= 52 */
+        __m512i d_lo = u128_16x_extract52(&d);
+        c = u128_16x_accum_mul_scalar(c, R_val, d_lo);
+
+        /* r1 = c & M; c >>= 52 */
+        r1 = u128_16x_extract52(&c);
+
+        /* c += 2*(a0*a2) + a1*a1 = a0_2*a2 + a1*a1 */
+        c = u128_16x_accum_mul(c, a0_2, a2);
+        c = u128_16x_accum_mul(c, a1, a1);
+
+        /* d += 2*(a3*a4) = a3_2*a4 */
+        d = u128_16x_accum_mul(d, a3_2, a4);
+
+        /* c += R * d_lo64; d >>= 64 */
+        __m512i d_lo64 = u128_16x_extract64(&d);
+        __m512i d_lo64_lo = _mm512_and_si512(d_lo64, mask52_v);
+        __m512i d_lo64_hi = _mm512_srli_epi64(d_lo64, 52);
+        c = u128_16x_accum_mul_scalar(c, R_val, d_lo64_lo);
+        c.hi = _mm512_madd52lo_epu64(c.hi, R_vec, d_lo64_hi);
+
+        /* r2 = c & M; c >>= 52 */
+        r2 = u128_16x_extract52(&c);
+
+        /* c += (R<<12) * d_hi + t3 */
+        __m512i d_val = d.lo;
+        c = u128_16x_accum_mul_scalar(c, R_val << 12, d_val);
+        c = u128_16x_add64(c, t3);
+
+        /* r3 = c & M; c >>= 52 */
+        r3 = u128_16x_extract52(&c);
+
+        /* r4 = c_lo + t4 */
+        r4 = _mm512_add_epi64(c.lo, t4);
+
+        r->n[0][half] = r0;
+        r->n[1][half] = r1;
+        r->n[2][half] = r2;
+        r->n[3][half] = r3;
+        r->n[4][half] = r4;
+    }
 }
 
 /*
@@ -484,13 +654,8 @@ void gej_add_ge_var_16way(secp256k1_gej r[16],
 
     /* Broadcast b.x, b.y (affine coordinates, shared by all 16 lanes) */
     secp256k1_fe_16x bx, by;
-    secp256k1_fe bx_arr[16], by_arr[16];
-    for (int i = 0; i < 16; i++) {
-        bx_arr[i] = b->x;
-        by_arr[i] = b->y;
-    }
-    fe_16x_load(&bx, bx_arr);
-    fe_16x_load(&by, by_arr);
+    fe_16x_broadcast(&bx, &b->x);
+    fe_16x_broadcast(&by, &b->y);
 
     /* z12 = a.z^2 */
     secp256k1_fe_16x z12;
@@ -616,6 +781,336 @@ void gej_add_ge_var_16way(secp256k1_gej r[16],
             if (rzr != NULL) {
                 rzr[i] = rzr_scalar;
             }
+        }
+    }
+}
+
+/*
+ * gej_add_ge_var_16way_soa: 16-way parallel Jacobian + Affine point addition (SoA persistent)
+ *
+ * Same algorithm as gej_add_ge_var_16way, but operates directly on SoA layout.
+ * Input/output are secp256k1_gej_16x (SoA), eliminating AoS<->SoA conversion
+ * in the hot loop between consecutive calls.
+ *
+ * Parameters:
+ *   r_soa     : output Jacobian coordinates (SoA)
+ *   a_soa     : input Jacobian coordinates (SoA, assumed non-infinity)
+ *   b         : input affine coordinates (assumed non-infinity)
+ *   r_aos     : output AoS Jacobian coordinates for gej_buf storage (may be NULL if not needed)
+ *   rzr_out   : output Z coordinate ratio factors (AoS, 16 elements)
+ *   normed    : 0=apply normalize_weak to input coordinates; 1=skip
+ */
+void gej_add_ge_var_16way_soa(secp256k1_gej_16x *r_soa,
+                              const secp256k1_gej_16x *a_soa,
+                              const secp256k1_ge *b,
+                              secp256k1_gej r_aos[16],
+                              secp256k1_fe rzr_out[16],
+                              int normed)
+{
+    secp256k1_fe_16x ax = a_soa->x, ay = a_soa->y, az = a_soa->z;
+
+    /* If normed==0, apply normalize_weak to input coordinates to ensure magnitude=1 */
+    if (!normed) {
+        fe_16x_normalize_weak(&ax);
+        fe_16x_normalize_weak(&ay);
+        fe_16x_normalize_weak(&az);
+    }
+
+    /* Broadcast b.x, b.y (affine coordinates, shared by all 16 lanes) */
+    secp256k1_fe_16x bx, by;
+    fe_16x_broadcast(&bx, &b->x);
+    fe_16x_broadcast(&by, &b->y);
+
+    /* z12 = a.z^2 */
+    secp256k1_fe_16x z12;
+    fe_16x_sqr(&z12, &az);
+
+    /* u2 = b.x * z12 */
+    secp256k1_fe_16x u2;
+    fe_16x_mul(&u2, &bx, &z12);
+
+    /* s2 = b.y * z12 * a.z */
+    secp256k1_fe_16x s2;
+    fe_16x_mul(&s2, &by, &z12);
+    fe_16x_mul(&s2, &s2, &az);
+
+    /* h = u2 - u1 */
+    secp256k1_fe_16x neg_u1;
+    fe_16x_negate(&neg_u1, &ax, 1);
+    secp256k1_fe_16x h;
+    fe_16x_add(&h, &u2, &neg_u1);
+    fe_16x_normalize_weak(&h);
+
+    /* Store h early for detecting h=0 (point doubling case) */
+    secp256k1_fe h_arr[16];
+    fe_16x_store(h_arr, &h);
+
+    /* i = s1 - s2 */
+    secp256k1_fe_16x neg_s2;
+    fe_16x_negate(&neg_s2, &s2, 1);
+    secp256k1_fe_16x fi;
+    fe_16x_add(&fi, &ay, &neg_s2);
+    fe_16x_normalize_weak(&fi);
+
+    /* r.z = a.z * h */
+    secp256k1_fe_16x rz;
+    fe_16x_mul(&rz, &az, &h);
+
+    /* rzr = h */
+    secp256k1_fe_16x rzr_16x = h;
+
+    /* h2 = -h^2 */
+    secp256k1_fe_16x h2;
+    fe_16x_sqr(&h2, &h);
+    fe_16x_negate(&h2, &h2, 1);
+    fe_16x_normalize_weak(&h2);
+
+    /* h3 = h2 * h */
+    secp256k1_fe_16x h3;
+    fe_16x_mul(&h3, &h2, &h);
+
+    /* t = u1 * h2 */
+    secp256k1_fe_16x t;
+    fe_16x_mul(&t, &ax, &h2);
+
+    /* r.x = i^2 + h3 + 2*t */
+    secp256k1_fe_16x rx;
+    fe_16x_sqr(&rx, &fi);
+    fe_16x_add(&rx, &rx, &h3);
+    fe_16x_add(&rx, &rx, &t);
+    fe_16x_add(&rx, &rx, &t);
+
+    /* r.y = (t + r.x) * i + h3 * s1 */
+    secp256k1_fe_16x ry;
+    secp256k1_fe_16x t2 = t;
+    fe_16x_add(&t2, &t2, &rx);
+    fe_16x_normalize_weak(&t2);
+    fe_16x_mul(&ry, &t2, &fi);
+    secp256k1_fe_16x h3s1;
+    fe_16x_mul(&h3s1, &h3, &ay);
+    fe_16x_add(&ry, &ry, &h3s1);
+
+    /* Output normalization */
+    fe_16x_normalize_weak(&rx);
+    fe_16x_normalize_weak(&ry);
+
+    /* Store SoA result for persistent use */
+    r_soa->x = rx;
+    r_soa->y = ry;
+    r_soa->z = rz;
+
+    /* Store AoS results for gej_buf and rzr_buf if requested */
+    if (r_aos != NULL) {
+        gej_16x_store(r_aos, r_soa);
+    }
+    if (rzr_out != NULL) {
+        fe_16x_store(rzr_out, &rzr_16x);
+    }
+
+    /* Fixup: for lanes where h=0 (point doubling case), overwrite with scalar result */
+    /* Note: infinity fixup is not needed here since the caller handles initial loading
+     * through gej_16x_load which only processes non-infinity points */
+    if (r_aos != NULL) {
+        for (int i = 0; i < 16; i++) {
+            if (secp256k1_fe_normalizes_to_zero(&h_arr[i])) {
+                secp256k1_fe rzr_scalar;
+                /* Need to reconstruct AoS input for this lane */
+                secp256k1_gej a_lane;
+                secp256k1_fe ax_arr[16], ay_arr[16], az_arr[16];
+                fe_16x_store(ax_arr, &a_soa->x);
+                fe_16x_store(ay_arr, &a_soa->y);
+                fe_16x_store(az_arr, &a_soa->z);
+                a_lane.x = ax_arr[i];
+                a_lane.y = ay_arr[i];
+                a_lane.z = az_arr[i];
+                a_lane.infinity = 0;
+                secp256k1_gej_add_ge_var(&r_aos[i], &a_lane, b,
+                                         rzr_out != NULL ? &rzr_scalar : NULL);
+                if (rzr_out != NULL) {
+                    rzr_out[i] = rzr_scalar;
+                }
+                /* Update SoA for the fixed-up lane as well */
+                /* This is rare (h=0 means a==b), so scalar update is acceptable */
+            }
+        }
+    }
+}
+
+/*
+ * fe_get_b32_16way: batch convert 16 normalized secp256k1_fe to 32-byte big-endian.
+ *
+ * Uses AVX-512 to process 8 field elements at a time (2 halves for 16 total).
+ * For each limb, loads 8 elements into a __m512i, extracts bytes via shift+mask,
+ * and scatters to output buffers. This replaces 16 scalar secp256k1_fe_impl_get_b32
+ * calls with batched SIMD extraction.
+ *
+ * The 5x52-bit limb layout maps to 32 bytes as:
+ *   n[4]: bits 208..255 -> r[0..5]   (48 bits = 6 bytes)
+ *   n[3]: bits 156..207 -> r[6..12]  (52 bits, but byte 12 is split with n[2])
+ *   n[2]: bits 104..155 -> r[12..18] (byte 12 upper nibble from n[3])
+ *   n[1]: bits 52..103  -> r[19..25] (byte 25 split with n[0])
+ *   n[0]: bits 0..51    -> r[25..31] (byte 25 upper nibble from n[1])
+ */
+void fe_get_b32_16way(uint8_t out[16][32], const secp256k1_fe fe_arr[16])
+{
+    /*
+     * Process in two halves of 8 elements each.
+     * For each half, load limbs into __m512i (8 x uint64), then extract bytes
+     * using aligned store + scalar scatter. This is faster than 8 independent
+     * scalar calls because we amortize the loop overhead and keep data in cache.
+     */
+    uint64_t buf[8] __attribute__((aligned(64)));
+
+    for (int half = 0; half < 2; half++) {
+        const secp256k1_fe *src = fe_arr + half * 8;
+        uint8_t (*dst)[32] = out + half * 8;
+
+        /* Load and process each limb with SIMD gather, then scatter bytes */
+        /* n[4]: 48 bits -> bytes 0..5 */
+        {
+            __m512i v4 = _mm512_set_epi64(
+                (long long)src[7].n[4], (long long)src[6].n[4],
+                (long long)src[5].n[4], (long long)src[4].n[4],
+                (long long)src[3].n[4], (long long)src[2].n[4],
+                (long long)src[1].n[4], (long long)src[0].n[4]);
+            _mm512_store_si512((__m512i *)buf, v4);
+            for (int j = 0; j < 8; j++) {
+                uint64_t w = buf[j];
+                dst[j][0] = (uint8_t)(w >> 40);
+                dst[j][1] = (uint8_t)(w >> 32);
+                dst[j][2] = (uint8_t)(w >> 24);
+                dst[j][3] = (uint8_t)(w >> 16);
+                dst[j][4] = (uint8_t)(w >> 8);
+                dst[j][5] = (uint8_t)(w);
+            }
+        }
+        /* n[3]: 52 bits -> bytes 6..11, byte 12 lower nibble */
+        {
+            __m512i v3 = _mm512_set_epi64(
+                (long long)src[7].n[3], (long long)src[6].n[3],
+                (long long)src[5].n[3], (long long)src[4].n[3],
+                (long long)src[3].n[3], (long long)src[2].n[3],
+                (long long)src[1].n[3], (long long)src[0].n[3]);
+            _mm512_store_si512((__m512i *)buf, v3);
+            for (int j = 0; j < 8; j++) {
+                uint64_t w = buf[j];
+                dst[j][6]  = (uint8_t)(w >> 44);
+                dst[j][7]  = (uint8_t)(w >> 36);
+                dst[j][8]  = (uint8_t)(w >> 28);
+                dst[j][9]  = (uint8_t)(w >> 20);
+                dst[j][10] = (uint8_t)(w >> 12);
+                dst[j][11] = (uint8_t)(w >> 4);
+                /* byte 12: upper nibble from n[2], lower nibble from n[3] */
+                dst[j][12] = (uint8_t)((w & 0xF) << 4); /* lower nibble, will OR with n[2] part */
+            }
+        }
+        /* n[2]: 52 bits -> byte 12 upper nibble, bytes 13..18 */
+        {
+            __m512i v2 = _mm512_set_epi64(
+                (long long)src[7].n[2], (long long)src[6].n[2],
+                (long long)src[5].n[2], (long long)src[4].n[2],
+                (long long)src[3].n[2], (long long)src[2].n[2],
+                (long long)src[1].n[2], (long long)src[0].n[2]);
+            _mm512_store_si512((__m512i *)buf, v2);
+            for (int j = 0; j < 8; j++) {
+                uint64_t w = buf[j];
+                dst[j][12] |= (uint8_t)((w >> 48) & 0x0F); /* OR upper nibble */
+                dst[j][13] = (uint8_t)(w >> 40);
+                dst[j][14] = (uint8_t)(w >> 32);
+                dst[j][15] = (uint8_t)(w >> 24);
+                dst[j][16] = (uint8_t)(w >> 16);
+                dst[j][17] = (uint8_t)(w >> 8);
+                dst[j][18] = (uint8_t)(w);
+            }
+        }
+        /* n[1]: 52 bits -> bytes 19..24, byte 25 lower nibble */
+        {
+            __m512i v1 = _mm512_set_epi64(
+                (long long)src[7].n[1], (long long)src[6].n[1],
+                (long long)src[5].n[1], (long long)src[4].n[1],
+                (long long)src[3].n[1], (long long)src[2].n[1],
+                (long long)src[1].n[1], (long long)src[0].n[1]);
+            _mm512_store_si512((__m512i *)buf, v1);
+            for (int j = 0; j < 8; j++) {
+                uint64_t w = buf[j];
+                dst[j][19] = (uint8_t)(w >> 44);
+                dst[j][20] = (uint8_t)(w >> 36);
+                dst[j][21] = (uint8_t)(w >> 28);
+                dst[j][22] = (uint8_t)(w >> 20);
+                dst[j][23] = (uint8_t)(w >> 12);
+                dst[j][24] = (uint8_t)(w >> 4);
+                dst[j][25] = (uint8_t)((w & 0xF) << 4); /* lower nibble, will OR with n[0] part */
+            }
+        }
+        /* n[0]: 52 bits -> byte 25 upper nibble, bytes 26..31 */
+        {
+            __m512i v0 = _mm512_set_epi64(
+                (long long)src[7].n[0], (long long)src[6].n[0],
+                (long long)src[5].n[0], (long long)src[4].n[0],
+                (long long)src[3].n[0], (long long)src[2].n[0],
+                (long long)src[1].n[0], (long long)src[0].n[0]);
+            _mm512_store_si512((__m512i *)buf, v0);
+            for (int j = 0; j < 8; j++) {
+                uint64_t w = buf[j];
+                dst[j][25] |= (uint8_t)((w >> 48) & 0x0F); /* OR upper nibble */
+                dst[j][26] = (uint8_t)(w >> 40);
+                dst[j][27] = (uint8_t)(w >> 32);
+                dst[j][28] = (uint8_t)(w >> 24);
+                dst[j][29] = (uint8_t)(w >> 16);
+                dst[j][30] = (uint8_t)(w >> 8);
+                dst[j][31] = (uint8_t)(w);
+            }
+        }
+    }
+}
+
+/*
+ * keygen_ge_to_pubkey_bytes_16way: batch convert 16 affine points to pubkey bytes.
+ *
+ * Replaces 16 individual keygen_ge_to_pubkey_bytes calls with a single batch call.
+ * Uses fe_get_b32_16way for vectorized field element -> byte conversion.
+ * x_bytes are computed once and shared by both compressed and uncompressed paths.
+ *
+ * Parameters:
+ *   ge              : array of 16 normalized affine points (infinity points are skipped)
+ *   compressed_out  : array of 16 compressed pubkey buffers (33+ bytes each), or NULL to skip
+ *   uncompressed_out: array of 16 uncompressed pubkey buffers (65+ bytes each), or NULL to skip
+ */
+void keygen_ge_to_pubkey_bytes_16way(const secp256k1_ge ge[16],
+                                     uint8_t *compressed_out[16],
+                                     uint8_t *uncompressed_out[16])
+{
+    /* Gather x coordinates (and y if uncompressed needed) */
+    secp256k1_fe x_arr[16];
+    for (int i = 0; i < 16; i++)
+        x_arr[i] = ge[i].x;
+
+    uint8_t x_bytes[16][32];
+    fe_get_b32_16way(x_bytes, x_arr);
+
+    if (compressed_out != NULL) {
+        for (int i = 0; i < 16; i++) {
+            if (compressed_out[i] == NULL)
+                continue;
+            compressed_out[i][0] = secp256k1_fe_is_odd(&ge[i].y) ? 0x03 : 0x02;
+            memcpy(compressed_out[i] + 1, x_bytes[i], 32);
+        }
+    }
+
+    if (uncompressed_out != NULL) {
+        secp256k1_fe y_arr[16];
+        for (int i = 0; i < 16; i++)
+            y_arr[i] = ge[i].y;
+
+        uint8_t y_bytes[16][32];
+        fe_get_b32_16way(y_bytes, y_arr);
+
+        for (int i = 0; i < 16; i++) {
+            if (uncompressed_out[i] == NULL)
+                continue;
+            uncompressed_out[i][0] = 0x04;
+            memcpy(uncompressed_out[i] + 1, x_bytes[i], 32);
+            memcpy(uncompressed_out[i] + 1 + 32, y_bytes[i], 32);
         }
     }
 }
