@@ -261,25 +261,35 @@ static void *search_key(void *arg)
 
         /* Iterate all steps, compute hash160 and lookup in batches of 16 */
         for (int step = 0; step < BATCH_SIZE && count < MAX_ATTEMPTS; step++) {
-            uint8_t comp_bufs[16][64];
-            uint8_t uncomp_bufs[16][128];
-            const uint8_t *comp_ptrs[16];
-            const uint8_t *uncomp_ptrs[16];
 
-            /* Collect 16 ge points for this step and detect infinity */
-            secp256k1_ge ge_16[16];
+            /* Detect infinity without copying full ge structs */
             int has_infinity = 0;
             for (int lane = 0; lane < 16; lane++) {
                 if (step >= chain_valid_steps[lane] || ge_buf[lane][step].infinity) {
                     has_infinity = 1;
-                    ge_16[lane].infinity = 1;
-                } else {
-                    ge_16[lane] = ge_buf[lane][step];
+                    break;  /* early exit: one infinity is enough to trigger slow path */
                 }
             }
 
+            uint8_t hash160_comp_16[16][20];
+            uint8_t hash160_uncomp_16[16][20];
+
             if (has_infinity) {
                 /* Slow path: some lanes are infinity, fall back to per-lane processing */
+                secp256k1_ge ge_16[16];
+                for (int lane = 0; lane < 16; lane++) {
+                    if (step >= chain_valid_steps[lane] || ge_buf[lane][step].infinity) {
+                        ge_16[lane].infinity = 1;
+                    } else {
+                        ge_16[lane] = ge_buf[lane][step];
+                    }
+                }
+
+                uint8_t comp_bufs[16][64];
+                uint8_t uncomp_bufs[16][128];
+                const uint8_t *comp_ptrs[16];
+                const uint8_t *uncomp_ptrs[16];
+
                 for (int lane = 0; lane < 16; lane++) {
                     if (ge_16[lane].infinity) {
                         memset(comp_bufs[lane], 0, 64);
@@ -292,28 +302,23 @@ static void *search_key(void *arg)
                     comp_ptrs[lane] = comp_bufs[lane];
                     uncomp_ptrs[lane] = uncomp_bufs[lane];
                 }
+                hash160_16way_compressed_prepadded(comp_ptrs, hash160_comp_16);
+                hash160_16way_uncompressed_prepadded(uncomp_ptrs, hash160_uncomp_16);
             } else {
-                /* Fast path: all lanes valid, batch convert pubkey bytes via AVX-512 */
-                uint8_t *comp_out[16];
-                uint8_t *uncomp_out[16];
+                /* Fast path: all lanes valid, load x/y directly from ge_buf via pointers (no copy)
+                 * Phase 1+2: fe_16x_load_ptrs → fe_to_sha256_words_16way → sha256_compress_avx512_soa_preloaded
+                 *            → RIPEMD-160 → hash160
+                 * Eliminates: fe_get_b32_16way (6.72%) + load_be32_16way (3.63%) + memcpy/padding overhead */
+                const secp256k1_fe *x_ptrs[16], *y_ptrs[16];
+                secp256k1_fe_16x fe_x_soa, fe_y_soa;
                 for (int lane = 0; lane < 16; lane++) {
-                    comp_out[lane] = comp_bufs[lane];
-                    uncomp_out[lane] = uncomp_bufs[lane];
+                    x_ptrs[lane] = &ge_buf[lane][step].x;
+                    y_ptrs[lane] = &ge_buf[lane][step].y;
                 }
-                keygen_ge_to_pubkey_bytes_16way(ge_16, comp_out, uncomp_out);
-                for (int lane = 0; lane < 16; lane++) {
-                    sha256_pad_block_33(comp_bufs[lane]);
-                    sha256_pad_block2_65(uncomp_bufs[lane]);
-                    comp_ptrs[lane] = comp_bufs[lane];
-                    uncomp_ptrs[lane] = uncomp_bufs[lane];
-                }
+                fe_16x_load_ptrs(&fe_x_soa, x_ptrs);
+                fe_16x_load_ptrs(&fe_y_soa, y_ptrs);
+                hash160_16way_from_fe_soa(&fe_x_soa, &fe_y_soa, hash160_comp_16, hash160_uncomp_16);
             }
-
-            /* 16-way parallel hash160 computation */
-            uint8_t hash160_comp_16[16][20];
-            uint8_t hash160_uncomp_16[16][20];
-            hash160_16way_compressed_prepadded(comp_ptrs, hash160_comp_16);
-            hash160_16way_uncompressed_prepadded(uncomp_ptrs, hash160_uncomp_16);
 
             const uint8_t *comp_h160_ptrs[16];
             const uint8_t *uncomp_h160_ptrs[16];

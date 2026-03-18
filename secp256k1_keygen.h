@@ -150,6 +150,12 @@ void gej_16x_store_scatter(secp256k1_gej *dst_ptrs[16], const secp256k1_gej_16x 
 /* Batch convert 16 normalized secp256k1_fe to 32-byte big-endian using AVX-512 */
 void fe_get_b32_16way(uint8_t out[16][32], const secp256k1_fe fe_arr[16]);
 
+/* Convert 16 scattered secp256k1_fe pointers to SoA layout (no intermediate copy) */
+void fe_16x_load_ptrs(secp256k1_fe_16x *dst, const secp256k1_fe *src_ptrs[16]);
+
+/* Direct SoA fe → SHA-256 big-endian SoA words conversion (16-way, pure SIMD) */
+void fe_to_sha256_words_16way(const secp256k1_fe_16x *fe, __m512i w[8]);
+
 /* Batch convert 16 affine points to compressed/uncompressed pubkey bytes using AVX-512 */
 void keygen_ge_to_pubkey_bytes_16way(const secp256k1_ge ge[16],
                                      uint8_t *compressed_out[16],

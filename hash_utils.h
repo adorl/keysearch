@@ -220,11 +220,42 @@ uint16_t ht_contains_16way(const uint8_t *h160s[16]);
 void sha256_compress_avx512_soa(__m512i soa_state[8], const uint8_t *blocks[16]);
 
 /*
+ * SHA256 SoA variant with pre-loaded message words.
+ * Same as sha256_compress_avx512_soa, but accepts pre-computed __m512i w_in[16]
+ * message words directly (already in big-endian host-order SoA format).
+ * Eliminates load_be32_16way gather+bswap overhead.
+ */
+void sha256_compress_avx512_soa_preloaded(__m512i soa_state[8], const __m512i w_in[16]);
+
+/*
  * RIPEMD160 preloaded-message SoA variant: operates on __m512i[5] state,
  * accepts pre-loaded __m512i[16] message words.
  * Eliminates all load_le32_contig/gather and rmd_store_16way overhead.
  */
 void ripemd160_compress_avx512_soa(__m512i soa_state[5], const __m512i w[16]);
+
+#ifdef __AVX512IFMA__
+
+#include "secp256k1_keygen.h"
+
+/*
+ * 16-way parallel hash160 directly from SoA field elements (Phase 1 optimization).
+ *
+ * Bypasses the entire fe->bytes->SHA256-words pipeline:
+ *   fe_16x → fe_to_sha256_words_16way → sha256_compress_avx512_soa_preloaded → RIPEMD160
+ *
+ * Parameters:
+ *   fe_x          : X coordinate in SoA 5×52-bit limb format (normalized)
+ *   fe_y          : Y coordinate in SoA 5×52-bit limb format (normalized)
+ *   hash160_comp  : output 16 compressed hash160 (20 bytes each)
+ *   hash160_uncomp: output 16 uncompressed hash160 (20 bytes each)
+ */
+void hash160_16way_from_fe_soa(const secp256k1_fe_16x *fe_x,
+                               const secp256k1_fe_16x *fe_y,
+                               uint8_t hash160_comp[16][20],
+                               uint8_t hash160_uncomp[16][20]);
+
+#endif /* __AVX512IFMA__ */
 
 #endif /* __AVX512F__ */
 
@@ -233,4 +264,5 @@ void ripemd160_compress_avx512_soa(__m512i soa_state[5], const __m512i w[16]);
 #endif
 
 #endif /* HASH_UTILS_H */
+
 

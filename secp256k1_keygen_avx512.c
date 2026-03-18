@@ -60,6 +60,28 @@ static void fe_16x_load(secp256k1_fe_16x *dst, const secp256k1_fe src[16])
 }
 
 /*
+ * fe_16x_load_ptrs: load 16 secp256k1_fe from scattered pointers into SoA layout.
+ * Same as fe_16x_load but accepts an array of 16 pointers instead of a contiguous array,
+ * allowing direct loading from non-contiguous memory (e.g. ge_buf[lane][step].x)
+ * without an intermediate copy.
+ */
+void fe_16x_load_ptrs(secp256k1_fe_16x *dst, const secp256k1_fe *src_ptrs[16])
+{
+    for (int i = 0; i < 5; i++) {
+        uint64_t lo[8] __attribute__((aligned(64))) = {
+            src_ptrs[0]->n[i], src_ptrs[1]->n[i], src_ptrs[2]->n[i], src_ptrs[3]->n[i],
+            src_ptrs[4]->n[i], src_ptrs[5]->n[i], src_ptrs[6]->n[i], src_ptrs[7]->n[i]
+        };
+        uint64_t hi[8] __attribute__((aligned(64))) = {
+            src_ptrs[8]->n[i], src_ptrs[9]->n[i], src_ptrs[10]->n[i], src_ptrs[11]->n[i],
+            src_ptrs[12]->n[i], src_ptrs[13]->n[i], src_ptrs[14]->n[i], src_ptrs[15]->n[i]
+        };
+        dst->n[i][0] = _mm512_load_si512((const void *)lo);
+        dst->n[i][1] = _mm512_load_si512((const void *)hi);
+    }
+}
+
+/*
  * fe_16x_store: convert SoA layout back to 16 secp256k1_fe elements
  *
  * Optimized write pattern: process one limb at a time, store to a single
@@ -1094,6 +1116,91 @@ void fe_get_b32_16way(uint8_t out[16][32], const secp256k1_fe fe_arr[16])
                 dst[j][31] = (uint8_t)(w);
             }
         }
+    }
+}
+
+/*
+ * fe_to_sha256_words_16way: Convert SoA 52-bit limbs directly to SHA-256 big-endian SoA words.
+ *
+ * 5x52-bit limb layout:
+ *   value = n[0] + n[1]*2^52 + n[2]*2^104 + n[3]*2^156 + n[4]*2^208
+ *
+ * 8x32-bit big-endian words (W[0] = most significant):
+ *   W[0]: bits[255:224] = (n[4] >> 16)
+ *   W[1]: bits[223:192] = (n[3] >> 36) | ((n[4] & 0xFFFF) << 16)
+ *   W[2]: bits[191:160] = (n[3] >> 4) & 0xFFFFFFFF
+ *   W[3]: bits[159:128] = (n[2] >> 24) | ((n[3] & 0xF) << 28)
+ *   W[4]: bits[127:96]  = (n[1] >> 44) | ((n[2] & 0xFFFFFF) << 8)
+ *   W[5]: bits[95:64]   = (n[1] >> 12) & 0xFFFFFFFF
+ *   W[6]: bits[63:32]   = (n[0] >> 32) | ((n[1] & 0xFFF) << 20)
+ *   W[7]: bits[31:0]    = n[0] & 0xFFFFFFFF
+ *
+ * Input:  fe->n[5][2] (each limb has lo/hi __m512i, 8 x 64-bit lanes each)
+ * Output: w[8] (__m512i, 16 x 32-bit lanes each)
+ *
+ * Lane mapping: fe->n[i][0]'s 8 64-bit lanes produce the lower 8 32-bit lanes of w[j],
+ *               fe->n[i][1]'s 8 64-bit lanes produce the upper 8 32-bit lanes of w[j].
+ */
+__attribute__((target("avx512f")))
+void fe_to_sha256_words_16way(const secp256k1_fe_16x *fe, __m512i w[8])
+{
+    const __m512i mask32 = _mm512_set1_epi64(0xFFFFFFFFLL);
+    const __m512i mask12 = _mm512_set1_epi64(0xFFFLL);
+    const __m512i mask24 = _mm512_set1_epi64(0xFFFFFFLL);
+    const __m512i mask16 = _mm512_set1_epi64(0xFFFFLL);
+    const __m512i mask4  = _mm512_set1_epi64(0xFLL);
+
+    __m256i lo_words[8], hi_words[8];
+
+    for (int half = 0; half < 2; half++) {
+        __m512i n0 = fe->n[0][half];
+        __m512i n1 = fe->n[1][half];
+        __m512i n2 = fe->n[2][half];
+        __m512i n3 = fe->n[3][half];
+        __m512i n4 = fe->n[4][half];
+
+        /* Compute 8 big-endian words (64-bit precision, truncated to 32-bit later) */
+        __m512i w7_64 = _mm512_and_si512(n0, mask32);
+        __m512i w6_64 = _mm512_or_si512(
+            _mm512_srli_epi64(n0, 32),
+            _mm512_slli_epi64(_mm512_and_si512(n1, mask12), 20));
+        __m512i w5_64 = _mm512_and_si512(_mm512_srli_epi64(n1, 12), mask32);
+        __m512i w4_64 = _mm512_or_si512(
+            _mm512_srli_epi64(n1, 44),
+            _mm512_slli_epi64(_mm512_and_si512(n2, mask24), 8));
+        __m512i w3_64 = _mm512_or_si512(
+            _mm512_srli_epi64(n2, 24),
+            _mm512_slli_epi64(_mm512_and_si512(n3, mask4), 28));
+        __m512i w2_64 = _mm512_and_si512(_mm512_srli_epi64(n3, 4), mask32);
+        __m512i w1_64 = _mm512_or_si512(
+            _mm512_srli_epi64(n3, 36),
+            _mm512_slli_epi64(_mm512_and_si512(n4, mask16), 16));
+        __m512i w0_64 = _mm512_and_si512(_mm512_srli_epi64(n4, 16), mask32);
+
+        /* Pack 8x64-bit -> 8x32-bit: _mm512_cvtepi64_epi32 truncates 8 64-bit lanes
+         * to __m256i (8 x 32-bit lanes) */
+        __m256i h[8];
+        h[0] = _mm512_cvtepi64_epi32(w0_64);
+        h[1] = _mm512_cvtepi64_epi32(w1_64);
+        h[2] = _mm512_cvtepi64_epi32(w2_64);
+        h[3] = _mm512_cvtepi64_epi32(w3_64);
+        h[4] = _mm512_cvtepi64_epi32(w4_64);
+        h[5] = _mm512_cvtepi64_epi32(w5_64);
+        h[6] = _mm512_cvtepi64_epi32(w6_64);
+        h[7] = _mm512_cvtepi64_epi32(w7_64);
+
+        if (half == 0) {
+            for (int i = 0; i < 8; i++)
+                lo_words[i] = h[i];
+        } else {
+            for (int i = 0; i < 8; i++)
+                hi_words[i] = h[i];
+        }
+    }
+
+    /* Merge lo/hi halves: lo -> lower 256 bits, hi -> upper 256 bits -> __m512i (16x32-bit) */
+    for (int i = 0; i < 8; i++) {
+        w[i] = _mm512_inserti64x4(_mm512_castsi256_si512(lo_words[i]), hi_words[i], 1);
     }
 }
 

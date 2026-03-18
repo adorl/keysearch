@@ -3915,8 +3915,7 @@ static void test_keygen_ge_to_pubkey_bytes_16way(void) {
  * Verify end-to-end correctness of the entire 16-way concurrent pipeline under __AVX512IFMA__,
  * using the exact same interface chain as keysearch.c IFMA path:
  *   gej_add_ge_var_16way_soa  →  keygen_batch_normalize_rzr
- *   →  keygen_ge_to_pubkey_bytes_16way  →  hash160_16way_compressed_prepadded
- *   →  hash160_16way_uncompressed_prepadded
+ *   →  fe_16x_load_ptrs  →  hash160_16way_from_fe_soa
  *
  * Final hash160 (compressed/uncompressed) compared with secp256k1 API lane by lane.
  *
@@ -3924,7 +3923,7 @@ static void test_keygen_ge_to_pubkey_bytes_16way(void) {
  *   9.1  Single batch (BATCH_SIZE=16 steps): each of 16 chains advances 16 steps,
  *        each step uses gej_add_ge_var_16way_soa (step0 normed=0, others normed=1),
  *        keygen_batch_normalize_rzr at end of batch,
- *        keygen_ge_to_pubkey_bytes_16way for pubkey conversion,
+ *        fe_16x_load_ptrs + hash160_16way_from_fe_soa for direct hash computation,
  *        hash160 compared with API lane by lane, step by step.
  *   9.2  Multi-batch (3 batches): each batch with independent random base privkey,
  *        verify no state pollution between batches.
@@ -4018,34 +4017,21 @@ static void test_avx512ifma_16way_full_pipeline(void) {
 
         /* Verify hash160 step by step, lane by lane */
         for (int step = 0; step < PIPE_STEPS; step++) {
-            /* Same as keysearch.c: use keygen_ge_to_pubkey_bytes_16way for batch conversion */
-            uint8_t comp_bufs[16][64];
-            uint8_t uncomp_bufs[16][128];
-            const uint8_t *comp_ptrs[16];
-            const uint8_t *uncomp_ptrs[16];
-
-            secp256k1_ge ge_16[16];
-            uint8_t *comp_out[16];
-            uint8_t *uncomp_out[16];
+            /* Same as keysearch.c IFMA fast path:
+             * fe_16x_load_ptrs → hash160_16way_from_fe_soa
+             * (skip keygen_ge_to_pubkey_bytes_16way + pad + hash160_prepadded) */
+            const secp256k1_fe *x_ptrs[16], *y_ptrs[16];
+            secp256k1_fe_16x fe_x_soa, fe_y_soa;
             for (int lane = 0; lane < 16; lane++) {
-                ge_16[lane] = ge_buf[lane][step];
-                comp_out[lane] = comp_bufs[lane];
-                uncomp_out[lane] = uncomp_bufs[lane];
+                x_ptrs[lane] = &ge_buf[lane][step].x;
+                y_ptrs[lane] = &ge_buf[lane][step].y;
             }
-            keygen_ge_to_pubkey_bytes_16way(ge_16, comp_out, uncomp_out);
+            fe_16x_load_ptrs(&fe_x_soa, x_ptrs);
+            fe_16x_load_ptrs(&fe_y_soa, y_ptrs);
 
-            for (int lane = 0; lane < 16; lane++) {
-                sha256_pad_block_33(comp_bufs[lane]);
-                sha256_pad_block2_65(uncomp_bufs[lane]);
-                comp_ptrs[lane]   = comp_bufs[lane];
-                uncomp_ptrs[lane] = uncomp_bufs[lane];
-            }
-
-            /* 16-way parallel hash160 */
             uint8_t avx_h160_comp[16][20];
             uint8_t avx_h160_uncomp[16][20];
-            hash160_16way_compressed_prepadded(comp_ptrs,   avx_h160_comp);
-            hash160_16way_uncompressed_prepadded(uncomp_ptrs, avx_h160_uncomp);
+            hash160_16way_from_fe_soa(&fe_x_soa, &fe_y_soa, avx_h160_comp, avx_h160_uncomp);
 
             /* Compare with API lane by lane */
             for (int lane = 0; lane < 16; lane++) {
