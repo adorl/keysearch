@@ -188,20 +188,6 @@ int ht_contains(const uint8_t *h160);
 
 #ifdef __AVX512F__
 /*
- * 16-way parallel hash160 (SHA256->RIPEMD160) for compressed public keys (33 bytes)
- * pubkeys[16]   : 16 compressed public key byte pointers (33 bytes each)
- * hash160s[16]  : 16 output buffers (20 bytes each)
- */
-void hash160_16way_compressed(const uint8_t *pubkeys[16], uint8_t hash160s[16][20]);
-
-/*
- * 16-way parallel hash160 (SHA256->RIPEMD160) for uncompressed public keys (65 bytes)
- * pubkeys[16]   : 16 uncompressed public key byte pointers (65 bytes each)
- * hash160s[16]  : 16 output buffers (20 bytes each)
- */
-void hash160_16way_uncompressed(const uint8_t *pubkeys[16], uint8_t hash160s[16][20]);
-
-/*
  * 16-way parallel hash160 for compressed public keys (pre-padded, zero-copy)
  * blocks[16]    : 16 pointers to 64-byte blocks with SHA256 padding already applied
  * hash160s[16]  : 16 output buffers (20 bytes each)
@@ -223,6 +209,23 @@ void hash160_16way_uncompressed_prepadded(const uint8_t *bufs[16], uint8_t hash1
  * Returns 16-bit hit mask: bit i set means lane i matched
  */
 uint16_t ht_contains_16way(const uint8_t *h160s[16]);
+
+#include <immintrin.h>
+
+/*
+ * SHA256 SoA (Structure-of-Arrays) variant: operates on __m512i[8] state
+ * instead of uint32_t*[16] AoS state. Eliminates load_state_word_16way and
+ * store_16way scatter overhead.
+ */
+void sha256_compress_avx512_soa(__m512i soa_state[8], const uint8_t *blocks[16]);
+
+/*
+ * RIPEMD160 preloaded-message SoA variant: operates on __m512i[5] state,
+ * accepts pre-loaded __m512i[16] message words.
+ * Eliminates all load_le32_contig/gather and rmd_store_16way overhead.
+ */
+void ripemd160_compress_avx512_soa(__m512i soa_state[5], const __m512i w[16]);
+
 #endif /* __AVX512F__ */
 
 #ifdef __cplusplus
@@ -230,5 +233,4 @@ uint16_t ht_contains_16way(const uint8_t *h160s[16]);
 #endif
 
 #endif /* HASH_UTILS_H */
-
 

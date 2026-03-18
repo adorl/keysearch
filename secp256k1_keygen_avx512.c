@@ -114,6 +114,25 @@ void gej_16x_store(secp256k1_gej dst[16], const secp256k1_gej_16x *src)
 }
 
 /*
+ * gej_16x_store_scatter: convert SoA layout and scatter-write to 16 non-contiguous
+ * secp256k1_gej pointers. Used to write directly into gej_buf[ch][step] without
+ * an intermediate contiguous array, eliminating one full 2048-byte copy per step.
+ */
+void gej_16x_store_scatter(secp256k1_gej *dst_ptrs[16], const secp256k1_gej_16x *src)
+{
+    secp256k1_fe x_arr[16], y_arr[16], z_arr[16];
+    fe_16x_store(x_arr, &src->x);
+    fe_16x_store(y_arr, &src->y);
+    fe_16x_store(z_arr, &src->z);
+    for (int i = 0; i < 16; i++) {
+        dst_ptrs[i]->x = x_arr[i];
+        dst_ptrs[i]->y = y_arr[i];
+        dst_ptrs[i]->z = z_arr[i];
+        dst_ptrs[i]->infinity = 0;
+    }
+}
+
+/*
  * Basic field operations
  */
 
@@ -493,11 +512,14 @@ static void fe_16x_sqr(secp256k1_fe_16x *r, const secp256k1_fe_16x *a)
         __m512i a0 = a->n[0][half], a1 = a->n[1][half],
                 a2 = a->n[2][half], a3 = a->n[3][half], a4 = a->n[4][half];
 
-        /* Pre-compute 2*a[i] for cross-term doubling */
-        __m512i a0_2 = _mm512_slli_epi64(a0, 1);
-        __m512i a1_2 = _mm512_slli_epi64(a1, 1);
-        __m512i a2_2 = _mm512_slli_epi64(a2, 1);
-        __m512i a3_2 = _mm512_slli_epi64(a3, 1);
+        /*
+         * IFMA (VPMADD52) only uses the low 52 bits of each operand.
+         * Since limbs can be up to 52 bits, pre-multiplying by 2 (shift left 1)
+         * would produce 53-bit values whose MSB gets truncated by IFMA.
+         *
+         * Fix: double cross-terms by accumulating twice instead of pre-shifting.
+         * e.g. 2*(a0*a3) = accum(a0,a3) + accum(a0,a3) instead of accum(a0<<1, a3).
+         */
 
         u128_16x c, d;
         __m512i t3, t4, tx, u0;
@@ -505,10 +527,12 @@ static void fe_16x_sqr(secp256k1_fe_16x *r, const secp256k1_fe_16x *a)
         __m512i mask52_v = _mm512_set1_epi64((int64_t)M_val);
         __m512i R_vec = _mm512_set1_epi64((int64_t)R_val);
 
-        /* d = 2*(a0*a3) + 2*(a1*a2) = a0_2*a3 + a1_2*a2 */
+        /* d = 2*(a0*a3) + 2*(a1*a2) */
         d = u128_16x_zero();
-        d = u128_16x_accum_mul(d, a0_2, a3);
-        d = u128_16x_accum_mul(d, a1_2, a2);
+        d = u128_16x_accum_mul(d, a0, a3);
+        d = u128_16x_accum_mul(d, a0, a3);
+        d = u128_16x_accum_mul(d, a1, a2);
+        d = u128_16x_accum_mul(d, a1, a2);
 
         /* c = a4*a4 */
         c = u128_16x_zero();
@@ -524,9 +548,11 @@ static void fe_16x_sqr(secp256k1_fe_16x *r, const secp256k1_fe_16x *a)
         /* t3 = d & M; d >>= 52 */
         t3 = u128_16x_extract52(&d);
 
-        /* d += 2*(a0*a4) + 2*(a1*a3) + a2*a2 = a0_2*a4 + a1_2*a3 + a2*a2 */
-        d = u128_16x_accum_mul(d, a0_2, a4);
-        d = u128_16x_accum_mul(d, a1_2, a3);
+        /* d += 2*(a0*a4) + 2*(a1*a3) + a2*a2 */
+        d = u128_16x_accum_mul(d, a0, a4);
+        d = u128_16x_accum_mul(d, a0, a4);
+        d = u128_16x_accum_mul(d, a1, a3);
+        d = u128_16x_accum_mul(d, a1, a3);
         d = u128_16x_accum_mul(d, a2, a2);
 
         /* d += (R<<12) * c_hi */
@@ -544,9 +570,11 @@ static void fe_16x_sqr(secp256k1_fe_16x *r, const secp256k1_fe_16x *a)
         c = u128_16x_zero();
         c = u128_16x_accum_mul(c, a0, a0);
 
-        /* d += 2*(a1*a4) + 2*(a2*a3) = a1_2*a4 + a2_2*a3 */
-        d = u128_16x_accum_mul(d, a1_2, a4);
-        d = u128_16x_accum_mul(d, a2_2, a3);
+        /* d += 2*(a1*a4) + 2*(a2*a3) */
+        d = u128_16x_accum_mul(d, a1, a4);
+        d = u128_16x_accum_mul(d, a1, a4);
+        d = u128_16x_accum_mul(d, a2, a3);
+        d = u128_16x_accum_mul(d, a2, a3);
 
         /* u0 = d & M; d >>= 52 */
         u0 = u128_16x_extract52(&d);
@@ -564,11 +592,13 @@ static void fe_16x_sqr(secp256k1_fe_16x *r, const secp256k1_fe_16x *a)
         /* r0 = c & M; c >>= 52 */
         r0 = u128_16x_extract52(&c);
 
-        /* c += 2*(a0*a1) = a0_2*a1 */
-        c = u128_16x_accum_mul(c, a0_2, a1);
+        /* c += 2*(a0*a1) */
+        c = u128_16x_accum_mul(c, a0, a1);
+        c = u128_16x_accum_mul(c, a0, a1);
 
-        /* d += 2*(a2*a4) + a3*a3 = a2_2*a4 + a3*a3 */
-        d = u128_16x_accum_mul(d, a2_2, a4);
+        /* d += 2*(a2*a4) + a3*a3 */
+        d = u128_16x_accum_mul(d, a2, a4);
+        d = u128_16x_accum_mul(d, a2, a4);
         d = u128_16x_accum_mul(d, a3, a3);
 
         /* c += (d & M) * R; d >>= 52 */
@@ -578,12 +608,14 @@ static void fe_16x_sqr(secp256k1_fe_16x *r, const secp256k1_fe_16x *a)
         /* r1 = c & M; c >>= 52 */
         r1 = u128_16x_extract52(&c);
 
-        /* c += 2*(a0*a2) + a1*a1 = a0_2*a2 + a1*a1 */
-        c = u128_16x_accum_mul(c, a0_2, a2);
+        /* c += 2*(a0*a2) + a1*a1 */
+        c = u128_16x_accum_mul(c, a0, a2);
+        c = u128_16x_accum_mul(c, a0, a2);
         c = u128_16x_accum_mul(c, a1, a1);
 
-        /* d += 2*(a3*a4) = a3_2*a4 */
-        d = u128_16x_accum_mul(d, a3_2, a4);
+        /* d += 2*(a3*a4) */
+        d = u128_16x_accum_mul(d, a3, a4);
+        d = u128_16x_accum_mul(d, a3, a4);
 
         /* c += R * d_lo64; d >>= 64 */
         __m512i d_lo64 = u128_16x_extract64(&d);
@@ -796,14 +828,15 @@ void gej_add_ge_var_16way(secp256k1_gej r[16],
  *   r_soa     : output Jacobian coordinates (SoA)
  *   a_soa     : input Jacobian coordinates (SoA, assumed non-infinity)
  *   b         : input affine coordinates (assumed non-infinity)
- *   r_aos     : output AoS Jacobian coordinates for gej_buf storage (may be NULL if not needed)
+ *   r_aos_ptrs: array of 16 pointers to output AoS Jacobian coordinates (scatter write);
+ *               may be NULL to skip AoS output entirely, individual pointers must not be NULL
  *   rzr_out   : output Z coordinate ratio factors (AoS, 16 elements)
  *   normed    : 0=apply normalize_weak to input coordinates; 1=skip
  */
 void gej_add_ge_var_16way_soa(secp256k1_gej_16x *r_soa,
                               const secp256k1_gej_16x *a_soa,
                               const secp256k1_ge *b,
-                              secp256k1_gej r_aos[16],
+                              secp256k1_gej *r_aos_ptrs[16],
                               secp256k1_fe rzr_out[16],
                               int normed)
 {
@@ -899,9 +932,9 @@ void gej_add_ge_var_16way_soa(secp256k1_gej_16x *r_soa,
     r_soa->y = ry;
     r_soa->z = rz;
 
-    /* Store AoS results for gej_buf and rzr_buf if requested */
-    if (r_aos != NULL) {
-        gej_16x_store(r_aos, r_soa);
+    /* Store AoS results for gej_buf (scatter write) if requested */
+    if (r_aos_ptrs != NULL) {
+        gej_16x_store_scatter(r_aos_ptrs, r_soa);
     }
     if (rzr_out != NULL) {
         fe_16x_store(rzr_out, &rzr_16x);
@@ -910,7 +943,7 @@ void gej_add_ge_var_16way_soa(secp256k1_gej_16x *r_soa,
     /* Fixup: for lanes where h=0 (point doubling case), overwrite with scalar result */
     /* Note: infinity fixup is not needed here since the caller handles initial loading
      * through gej_16x_load which only processes non-infinity points */
-    if (r_aos != NULL) {
+    if (r_aos_ptrs != NULL) {
         for (int i = 0; i < 16; i++) {
             if (secp256k1_fe_normalizes_to_zero(&h_arr[i])) {
                 secp256k1_fe rzr_scalar;
@@ -924,7 +957,7 @@ void gej_add_ge_var_16way_soa(secp256k1_gej_16x *r_soa,
                 a_lane.y = ay_arr[i];
                 a_lane.z = az_arr[i];
                 a_lane.infinity = 0;
-                secp256k1_gej_add_ge_var(&r_aos[i], &a_lane, b,
+                secp256k1_gej_add_ge_var(r_aos_ptrs[i], &a_lane, b,
                                          rzr_out != NULL ? &rzr_scalar : NULL);
                 if (rzr_out != NULL) {
                     rzr_out[i] = rzr_scalar;
@@ -1116,3 +1149,4 @@ void keygen_ge_to_pubkey_bytes_16way(const secp256k1_ge ge[16],
 }
 
 #endif /* __AVX512IFMA__ */
+

@@ -134,7 +134,7 @@ void gej_add_ge_var_16way(secp256k1_gej r[16],
 void gej_add_ge_var_16way_soa(secp256k1_gej_16x *r_soa,
                               const secp256k1_gej_16x *a_soa,
                               const secp256k1_ge *b,
-                              secp256k1_gej r_aos[16],
+                              secp256k1_gej *r_aos_ptrs[16],
                               secp256k1_fe rzr_out[16],
                               int normed);
 
@@ -143,6 +143,9 @@ void gej_16x_load(secp256k1_gej_16x *dst, const secp256k1_gej src[16]);
 
 /* Convert SoA layout back to 16 secp256k1_gej elements (AoS) */
 void gej_16x_store(secp256k1_gej dst[16], const secp256k1_gej_16x *src);
+
+/* Scatter-write SoA layout to 16 non-contiguous secp256k1_gej pointers */
+void gej_16x_store_scatter(secp256k1_gej *dst_ptrs[16], const secp256k1_gej_16x *src);
 
 /* Batch convert 16 normalized secp256k1_fe to 32-byte big-endian using AVX-512 */
 void fe_get_b32_16way(uint8_t out[16][32], const secp256k1_fe fe_arr[16]);
@@ -190,4 +193,5 @@ void keygen_ge_to_pubkey_bytes(const secp256k1_context *ctx,
 #endif /* USE_PUBKEY_API_ONLY */
 
 #endif /* SECP256K1_KEYGEN_H */
+
 

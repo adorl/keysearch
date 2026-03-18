@@ -144,7 +144,8 @@ static void *search_key(void *arg)
      * AVX-512 IFMA 16-chain buffers: each chain accumulates BATCH_SIZE steps of Jacobian points and rzr factors
      * Three buffers total ~24MB, must be heap-allocated
      * Allocated once before the outermost loop, freed when thread exits
-     */    secp256k1_gej (*gej_buf)[BATCH_SIZE] = malloc(16 * BATCH_SIZE * sizeof(secp256k1_gej));
+     */
+    secp256k1_gej (*gej_buf)[BATCH_SIZE] = malloc(16 * BATCH_SIZE * sizeof(secp256k1_gej));
     secp256k1_fe (*rzr_buf)[BATCH_SIZE] = malloc(16 * BATCH_SIZE * sizeof(secp256k1_fe));
     secp256k1_ge (*ge_buf)[BATCH_SIZE] = malloc(16 * BATCH_SIZE * sizeof(secp256k1_ge));
     if (!gej_buf || !rzr_buf || !ge_buf) {
@@ -192,25 +193,46 @@ static void *search_key(void *arg)
          * This way rzr[i] relates gej[i] to gej[i+1], and the backward pass
          *   inv = inv * rzr[i-1] correctly computes 1/Z[i-1] from 1/Z[i].
          */
-        secp256k1_gej_16x chain_soa, next_soa;
-        secp256k1_gej next_gej_16[16];  /* must persist across iterations for input storage */
+        /* Ping-pong buffers: alternate between two SoA buffers to avoid
+         * copying the entire secp256k1_gej_16x (30 × __m512i = 1920 bytes) each step */
+        secp256k1_gej_16x soa_buf[2];
+        int cur = 0;  /* index of current input buffer */
+        /* Scatter-write pointer array: gej_add_ge_var_16way_soa writes directly to
+         * gej_buf[ch][step+1], eliminating the intermediate next_gej_16 copy */
+        secp256k1_gej *gej_ptrs[16];
         for (int step = 0; step < BATCH_SIZE; step++) {
             secp256k1_fe step_rzr[16];
+            int nxt = 1 - cur;
             if (step == 0) {
                 /* First step: convert AoS chain_gej to SoA, apply normalize_weak */
-                gej_16x_load(&chain_soa, chain_gej);
+                gej_16x_load(&soa_buf[cur], chain_gej);
                 /* Store input point BEFORE add (non-IFMA convention) */
                 for (int ch = 0; ch < 16; ch++)
                     gej_buf[ch][0] = chain_gej[ch];
-                gej_add_ge_var_16way_soa(&next_soa, &chain_soa, &G_affine,
-                                         next_gej_16, step_rzr, 0);
+                /* Set up scatter pointers for output -> gej_buf[ch][1] */
+                if (step + 1 < BATCH_SIZE) {
+                    for (int ch = 0; ch < 16; ch++)
+                        gej_ptrs[ch] = &gej_buf[ch][step + 1];
+                    gej_add_ge_var_16way_soa(&soa_buf[nxt], &soa_buf[cur], &G_affine,
+                                             gej_ptrs, step_rzr, 0);
+                } else {
+                    gej_add_ge_var_16way_soa(&soa_buf[nxt], &soa_buf[cur], &G_affine,
+                                             NULL, step_rzr, 0);
+                }
             } else {
-                /* Store input point BEFORE add: previous output = current input */
-                for (int ch = 0; ch < 16; ch++)
-                    gej_buf[ch][step] = next_gej_16[ch];
-                /* Subsequent steps: SoA input already available, skip normalize_weak */
-                gej_add_ge_var_16way_soa(&next_soa, &chain_soa, &G_affine,
-                                         next_gej_16, step_rzr, 1);
+                /* Subsequent steps: SoA input already available, skip normalize_weak.
+                 * gej_buf[ch][step] was already written by previous step's scatter output. */
+                if (step + 1 < BATCH_SIZE) {
+                    for (int ch = 0; ch < 16; ch++)
+                        gej_ptrs[ch] = &gej_buf[ch][step + 1];
+                    gej_add_ge_var_16way_soa(&soa_buf[nxt], &soa_buf[cur], &G_affine,
+                                             gej_ptrs, step_rzr, 1);
+                } else {
+                    /* Last step: output is not an input to any future step, skip AoS store.
+                     * gej_buf[ch][BATCH_SIZE-1] was already stored by step BATCH_SIZE-2. */
+                    gej_add_ge_var_16way_soa(&soa_buf[nxt], &soa_buf[cur], &G_affine,
+                                             NULL, step_rzr, 1);
+                }
             }
 
             for (int ch = 0; ch < 16; ch++) {
@@ -227,8 +249,8 @@ static void *search_key(void *arg)
                 }
             }
 
-            /* Persist SoA state for next iteration (no AoS copy needed) */
-            chain_soa = next_soa;
+            /* Swap buffer index: next output becomes current input (no data copy) */
+            cur = nxt;
         }
 
         /* Batch normalize: call keygen_batch_normalize_rzr for each chain */

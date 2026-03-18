@@ -87,7 +87,7 @@ ripemd160_avx2.o: ripemd160_avx2.c
 	$(CC) $(CFLAGS) -mavx2 -c -o $@ $<
 
 sha256_avx512.o: sha256_avx512.c
-	$(CC) $(CFLAGS) -mavx512f -c -o $@ $<
+	$(CC) $(CFLAGS) -mavx512f -mavx512bw -c -o $@ $<
 
 ripemd160_avx512.o: ripemd160_avx512.c
 	$(CC) $(CFLAGS) -mavx512f -c -o $@ $<
@@ -99,7 +99,7 @@ hash_utils_avx512.o: hash_utils_avx512.c
 	$(CC) $(CFLAGS) -mavx512f -c -o $@ $<
 
 secp256k1_keygen_avx512.o: secp256k1_keygen_avx512.c
-	$(CC) $(CFLAGS) -mavx512f -mavx512ifma -c -o $@ $<
+	$(CC) $(CFLAGS) -mavx512f -mavx512ifma -mavx512bw -c -o $@ $<
 
 keysearch.o: keysearch.c
 	$(CC) $(CFLAGS) -mavx512f -mavx512ifma -c -o $@ $<

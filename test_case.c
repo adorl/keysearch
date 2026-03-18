@@ -6,6 +6,9 @@
 #include "ripemd160.h"
 #include "hash_utils.h"
 #include "rand_key.h"
+#ifdef __AVX512F__
+#include <immintrin.h>
+#endif
 
 /* GPU algorithm CPU-side simulation tests (defined in test_gpu.c) */
 void run_gpu_tests(void);
@@ -1025,31 +1028,90 @@ static void test_hash160_8way(void) {
 #ifdef __AVX512F__
 
 __attribute__((target("avx512f")))
+/*
+ * Helper: extract per-lane SHA256 digest from SoA state.
+ * soa_state[8] holds 16 lanes; this extracts lane `lane` into digest[32].
+ */
+static void sha256_soa_state_to_digest(const __m512i soa_state[8], int lane, uint8_t digest[32])
+{
+    uint32_t tmp[16] __attribute__((aligned(64)));
+    for (int w = 0; w < 8; w++) {
+        _mm512_store_si512((__m512i *)tmp, soa_state[w]);
+        uint32_t val = tmp[lane];
+        digest[w*4+0] = (uint8_t)(val >> 24);
+        digest[w*4+1] = (uint8_t)(val >> 16);
+        digest[w*4+2] = (uint8_t)(val >>  8);
+        digest[w*4+3] = (uint8_t)(val      );
+    }
+}
+
+/*
+ * Helper: extract per-lane RIPEMD160 digest from SoA state.
+ * soa_state[5] holds 16 lanes; this extracts lane `lane` into digest[20].
+ */
+static void rmd160_soa_state_to_digest(const __m512i soa_state[5], int lane, uint8_t digest[20])
+{
+    uint32_t tmp[16] __attribute__((aligned(64)));
+    for (int w = 0; w < 5; w++) {
+        _mm512_store_si512((__m512i *)tmp, soa_state[w]);
+        uint32_t val = tmp[lane];
+        /* RIPEMD160 is little-endian */
+        digest[w*4+0] = (uint8_t)(val      );
+        digest[w*4+1] = (uint8_t)(val >>  8);
+        digest[w*4+2] = (uint8_t)(val >> 16);
+        digest[w*4+3] = (uint8_t)(val >> 24);
+    }
+}
+
+/*
+ * Helper: load 16 RIPEMD160 message words from 16 padded blocks into __m512i[16].
+ * blocks[16] are pointers to 64-byte padded blocks (little-endian uint32).
+ */
+static void load_rmd160_words_16way(const uint8_t *blocks[16], __m512i w[16])
+{
+    for (int i = 0; i < 16; i++) {
+        const int off = i * 4;
+        uint32_t lanes[16] __attribute__((aligned(64)));
+        for (int k = 0; k < 16; k++) {
+            uint32_t v;
+            __builtin_memcpy(&v, blocks[k] + off, sizeof(v));
+            lanes[k] = v;
+        }
+        w[i] = _mm512_load_si512((const void *)lanes);
+    }
+}
+
 static void test_avx512_compress(void) {
-    printf("\n=== AVX-512 compression function tests (sha256_compress_avx512 / ripemd160_compress_avx512) ===\n");
+    printf("\n=== AVX-512 compression function tests (sha256_compress_avx512_soa / ripemd160_compress_avx512_soa) ===\n");
 
     /* ------------------------------------------------------------------ */
-    /* 10.1  sha256_compress_avx512 — 16 identical messages, results consistent with scalar sha256() */
+    /* 10.1  sha256_compress_avx512_soa — 16 identical messages, results consistent with scalar sha256() */
     {
         uint8_t block_abc[64];
         make_sha256_padded_block((const uint8_t *)"abc", 3, block_abc);
 
-        uint32_t states_data[16][8];
-        uint32_t *states[16];
         const uint8_t *blocks[16];
         for (int i = 0; i < 16; i++) {
-            memcpy(states_data[i], SHA256_INIT, 32);
-            states[i] = states_data[i];
             blocks[i] = block_abc;
         }
 
-        sha256_compress_avx512(states, blocks);
+        __m512i soa_state[8];
+        soa_state[0] = _mm512_set1_epi32(0x6a09e667);
+        soa_state[1] = _mm512_set1_epi32((int)0xbb67ae85);
+        soa_state[2] = _mm512_set1_epi32(0x3c6ef372);
+        soa_state[3] = _mm512_set1_epi32((int)0xa54ff53a);
+        soa_state[4] = _mm512_set1_epi32(0x510e527f);
+        soa_state[5] = _mm512_set1_epi32((int)0x9b05688c);
+        soa_state[6] = _mm512_set1_epi32(0x1f83d9ab);
+        soa_state[7] = _mm512_set1_epi32(0x5be0cd19);
+
+        sha256_compress_avx512_soa(soa_state, blocks);
 
         uint8_t digest_avx512[32];
         for (int lane = 0; lane < 16; lane++) {
-            sha256_state_to_digest(states_data[lane], digest_avx512);
+            sha256_soa_state_to_digest(soa_state, lane, digest_avx512);
             char name[80];
-            snprintf(name, sizeof(name), "10.1 sha256_compress_avx512(\"abc\") lane%d consistent with standard value", lane);
+            snprintf(name, sizeof(name), "10.1 sha256_compress_avx512_soa(\"abc\") lane%d consistent with standard value", lane);
             check(name,
                   "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
                   digest_avx512, 32);
@@ -1057,7 +1119,7 @@ static void test_avx512_compress(void) {
     }
 
     /* ------------------------------------------------------------------ */
-    /* 10.2  sha256_compress_avx512 — 16 different messages, each lane consistent with scalar sha256() */
+    /* 10.2  sha256_compress_avx512_soa — 16 different messages, each lane consistent with scalar sha256() */
     {
         static const struct { const uint8_t *msg; size_t len; } cases[16] = {
             { (const uint8_t *)"",           0  },
@@ -1079,34 +1141,40 @@ static void test_avx512_compress(void) {
         };
 
         uint8_t padded_blocks[16][64];
-        uint32_t states_data[16][8];
-        uint32_t *states[16];
         const uint8_t *blocks[16];
 
         for (int i = 0; i < 16; i++) {
             make_sha256_padded_block(cases[i].msg, cases[i].len, padded_blocks[i]);
-            memcpy(states_data[i], SHA256_INIT, 32);
-            states[i] = states_data[i];
             blocks[i] = padded_blocks[i];
         }
 
-        sha256_compress_avx512(states, blocks);
+        __m512i soa_state[8];
+        soa_state[0] = _mm512_set1_epi32(0x6a09e667);
+        soa_state[1] = _mm512_set1_epi32((int)0xbb67ae85);
+        soa_state[2] = _mm512_set1_epi32(0x3c6ef372);
+        soa_state[3] = _mm512_set1_epi32((int)0xa54ff53a);
+        soa_state[4] = _mm512_set1_epi32(0x510e527f);
+        soa_state[5] = _mm512_set1_epi32((int)0x9b05688c);
+        soa_state[6] = _mm512_set1_epi32(0x1f83d9ab);
+        soa_state[7] = _mm512_set1_epi32(0x5be0cd19);
+
+        sha256_compress_avx512_soa(soa_state, blocks);
 
         uint8_t digest_avx512[32];
         uint8_t digest_ref[32];
         char ref_hex[65];
         for (int i = 0; i < 16; i++) {
-            sha256_state_to_digest(states_data[i], digest_avx512);
+            sha256_soa_state_to_digest(soa_state, i, digest_avx512);
             sha256(cases[i].msg, cases[i].len, digest_ref);
             bytes_to_hex_helper(digest_ref, 32, ref_hex);
             char name[80];
-            snprintf(name, sizeof(name), "10.2 sha256_compress_avx512 16-way different messages lane%d consistent with scalar", i);
+            snprintf(name, sizeof(name), "10.2 sha256_compress_avx512_soa 16-way different messages lane%d consistent with scalar", i);
             check(name, ref_hex, digest_avx512, 32);
         }
     }
 
     /* ------------------------------------------------------------------ */
-    /* 10.3  sha256_compress_avx512 — 16-way 33-byte pubkeys, cross-validate with sha256_33 */
+    /* 10.3  sha256_compress_avx512_soa — 16-way 33-byte pubkeys, cross-validate with sha256_33 */
     {
         static const uint8_t msgs[16][33] = {
             { 0x02,0x79,0xbe,0x66,0x7e,0xf9,0xdc,0xbb,0xac,0x55,0xa0,0x62,0x95,0xce,0x87,0x0b,
@@ -1144,54 +1212,66 @@ static void test_avx512_compress(void) {
         };
 
         uint8_t padded_blocks[16][64];
-        uint32_t states_data[16][8];
-        uint32_t *states[16];
         const uint8_t *blocks[16];
 
         for (int i = 0; i < 16; i++) {
             make_sha256_padded_block(msgs[i], 33, padded_blocks[i]);
-            memcpy(states_data[i], SHA256_INIT, 32);
-            states[i] = states_data[i];
             blocks[i] = padded_blocks[i];
         }
 
-        sha256_compress_avx512(states, blocks);
+        __m512i soa_state[8];
+        soa_state[0] = _mm512_set1_epi32(0x6a09e667);
+        soa_state[1] = _mm512_set1_epi32((int)0xbb67ae85);
+        soa_state[2] = _mm512_set1_epi32(0x3c6ef372);
+        soa_state[3] = _mm512_set1_epi32((int)0xa54ff53a);
+        soa_state[4] = _mm512_set1_epi32(0x510e527f);
+        soa_state[5] = _mm512_set1_epi32((int)0x9b05688c);
+        soa_state[6] = _mm512_set1_epi32(0x1f83d9ab);
+        soa_state[7] = _mm512_set1_epi32(0x5be0cd19);
+
+        sha256_compress_avx512_soa(soa_state, blocks);
 
         uint8_t digest_avx512[32];
         uint8_t digest_ref[32];
         char ref_hex[65];
         for (int i = 0; i < 16; i++) {
-            sha256_state_to_digest(states_data[i], digest_avx512);
+            sha256_soa_state_to_digest(soa_state, i, digest_avx512);
             sha256_33(msgs[i], digest_ref);
             bytes_to_hex_helper(digest_ref, 32, ref_hex);
             char name[80];
-            snprintf(name, sizeof(name), "10.3 sha256_compress_avx512 16-way 33-byte pubkey lane%d consistent with sha256_33", i);
+            snprintf(name, sizeof(name), "10.3 sha256_compress_avx512_soa 16-way 33-byte pubkey lane%d consistent with sha256_33", i);
             check(name, ref_hex, digest_avx512, 32);
         }
     }
 
     /* ------------------------------------------------------------------ */
-    /* 10.4  ripemd160_compress_avx512 — 16 identical messages, results consistent with scalar ripemd160() */
+    /* 10.4  ripemd160_compress_avx512_soa — 16 identical messages, results consistent with scalar ripemd160() */
     {
         uint8_t block_abc[64];
         make_ripemd160_padded_block((const uint8_t *)"abc", 3, block_abc);
 
-        uint32_t states_data[16][5];
-        uint32_t *states[16];
         const uint8_t *blocks[16];
         for (int i = 0; i < 16; i++) {
-            memcpy(states_data[i], RMD160_INIT, 20);
-            states[i] = states_data[i];
             blocks[i] = block_abc;
         }
 
-        ripemd160_compress_avx512(states, blocks);
+        __m512i rmd_w[16];
+        load_rmd160_words_16way(blocks, rmd_w);
+
+        __m512i soa_state[5];
+        soa_state[0] = _mm512_set1_epi32(0x67452301);
+        soa_state[1] = _mm512_set1_epi32((int)0xEFCDAB89);
+        soa_state[2] = _mm512_set1_epi32((int)0x98BADCFE);
+        soa_state[3] = _mm512_set1_epi32(0x10325476);
+        soa_state[4] = _mm512_set1_epi32((int)0xC3D2E1F0);
+
+        ripemd160_compress_avx512_soa(soa_state, rmd_w);
 
         uint8_t digest_avx512[20];
         for (int lane = 0; lane < 16; lane++) {
-            rmd160_state_to_digest(states_data[lane], digest_avx512);
+            rmd160_soa_state_to_digest(soa_state, lane, digest_avx512);
             char name[80];
-            snprintf(name, sizeof(name), "10.4 ripemd160_compress_avx512(\"abc\") lane%d consistent with standard value", lane);
+            snprintf(name, sizeof(name), "10.4 ripemd160_compress_avx512_soa(\"abc\") lane%d consistent with standard value", lane);
             check(name,
                   "8eb208f7e05d987a9b044a8e98c6b087f15a0bfc",
                   digest_avx512, 20);
@@ -1199,7 +1279,7 @@ static void test_avx512_compress(void) {
     }
 
     /* ------------------------------------------------------------------ */
-    /* 10.5  ripemd160_compress_avx512 — 16 different messages, each lane consistent with scalar */
+    /* 10.5  ripemd160_compress_avx512_soa — 16 different messages, each lane consistent with scalar */
     {
         static const struct { const uint8_t *msg; size_t len; } cases[16] = {
             { (const uint8_t *)"",           0  },
@@ -1221,34 +1301,40 @@ static void test_avx512_compress(void) {
         };
 
         uint8_t padded_blocks[16][64];
-        uint32_t states_data[16][5];
-        uint32_t *states[16];
         const uint8_t *blocks[16];
 
         for (int i = 0; i < 16; i++) {
             make_ripemd160_padded_block(cases[i].msg, cases[i].len, padded_blocks[i]);
-            memcpy(states_data[i], RMD160_INIT, 20);
-            states[i] = states_data[i];
             blocks[i] = padded_blocks[i];
         }
 
-        ripemd160_compress_avx512(states, blocks);
+        __m512i rmd_w[16];
+        load_rmd160_words_16way(blocks, rmd_w);
+
+        __m512i soa_state[5];
+        soa_state[0] = _mm512_set1_epi32(0x67452301);
+        soa_state[1] = _mm512_set1_epi32((int)0xEFCDAB89);
+        soa_state[2] = _mm512_set1_epi32((int)0x98BADCFE);
+        soa_state[3] = _mm512_set1_epi32(0x10325476);
+        soa_state[4] = _mm512_set1_epi32((int)0xC3D2E1F0);
+
+        ripemd160_compress_avx512_soa(soa_state, rmd_w);
 
         uint8_t digest_avx512[20];
         uint8_t digest_ref[20];
         char ref_hex[41];
         for (int i = 0; i < 16; i++) {
-            rmd160_state_to_digest(states_data[i], digest_avx512);
+            rmd160_soa_state_to_digest(soa_state, i, digest_avx512);
             ripemd160(cases[i].msg, cases[i].len, digest_ref);
             bytes_to_hex_helper(digest_ref, 20, ref_hex);
             char name[80];
-            snprintf(name, sizeof(name), "10.5 ripemd160_compress_avx512 16-way different messages lane%d consistent with generic ripemd160", i);
+            snprintf(name, sizeof(name), "10.5 ripemd160_compress_avx512_soa 16-way different messages lane%d consistent with generic ripemd160", i);
             check(name, ref_hex, digest_avx512, 20);
         }
     }
 
     /* ------------------------------------------------------------------ */
-    /* 10.6  ripemd160_compress_avx512 — 16-way 32-byte messages (ripemd160_32 scenario) */
+    /* 10.6  ripemd160_compress_avx512_soa — 16-way 32-byte messages (ripemd160_32 scenario) */
     {
         static const uint8_t inputs[16][32] = {
             { 0x0b,0x7c,0x28,0xc9,0xb7,0x29,0x0c,0x98,0xd7,0x43,0x8e,0x70,0xb3,0xd3,0xf7,0xc8,
@@ -1285,28 +1371,34 @@ static void test_avx512_compress(void) {
         };
 
         uint8_t padded_blocks[16][64];
-        uint32_t states_data[16][5];
-        uint32_t *states[16];
         const uint8_t *blocks[16];
 
         for (int i = 0; i < 16; i++) {
             make_ripemd160_padded_block(inputs[i], 32, padded_blocks[i]);
-            memcpy(states_data[i], RMD160_INIT, 20);
-            states[i] = states_data[i];
             blocks[i] = padded_blocks[i];
         }
 
-        ripemd160_compress_avx512(states, blocks);
+        __m512i rmd_w[16];
+        load_rmd160_words_16way(blocks, rmd_w);
+
+        __m512i soa_state[5];
+        soa_state[0] = _mm512_set1_epi32(0x67452301);
+        soa_state[1] = _mm512_set1_epi32((int)0xEFCDAB89);
+        soa_state[2] = _mm512_set1_epi32((int)0x98BADCFE);
+        soa_state[3] = _mm512_set1_epi32(0x10325476);
+        soa_state[4] = _mm512_set1_epi32((int)0xC3D2E1F0);
+
+        ripemd160_compress_avx512_soa(soa_state, rmd_w);
 
         uint8_t digest_avx512[20];
         uint8_t digest_ref[20];
         char ref_hex[41];
         for (int i = 0; i < 16; i++) {
-            rmd160_state_to_digest(states_data[i], digest_avx512);
+            rmd160_soa_state_to_digest(soa_state, i, digest_avx512);
             ripemd160_32(inputs[i], digest_ref);
             bytes_to_hex_helper(digest_ref, 20, ref_hex);
             char name[80];
-            snprintf(name, sizeof(name), "10.6 ripemd160_compress_avx512 16-way 32-byte input lane%d consistent with ripemd160_32", i);
+            snprintf(name, sizeof(name), "10.6 ripemd160_compress_avx512_soa 16-way 32-byte input lane%d consistent with ripemd160_32", i);
             check(name, ref_hex, digest_avx512, 20);
         }
     }
@@ -1337,13 +1429,16 @@ static void test_hash160_16way(void) {
     };
 
     /* ------------------------------------------------------------------ */
-    /* 11.1  hash160_16way_compressed — 16 identical inputs (G point compressed pubkey) */
+    /* 11.1  hash160_16way_compressed_prepadded — 16 identical inputs (G point compressed pubkey) */
     {
+        uint8_t padded_buf[64];
+        memcpy(padded_buf, G_comp, 33);
+        sha256_pad_block_33(padded_buf);
         const uint8_t *comp_ptrs[16];
-        for (int i = 0; i < 16; i++) comp_ptrs[i] = G_comp;
+        for (int i = 0; i < 16; i++) comp_ptrs[i] = padded_buf;
 
         uint8_t hash160s[16][20];
-        hash160_16way_compressed(comp_ptrs, hash160s);
+        hash160_16way_compressed_prepadded(comp_ptrs, hash160s);
 
         uint8_t ref[20];
         pubkey_bytes_to_hash160(G_comp, 33, ref);
@@ -1353,19 +1448,22 @@ static void test_hash160_16way(void) {
         for (int lane = 0; lane < 16; lane++) {
             char name[80];
             snprintf(name, sizeof(name),
-                     "11.1 hash160_16way_compressed(G point) lane%d consistent with scalar", lane);
+                     "11.1 hash160_16way_compressed_prepadded(G point) lane%d consistent with scalar", lane);
             check(name, ref_hex, hash160s[lane], 20);
         }
     }
 
     /* ------------------------------------------------------------------ */
-    /* 11.2  hash160_16way_uncompressed — 16 identical inputs (G point uncompressed pubkey) */
+    /* 11.2  hash160_16way_uncompressed_prepadded — 16 identical inputs (G point uncompressed pubkey) */
     {
+        uint8_t padded_buf[128];
+        memcpy(padded_buf, G_uncomp, 65);
+        sha256_pad_block2_65(padded_buf);
         const uint8_t *uncomp_ptrs[16];
-        for (int i = 0; i < 16; i++) uncomp_ptrs[i] = G_uncomp;
+        for (int i = 0; i < 16; i++) uncomp_ptrs[i] = padded_buf;
 
         uint8_t hash160s[16][20];
-        hash160_16way_uncompressed(uncomp_ptrs, hash160s);
+        hash160_16way_uncompressed_prepadded(uncomp_ptrs, hash160s);
 
         uint8_t ref[20];
         pubkey_bytes_to_hash160(G_uncomp, 65, ref);
@@ -1375,43 +1473,46 @@ static void test_hash160_16way(void) {
         for (int lane = 0; lane < 16; lane++) {
             char name[80];
             snprintf(name, sizeof(name),
-                     "11.2 hash160_16way_uncompressed(G point) lane%d consistent with scalar", lane);
+                     "11.2 hash160_16way_uncompressed_prepadded(G point) lane%d consistent with scalar", lane);
             check(name, ref_hex, hash160s[lane], 20);
         }
     }
 
     /* ------------------------------------------------------------------ */
-    /* 11.3  hash160_16way_compressed — 16 different inputs (compressed pubkeys for k=1..16) */
+    /* 11.3  hash160_16way_compressed_prepadded — 16 different inputs (compressed pubkeys for k=1..16) */
     {
-        uint8_t comp_bufs[16][33];
+        uint8_t comp_bufs[16][64];
         const uint8_t *comp_ptrs[16];
         uint8_t ref_hash160s[16][20];
 
         for (int i = 0; i < 16; i++) {
             uint8_t privkey[32] = {0};
             privkey[31] = (uint8_t)(i + 1);
-            privkey_to_compressed_bytes(privkey, comp_bufs[i]);
+            uint8_t pubkey_raw[33];
+            privkey_to_compressed_bytes(privkey, pubkey_raw);
+            memcpy(comp_bufs[i], pubkey_raw, 33);
+            sha256_pad_block_33(comp_bufs[i]);
             comp_ptrs[i] = comp_bufs[i];
             privkey_to_hash160(privkey, ref_hash160s[i], NULL);
         }
 
         uint8_t hash160s[16][20];
-        hash160_16way_compressed(comp_ptrs, hash160s);
+        hash160_16way_compressed_prepadded(comp_ptrs, hash160s);
 
         for (int lane = 0; lane < 16; lane++) {
             char ref_hex[41];
             bytes_to_hex_helper(ref_hash160s[lane], 20, ref_hex);
             char name[80];
             snprintf(name, sizeof(name),
-                     "11.3 hash160_16way_compressed(k=%d) lane%d consistent with scalar", lane + 1, lane);
+                     "11.3 hash160_16way_compressed_prepadded(k=%d) lane%d consistent with scalar", lane + 1, lane);
             check(name, ref_hex, hash160s[lane], 20);
         }
     }
 
     /* ------------------------------------------------------------------ */
-    /* 11.4  hash160_16way_uncompressed — 16 different inputs (uncompressed pubkeys for k=1..16) */
+    /* 11.4  hash160_16way_uncompressed_prepadded — 16 different inputs (uncompressed pubkeys for k=1..16) */
     {
-        uint8_t uncomp_bufs[16][65];
+        uint8_t uncomp_bufs[16][128];
         const uint8_t *uncomp_ptrs[16];
         uint8_t ref_hash160s[16][20];
 
@@ -1424,53 +1525,60 @@ static void test_hash160_16way(void) {
             secp256k1_ec_pubkey_create(secp_ctx, &pubkey, privkey);
             secp256k1_ec_pubkey_serialize(secp_ctx, uncomp_bufs[i], &len,
                                           &pubkey, SECP256K1_EC_UNCOMPRESSED);
+            sha256_pad_block2_65(uncomp_bufs[i]);
             uncomp_ptrs[i] = uncomp_bufs[i];
             privkey_to_hash160(privkey, NULL, ref_hash160s[i]);
         }
 
         uint8_t hash160s[16][20];
-        hash160_16way_uncompressed(uncomp_ptrs, hash160s);
+        hash160_16way_uncompressed_prepadded(uncomp_ptrs, hash160s);
 
         for (int lane = 0; lane < 16; lane++) {
             char ref_hex[41];
             bytes_to_hex_helper(ref_hash160s[lane], 20, ref_hex);
             char name[80];
             snprintf(name, sizeof(name),
-                     "11.4 hash160_16way_uncompressed(k=%d) lane%d consistent with scalar", lane + 1, lane);
+                     "11.4 hash160_16way_uncompressed_prepadded(k=%d) lane%d consistent with scalar", lane + 1, lane);
             check(name, ref_hex, hash160s[lane], 20);
         }
     }
 
     /* ------------------------------------------------------------------ */
-    /* 11.5  Known vector: hash160_16way_compressed(G point) lane0 consistent with known hash160 */
+    /* 11.5  Known vector: hash160_16way_compressed_prepadded(G point) lane0 consistent with known hash160 */
     {
+        uint8_t padded_buf[64];
+        memcpy(padded_buf, G_comp, 33);
+        sha256_pad_block_33(padded_buf);
         const uint8_t *comp_ptrs[16];
-        for (int i = 0; i < 16; i++) comp_ptrs[i] = G_comp;
+        for (int i = 0; i < 16; i++) comp_ptrs[i] = padded_buf;
 
         uint8_t hash160s[16][20];
-        hash160_16way_compressed(comp_ptrs, hash160s);
+        hash160_16way_compressed_prepadded(comp_ptrs, hash160s);
 
-        check("11.5 hash160_16way_compressed(G point) consistent with known vector",
+        check("11.5 hash160_16way_compressed_prepadded(G point) consistent with known vector",
               "751e76e8199196d454941c45d1b3a323f1433bd6",
               hash160s[0], 20);
-        check("11.5b hash160_16way_compressed(G point) lane15 consistent with known vector",
+        check("11.5b hash160_16way_compressed_prepadded(G point) lane15 consistent with known vector",
               "751e76e8199196d454941c45d1b3a323f1433bd6",
               hash160s[15], 20);
     }
 
     /* ------------------------------------------------------------------ */
-    /* 11.6  Known vector: hash160_16way_uncompressed(G point) lane0 consistent with known hash160 */
+    /* 11.6  Known vector: hash160_16way_uncompressed_prepadded(G point) lane0 consistent with known hash160 */
     {
+        uint8_t padded_buf[128];
+        memcpy(padded_buf, G_uncomp, 65);
+        sha256_pad_block2_65(padded_buf);
         const uint8_t *uncomp_ptrs[16];
-        for (int i = 0; i < 16; i++) uncomp_ptrs[i] = G_uncomp;
+        for (int i = 0; i < 16; i++) uncomp_ptrs[i] = padded_buf;
 
         uint8_t hash160s[16][20];
-        hash160_16way_uncompressed(uncomp_ptrs, hash160s);
+        hash160_16way_uncompressed_prepadded(uncomp_ptrs, hash160s);
 
-        check("11.6 hash160_16way_uncompressed(G point) consistent with known vector",
+        check("11.6 hash160_16way_uncompressed_prepadded(G point) consistent with known vector",
               "91b24bf9f5288532960ac687abb035127b1d28a5",
               hash160s[0], 20);
-        check("11.6b hash160_16way_uncompressed(G point) lane15 consistent with known vector",
+        check("11.6b hash160_16way_uncompressed_prepadded(G point) lane15 consistent with known vector",
               "91b24bf9f5288532960ac687abb035127b1d28a5",
               hash160s[15], 20);
     }
@@ -1616,10 +1724,6 @@ static void test_ht_contains_16way_func(void) {
 
     ht_free();
 }
-
-/* AVX-512 function forward declarations (for test use) */
-void sha256_compress_avx512(uint32_t *states[16], const uint8_t *blocks[16]);
-void ripemd160_compress_avx512(uint32_t *states[16], const uint8_t *blocks[16]);
 
 #endif /* __AVX512F__ */
 
@@ -3017,6 +3121,26 @@ static void test_gej_add_ge_var_16way(void) {
     }
 }
 
+/*
+ * Test adapter: wraps gej_add_ge_var_16way_soa's new scatter-pointer interface
+ * to accept a contiguous r_aos[16] array (for backward compatibility in tests).
+ */
+static void gej_add_ge_var_16way_soa_compat(secp256k1_gej_16x *r_soa,
+                                             const secp256k1_gej_16x *a_soa,
+                                             const secp256k1_ge *b,
+                                             secp256k1_gej r_aos[16],
+                                             secp256k1_fe rzr_out[16],
+                                             int normed)
+{
+    if (r_aos != NULL) {
+        secp256k1_gej *ptrs[16];
+        for (int i = 0; i < 16; i++) ptrs[i] = &r_aos[i];
+        gej_add_ge_var_16way_soa(r_soa, a_soa, b, ptrs, rzr_out, normed);
+    } else {
+        gej_add_ge_var_16way_soa(r_soa, a_soa, b, NULL, rzr_out, normed);
+    }
+}
+
 /* ------------------------------------------------------------------
  * test_gej_add_ge_var_16way_soa
  *
@@ -3056,7 +3180,7 @@ static void test_gej_add_ge_var_16way_soa(void) {
         secp256k1_gej_16x r_soa;
         secp256k1_gej r_aos[16];
         secp256k1_fe  rzr_out[16];
-        gej_add_ge_var_16way_soa(&r_soa, &a_soa, &G_affine, r_aos, rzr_out, 0);
+        gej_add_ge_var_16way_soa_compat(&r_soa, &a_soa, &G_affine, r_aos, rzr_out, 0);
 
         /* Scalar reference */
         secp256k1_gej ref_next[16];
@@ -3153,7 +3277,7 @@ static void test_gej_add_ge_var_16way_soa(void) {
             secp256k1_gej r_aos[16];
             secp256k1_fe  rzr[16];
             int normed = (step == 0) ? 0 : 1;
-            gej_add_ge_var_16way_soa(&r_soa, &a_soa, &G_affine, r_aos, rzr, normed);
+            gej_add_ge_var_16way_soa_compat(&r_soa, &a_soa, &G_affine, r_aos, rzr, normed);
 
             /* Every 50 steps: verify SoA->AoS matches r_aos */
             if (step % 50 == 0 || step == STEPS - 1) {
@@ -3258,7 +3382,7 @@ static void test_gej_add_ge_var_16way_soa(void) {
             secp256k1_gej_16x r_soa;
             secp256k1_gej r_aos[16];
             secp256k1_fe  rzr[16];
-            gej_add_ge_var_16way_soa(&r_soa, &a_soa, &G_affine, r_aos, rzr, 0);
+            gej_add_ge_var_16way_soa_compat(&r_soa, &a_soa, &G_affine, r_aos, rzr, 0);
 
             secp256k1_ge next_ge[16];
             keygen_batch_normalize(r_aos, next_ge, 16);
@@ -3337,7 +3461,7 @@ static void test_gej_add_ge_var_16way_soa(void) {
             secp256k1_gej_16x r_soa;
             secp256k1_gej r_aos[16];
             secp256k1_fe  rzr[16];
-            gej_add_ge_var_16way_soa(&r_soa, &a_soa, &G_affine, r_aos, rzr, 0);
+            gej_add_ge_var_16way_soa_compat(&r_soa, &a_soa, &G_affine, r_aos, rzr, 0);
 
             secp256k1_ge next_ge[16];
             keygen_batch_normalize(r_aos, next_ge, 16);
@@ -3385,7 +3509,7 @@ static void test_gej_add_ge_var_16way_soa(void) {
             secp256k1_gej_16x r_soa;
             secp256k1_gej r_aos[16];
             secp256k1_fe  rzr[16];
-            gej_add_ge_var_16way_soa(&r_soa, &a_soa, &G_affine, r_aos, rzr, 0);
+            gej_add_ge_var_16way_soa_compat(&r_soa, &a_soa, &G_affine, r_aos, rzr, 0);
 
             secp256k1_ge next_ge[16];
             keygen_batch_normalize(r_aos, next_ge, 16);
@@ -3448,7 +3572,7 @@ static void test_gej_add_ge_var_16way_soa(void) {
             secp256k1_gej_16x r_soa;
             secp256k1_gej soa_result[16];
             secp256k1_fe  soa_rzr[16];
-            gej_add_ge_var_16way_soa(&r_soa, &a_soa, &G_affine, soa_result, soa_rzr, 0);
+            gej_add_ge_var_16way_soa_compat(&r_soa, &a_soa, &G_affine, soa_result, soa_rzr, 0);
 
             for (int ch = 0; ch < 16; ch++) {
                 secp256k1_fe ax1, ay1, az1, ax2, ay2, az2;
@@ -3491,7 +3615,7 @@ static void test_gej_add_ge_var_16way_soa(void) {
 
             secp256k1_gej_16x a_soa, r_soa_step1;
             gej_16x_load(&a_soa, chain_gej);
-            gej_add_ge_var_16way_soa(&r_soa_step1, &a_soa, &G_affine, soa_step1, soa_rzr1, 0);
+            gej_add_ge_var_16way_soa_compat(&r_soa_step1, &a_soa, &G_affine, soa_step1, soa_rzr1, 0);
 
             /* Second step: normed=1 */
             secp256k1_gej aos_step2[16], soa_step2[16];
@@ -3500,7 +3624,7 @@ static void test_gej_add_ge_var_16way_soa(void) {
             gej_add_ge_var_16way(aos_step2, aos_step1, &G_affine, aos_rzr2, 1);
 
             secp256k1_gej_16x r_soa_step2;
-            gej_add_ge_var_16way_soa(&r_soa_step2, &r_soa_step1, &G_affine, soa_step2, soa_rzr2, 1);
+            gej_add_ge_var_16way_soa_compat(&r_soa_step2, &r_soa_step1, &G_affine, soa_step2, soa_rzr2, 1);
 
             for (int ch = 0; ch < 16; ch++) {
                 secp256k1_fe ax1, ay1, az1, ax2, ay2, az2;
@@ -3866,14 +3990,14 @@ static void test_avx512ifma_16way_full_pipeline(void) {
                 /* Store input point BEFORE add (non-IFMA convention) */
                 for (int ch = 0; ch < 16; ch++)
                     gej_buf[ch][0] = chain_gej[ch];
-                gej_add_ge_var_16way_soa(&next_soa, &chain_soa, &G_affine,
+                gej_add_ge_var_16way_soa_compat(&next_soa, &chain_soa, &G_affine,
                                          next_gej_16, step_rzr, 0);
             } else {
                 /* Store input point BEFORE add: previous output = current input */
                 for (int ch = 0; ch < 16; ch++)
                     gej_buf[ch][step] = next_gej_16[ch];
                 /* Subsequent steps: SoA input already available, normed=1 */
-                gej_add_ge_var_16way_soa(&next_soa, &chain_soa, &G_affine,
+                gej_add_ge_var_16way_soa_compat(&next_soa, &chain_soa, &G_affine,
                                          next_gej_16, step_rzr, 1);
             }
 
@@ -4424,4 +4548,5 @@ int main(void) {
 
     return (fail_count > 0) ? 1 : 0;
 }
+
 

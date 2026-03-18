@@ -8,281 +8,127 @@
 
 #ifdef __AVX512F__
 
-/* Forward declaration of sha256_compress_avx512 */
-void sha256_compress_avx512(uint32_t *states[16], const uint8_t *blocks[16]);
-void sha256_compress_avx512_contig(uint32_t *states[16], const uint8_t *base, int stride);
-/* Forward declaration of ripemd160_compress_avx512 */
-void ripemd160_compress_avx512(uint32_t *states[16], const uint8_t *blocks[16]);
-void ripemd160_compress_avx512_contig(uint32_t *states[16], const uint8_t *base, int stride);
-
-/* SHA256 initial state pre-expanded to 16 lanes to avoid per-loop copying */
-static const uint32_t sha256_init_state_16way[16][8] = {
-    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
-    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
-    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
-    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
-    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
-    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
-    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
-    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
-    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
-    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
-    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
-    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
-    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
-    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
-    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
-    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19},
-};
-
-/* RIPEMD160 initial state pre-expanded to 16 lanes to avoid per-loop copying */
-static const uint32_t rmd160_init_state_16way[16][5] = {
-    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
-    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
-    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
-    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
-    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
-    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
-    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
-    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
-    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
-    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
-    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
-    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
-    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
-    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
-    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
-    {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0},
-};
+/* Forward declaration of sha256_compress_avx512 SoA variant */
+void sha256_compress_avx512_soa(__m512i soa_state[8], const uint8_t *blocks[16]);
+/* Forward declaration of ripemd160_compress_avx512 SoA variant */
+void ripemd160_compress_avx512_soa(__m512i soa_state[5], const __m512i w[16]);
 
 /*
- * Pre-filled RIPEMD160 blocks template for 32-byte messages (SHA256 digests).
- * Each block[16][64] has bytes [32..63] pre-filled with RIPEMD160 padding:
- *   block[32]    = 0x80 (padding marker)
- *   block[33..55]= 0x00 (23 zero bytes)
- *   block[56..63]= LE64(256) (bit length = 32*8 = 256)
- * Only the first 32 bytes need to be written per invocation.
+ * sha256_soa_to_rmd160_words — Bridge: convert SHA256 SoA state to RIPEMD160 message words.
+ *
+ * Performs big-endian→little-endian byte-swap on sha_state[0..7] using
+ * _mm512_shuffle_epi8, then fills w[8..15] with the fixed RIPEMD160 padding
+ * for a 32-byte message (0x80 padding marker, zeros, LE64(256) bit length).
+ *
+ * This replaces sha256_state_to_bytes_16way + load_le32_contig entirely,
+ * keeping all data in SIMD registers.
  */
-#define RMD_BLK_TEMPLATE_ROW    \
-    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
-     0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x01, 0, 0, 0, 0, 0, 0 }
-static const uint8_t rmd_blocks_template_16way[16][64] = {
-    RMD_BLK_TEMPLATE_ROW, RMD_BLK_TEMPLATE_ROW, RMD_BLK_TEMPLATE_ROW, RMD_BLK_TEMPLATE_ROW,
-    RMD_BLK_TEMPLATE_ROW, RMD_BLK_TEMPLATE_ROW, RMD_BLK_TEMPLATE_ROW, RMD_BLK_TEMPLATE_ROW,
-    RMD_BLK_TEMPLATE_ROW, RMD_BLK_TEMPLATE_ROW, RMD_BLK_TEMPLATE_ROW, RMD_BLK_TEMPLATE_ROW,
-    RMD_BLK_TEMPLATE_ROW, RMD_BLK_TEMPLATE_ROW, RMD_BLK_TEMPLATE_ROW, RMD_BLK_TEMPLATE_ROW
-};
-#undef RMD_BLK_TEMPLATE_ROW
-
-/* Construct SHA256 padded block (single block, message <= 55 bytes) */
-static void make_sha256_block(const uint8_t *msg, size_t msglen, uint8_t block[64])
+static inline __attribute__((always_inline)) void
+sha256_soa_to_rmd160_words(const __m512i sha_state[8], __m512i w[16])
 {
-    memset(block, 0, 64);
-    memcpy(block, msg, msglen);
-    block[msglen] = 0x80;
-    uint64_t bitlen = (uint64_t)msglen * 8;
-    block[56] = (uint8_t)(bitlen >> 56);
-    block[57] = (uint8_t)(bitlen >> 48);
-    block[58] = (uint8_t)(bitlen >> 40);
-    block[59] = (uint8_t)(bitlen >> 32);
-    block[60] = (uint8_t)(bitlen >> 24);
-    block[61] = (uint8_t)(bitlen >> 16);
-    block[62] = (uint8_t)(bitlen >> 8);
-    block[63] = (uint8_t)(bitlen);
-}
+    /* Byte-swap mask: reverse bytes within each 32-bit lane (big-endian → little-endian) */
+    const __m512i bswap = _mm512_set_epi8(
+        12,13,14,15, 8,9,10,11, 4,5,6,7, 0,1,2,3,
+        12,13,14,15, 8,9,10,11, 4,5,6,7, 0,1,2,3,
+        12,13,14,15, 8,9,10,11, 4,5,6,7, 0,1,2,3,
+        12,13,14,15, 8,9,10,11, 4,5,6,7, 0,1,2,3);
 
-/* Construct SHA256 first block (64-byte message block, no padding) */
-static void make_sha256_block_raw(const uint8_t *msg64, uint8_t block[64])
-{
-    memcpy(block, msg64, 64);
-}
+    /* SHA256 outputs 8 big-endian uint32 words → byte-swap for RIPEMD160 LE input */
+    w[0] = _mm512_shuffle_epi8(sha_state[0], bswap);
+    w[1] = _mm512_shuffle_epi8(sha_state[1], bswap);
+    w[2] = _mm512_shuffle_epi8(sha_state[2], bswap);
+    w[3] = _mm512_shuffle_epi8(sha_state[3], bswap);
+    w[4] = _mm512_shuffle_epi8(sha_state[4], bswap);
+    w[5] = _mm512_shuffle_epi8(sha_state[5], bswap);
+    w[6] = _mm512_shuffle_epi8(sha_state[6], bswap);
+    w[7] = _mm512_shuffle_epi8(sha_state[7], bswap);
 
-/* Construct SHA256 second padded block (tail block for 65-byte message) */
-static void make_sha256_block2_65(const uint8_t last_byte, uint8_t block[64])
-{
-    memset(block, 0, 64);
-    block[0] = last_byte;
-    block[1] = 0x80;
-    uint64_t bitlen = 65ULL * 8;
-    block[56] = (uint8_t)(bitlen >> 56);
-    block[57] = (uint8_t)(bitlen >> 48);
-    block[58] = (uint8_t)(bitlen >> 40);
-    block[59] = (uint8_t)(bitlen >> 32);
-    block[60] = (uint8_t)(bitlen >> 24);
-    block[61] = (uint8_t)(bitlen >> 16);
-    block[62] = (uint8_t)(bitlen >> 8);
-    block[63] = (uint8_t)(bitlen);
-}
-
-/* Convert SHA256 state[8] to 32-byte big-endian digest (scalar, single lane) */
-static void sha256_state_to_bytes(const uint32_t state[8], uint8_t out[32])
-{
-    for (int i = 0; i < 8; i++) {
-        out[i * 4 + 0] = (uint8_t)(state[i] >> 24);
-        out[i * 4 + 1] = (uint8_t)(state[i] >> 16);
-        out[i * 4 + 2] = (uint8_t)(state[i] >> 8);
-        out[i * 4 + 3] = (uint8_t)(state[i]);
-    }
-}
-
-/*
- * sha256_state_to_bytes_16way: vectorized big-endian byte-swap for 16 SHA256 states.
- * For each of the 8 state words, gathers 16 uint32_t values into a __m512i,
- * performs in-register byte-swap via _mm512_shuffle_epi8, then scatters
- * the 4-byte results into each lane's output buffer.
- * Replaces 16 x 8 = 128 scalar shift operations with 8 SIMD iterations.
- */
-static void sha256_state_to_bytes_16way(uint32_t sha_states[16][8],
-                                        uint8_t rmd_blocks[16][64])
-{
-    /*
-     * AVX-512F only (no BW needed): byte-swap uint32_t using shift+mask+or.
-     * For each 32-bit element ABCD -> DCBA:
-     *   byte3 = (v >> 24) & 0xFF
-     *   byte2 = (v >> 8)  & 0xFF00
-     *   byte1 = (v << 8)  & 0xFF0000
-     *   byte0 = (v << 24) & 0xFF000000
+    /* RIPEMD160 padding for 32-byte message:
+     * w[8]  = 0x00000080 (0x80 marker byte at position 32, little-endian uint32)
+     * w[9..13] = 0x00000000
+     * w[14] = 0x00000100 (bit length 256 = 0x100, LE)
+     * w[15] = 0x00000000
      */
-    const __m512i mask_ff   = _mm512_set1_epi32(0x000000FF);
-    const __m512i mask_ff00 = _mm512_set1_epi32(0x0000FF00);
+    w[8]  = _mm512_set1_epi32(0x00000080);
+    w[9]  = _mm512_setzero_si512();
+    w[10] = _mm512_setzero_si512();
+    w[11] = _mm512_setzero_si512();
+    w[12] = _mm512_setzero_si512();
+    w[13] = _mm512_setzero_si512();
+    w[14] = _mm512_set1_epi32(0x00000100);
+    w[15] = _mm512_setzero_si512();
+}
 
-    for (int w = 0; w < 8; w++) {
-        /* Gather state word w from all 16 lanes into two __m512i (16 x uint32_t each) */
-        uint32_t lo_buf[16] __attribute__((aligned(64)));
-        uint32_t hi_buf[16] __attribute__((aligned(64)));
-        for (int i = 0; i < 8; i++) {
-            lo_buf[i] = sha_states[i][w];
-            hi_buf[i] = sha_states[i + 8][w];
-        }
-        __m512i lo = _mm512_load_si512((const void *)lo_buf);
-        __m512i hi = _mm512_load_si512((const void *)hi_buf);
+/*
+ * rmd160_soa_to_bytes_16way — Convert RIPEMD160 SoA state to 16 hash160 byte arrays.
+ *
+ * On x86 (native little-endian), RIPEMD160 state words are already in the
+ * correct byte order.  We store each __m512i to a temp buffer and scatter
+ * the 4-byte words into the appropriate positions of each lane's 20-byte output.
+ */
+static void rmd160_soa_to_bytes_16way(const __m512i soa_state[5], uint8_t hash160s[16][20])
+{
+    uint32_t tmp[16] __attribute__((aligned(64)));
 
-        /* In-register 32-bit byte-swap using AVX-512F shift/mask/or */
-        __m512i lo_b3 = _mm512_and_si512(_mm512_srli_epi32(lo, 24), mask_ff);
-        __m512i lo_b2 = _mm512_and_si512(_mm512_srli_epi32(lo, 8),  mask_ff00);
-        __m512i lo_b1 = _mm512_and_si512(_mm512_slli_epi32(lo, 8),  _mm512_set1_epi32(0x00FF0000));
-        __m512i lo_b0 = _mm512_slli_epi32(lo, 24);
-        lo = _mm512_or_si512(_mm512_or_si512(lo_b0, lo_b1), _mm512_or_si512(lo_b2, lo_b3));
-
-        __m512i hi_b3 = _mm512_and_si512(_mm512_srli_epi32(hi, 24), mask_ff);
-        __m512i hi_b2 = _mm512_and_si512(_mm512_srli_epi32(hi, 8),  mask_ff00);
-        __m512i hi_b1 = _mm512_and_si512(_mm512_slli_epi32(hi, 8),  _mm512_set1_epi32(0x00FF0000));
-        __m512i hi_b0 = _mm512_slli_epi32(hi, 24);
-        hi = _mm512_or_si512(_mm512_or_si512(hi_b0, hi_b1), _mm512_or_si512(hi_b2, hi_b3));
-
-        /* Store swapped 4 bytes to each lane's rmd_block at offset w*4 */
-        _mm512_store_si512((__m512i *)lo_buf, lo);
-        _mm512_store_si512((__m512i *)hi_buf, hi);
-
+    for (int w = 0; w < 5; w++) {
+        _mm512_store_si512((__m512i *)tmp, soa_state[w]);
         int off = w * 4;
-        for (int i = 0; i < 8; i++) {
-            memcpy(&rmd_blocks[i][off], &lo_buf[i], 4);
-        }
-        for (int i = 0; i < 8; i++) {
-            memcpy(&rmd_blocks[i + 8][off], &hi_buf[i], 4);
+        for (int i = 0; i < 16; i++) {
+            memcpy(&hash160s[i][off], &tmp[i], 4);
         }
     }
 }
 
-/* Convert RIPEMD160 state[5] to 20-byte little-endian digest.
- * On x86 (native little-endian), uint32_t memory layout already matches
- * the desired byte order, so a direct memcpy suffices. */
-static void rmd160_state_to_bytes(const uint32_t state[5], uint8_t out[20])
+/*
+ * hash160_16way_finalize_from_sha_soa — Full SoA pipeline finalization.
+ *
+ * Takes SHA256 SoA state directly, converts to RIPEMD160 message words in
+ * registers, runs RIPEMD160 preloaded compression, and extracts hash160 bytes.
+ * Eliminates sha256_state_to_bytes_16way, load_le32_contig, and rmd_store_16way.
+ */
+static void hash160_16way_finalize_from_sha_soa(__m512i sha_soa_state[8], uint8_t hash160s[16][20])
 {
-    memcpy(out, state, 20);
-}
+    /* Bridge: SHA256 SoA state -> RIPEMD160 pre-loaded message words */
+    __m512i rmd_w[16];
+    sha256_soa_to_rmd160_words(sha_soa_state, rmd_w);
 
-static void hash160_16way_sha_init(uint32_t sha_states[16][8], uint32_t *sha_state_ptrs[16])
-{
-    /* Single memcpy(512 bytes) replaces 16x memcpy(32 bytes), more vectorization-friendly */
-    memcpy(sha_states, sha256_init_state_16way, sizeof(sha256_init_state_16way));
-    for (int i = 0; i < 16; i++) {
-        sha_state_ptrs[i] = sha_states[i];
-    }
-}
+    /* Initialize RIPEMD160 SoA state */
+    __m512i rmd_soa[5];
+    rmd_soa[0] = _mm512_set1_epi32(0x67452301);
+    rmd_soa[1] = _mm512_set1_epi32((int)0xEFCDAB89);
+    rmd_soa[2] = _mm512_set1_epi32((int)0x98BADCFE);
+    rmd_soa[3] = _mm512_set1_epi32(0x10325476);
+    rmd_soa[4] = _mm512_set1_epi32((int)0xC3D2E1F0);
 
-static void hash160_16way_finalize_from_sha(uint32_t sha_states[16][8], uint8_t hash160s[16][20])
-{
-    /* Copy template with pre-filled padding; only first 32 bytes per row need updating */
-    uint8_t rmd_blocks[16][64];
-    memcpy(rmd_blocks, rmd_blocks_template_16way, sizeof(rmd_blocks_template_16way));
+    /* RIPEMD160 compression with pre-loaded words (no gather, no scatter) */
+    ripemd160_compress_avx512_soa(rmd_soa, rmd_w);
 
-    uint32_t rmd_states[16][5];
-    uint32_t *rmd_state_ptrs[16];
-    const uint8_t *rmd_block_ptrs[16];
-
-    memcpy(rmd_states, rmd160_init_state_16way, sizeof(rmd160_init_state_16way));
-    /* Vectorized byte-swap: convert 16 SHA256 states to big-endian bytes in rmd_blocks */
-    sha256_state_to_bytes_16way(sha_states, rmd_blocks);
-    for (int i = 0; i < 16; i++) {
-        rmd_state_ptrs[i] = rmd_states[i];
-    }
-
-    /* rmd_blocks[16][64] is contiguous, use gather-optimized variant */
-    ripemd160_compress_avx512_contig(rmd_state_ptrs, (const uint8_t *)rmd_blocks, 64);
-
-    for (int i = 0; i < 16; i++) {
-        rmd160_state_to_bytes(rmd_states[i], hash160s[i]);
-    }
+    /* Convert RIPEMD160 SoA state to 16 x 20-byte hash160 */
+    rmd160_soa_to_bytes_16way(rmd_soa, hash160s);
 }
 
 static void hash160_16way_prepadded_sha(const uint8_t *blocks1[16],
                                         const uint8_t *blocks2[16],
                                         uint8_t hash160s[16][20])
 {
-    uint32_t sha_states[16][8];
-    uint32_t *sha_state_ptrs[16];
+    /* Initialize SHA256 SoA state with standard IV */
+    __m512i soa_state[8];
+    soa_state[0] = _mm512_set1_epi32(0x6a09e667);
+    soa_state[1] = _mm512_set1_epi32((int)0xbb67ae85);
+    soa_state[2] = _mm512_set1_epi32(0x3c6ef372);
+    soa_state[3] = _mm512_set1_epi32((int)0xa54ff53a);
+    soa_state[4] = _mm512_set1_epi32(0x510e527f);
+    soa_state[5] = _mm512_set1_epi32((int)0x9b05688c);
+    soa_state[6] = _mm512_set1_epi32(0x1f83d9ab);
+    soa_state[7] = _mm512_set1_epi32(0x5be0cd19);
 
-    hash160_16way_sha_init(sha_states, sha_state_ptrs);
-    sha256_compress_avx512(sha_state_ptrs, blocks1);
+    sha256_compress_avx512_soa(soa_state, blocks1);
 
     if (blocks2 != NULL) {
-        sha256_compress_avx512(sha_state_ptrs, blocks2);
+        sha256_compress_avx512_soa(soa_state, blocks2);
     }
 
-    hash160_16way_finalize_from_sha(sha_states, hash160s);
-}
-
-/*
- * 16-way parallel hash160 (SHA256->RIPEMD160) for compressed public keys (33 bytes)
- */
-__attribute__((target("avx512f")))
-void hash160_16way_compressed(const uint8_t *pubkeys[16], uint8_t hash160s[16][20])
-{
-    uint8_t sha_blocks[16][64];
-    uint32_t sha_states[16][8];
-    uint32_t *sha_state_ptrs[16];
-    const uint8_t *sha_block_ptrs[16];
-
-    memcpy(sha_states, sha256_init_state_16way, sizeof(sha256_init_state_16way));
-    for (int i = 0; i < 16; i++) {
-        make_sha256_block(pubkeys[i], 33, sha_blocks[i]);
-        sha_state_ptrs[i] = sha_states[i];
-    }
-
-    /* sha_blocks[16][64] is contiguous, use gather-optimized variant */
-    sha256_compress_avx512_contig(sha_state_ptrs, (const uint8_t *)sha_blocks, 64);
-
-    /* Reuse pre-filled template: only write first 32 bytes per block */
-    uint8_t rmd_blocks[16][64];
-    memcpy(rmd_blocks, rmd_blocks_template_16way, sizeof(rmd_blocks_template_16way));
-
-    uint32_t rmd_states[16][5];
-    uint32_t *rmd_state_ptrs[16];
-
-    memcpy(rmd_states, rmd160_init_state_16way, sizeof(rmd160_init_state_16way));
-    /* Vectorized byte-swap: convert 16 SHA256 states to big-endian bytes in rmd_blocks */
-    sha256_state_to_bytes_16way(sha_states, rmd_blocks);
-    for (int i = 0; i < 16; i++) {
-        rmd_state_ptrs[i] = rmd_states[i];
-    }
-
-    /* rmd_blocks[16][64] is contiguous, use gather-optimized variant */
-    ripemd160_compress_avx512_contig(rmd_state_ptrs, (const uint8_t *)rmd_blocks, 64);
-
-    for (int i = 0; i < 16; i++) {
-        rmd160_state_to_bytes(rmd_states[i], hash160s[i]);
-    }
+    hash160_16way_finalize_from_sha_soa(soa_state, hash160s);
 }
 
 /*
@@ -311,56 +157,6 @@ void hash160_16way_uncompressed_prepadded(const uint8_t *bufs[16], uint8_t hash1
     }
 
     hash160_16way_prepadded_sha(bufs, blocks2, hash160s);
-}
-
-/*
- * 16-way parallel hash160 (SHA256->RIPEMD160) for uncompressed public keys (65 bytes)
- */
-__attribute__((target("avx512f")))
-void hash160_16way_uncompressed(const uint8_t *pubkeys[16], uint8_t hash160s[16][20])
-{
-    uint8_t sha_blocks1[16][64];
-    uint32_t sha_states[16][8];
-    uint32_t *sha_state_ptrs[16];
-    const uint8_t *sha_block_ptrs[16];
-
-    memcpy(sha_states, sha256_init_state_16way, sizeof(sha256_init_state_16way));
-    for (int i = 0; i < 16; i++) {
-        make_sha256_block_raw(pubkeys[i], sha_blocks1[i]);
-        sha_state_ptrs[i] = sha_states[i];
-    }
-
-    /* sha_blocks1[16][64] is contiguous, use gather-optimized variant */
-    sha256_compress_avx512_contig(sha_state_ptrs, (const uint8_t *)sha_blocks1, 64);
-
-    uint8_t sha_blocks2[16][64];
-    for (int i = 0; i < 16; i++) {
-        make_sha256_block2_65(pubkeys[i][64], sha_blocks2[i]);
-    }
-
-    /* sha_blocks2[16][64] is contiguous, use gather-optimized variant */
-    sha256_compress_avx512_contig(sha_state_ptrs, (const uint8_t *)sha_blocks2, 64);
-
-    /* Reuse pre-filled template: only write first 32 bytes per block */
-    uint8_t rmd_blocks[16][64];
-    memcpy(rmd_blocks, rmd_blocks_template_16way, sizeof(rmd_blocks_template_16way));
-
-    uint32_t rmd_states[16][5];
-    uint32_t *rmd_state_ptrs[16];
-
-    memcpy(rmd_states, rmd160_init_state_16way, sizeof(rmd160_init_state_16way));
-    /* Vectorized byte-swap: convert 16 SHA256 states to big-endian bytes in rmd_blocks */
-    sha256_state_to_bytes_16way(sha_states, rmd_blocks);
-    for (int i = 0; i < 16; i++) {
-        rmd_state_ptrs[i] = rmd_states[i];
-    }
-
-    /* rmd_blocks[16][64] is contiguous, use gather-optimized variant */
-    ripemd160_compress_avx512_contig(rmd_state_ptrs, (const uint8_t *)rmd_blocks, 64);
-
-    for (int i = 0; i < 16; i++) {
-        rmd160_state_to_bytes(rmd_states[i], hash160s[i]);
-    }
 }
 
 /*
@@ -409,3 +205,4 @@ uint16_t ht_contains_16way(const uint8_t *h160s[16])
 }
 
 #endif /* __AVX512F__ */
+

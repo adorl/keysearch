@@ -1,11 +1,11 @@
 /*
- * ripemd160_avx512.c — RIPEMD160 16-way AVX-512 parallel compression function
+ * ripemd160_avx512.c — RIPEMD160 16-way AVX-512 parallel compression function (SoA variant)
  *
- * Processes 16 independent message blocks (each 64 bytes) simultaneously,
+ * Processes 16 independent message blocks simultaneously,
  * using AVX-512 512-bit registers.
  *
- * Interface:
- *   void ripemd160_compress_avx512(uint32_t *states[16], const uint8_t *blocks[16])
+ * SoA Interface:
+ *   void ripemd160_compress_avx512_soa(__m512i soa_state[5], const __m512i w[16])
  */
 
 #ifdef __AVX512F__
@@ -56,312 +56,36 @@
 #define VRR_G(a, b, c, d, e, x, s)  VRL_STEP(a, b, c, d, e, _mm512_add_epi32(_mm512_add_epi32(V_G(b, c, d), (x)), _mm512_set1_epi32(0x7A6D76E9)), s)
 #define VRR_F(a, b, c, d, e, x, s)  VRL_STEP(a, b, c, d, e, _mm512_add_epi32(V_F(b, c, d), (x)), s)
 
-/* Load the i-th uint32_t (little-endian) from each of 16 blocks into a __m512i */
-static inline __attribute__((always_inline)) __m512i load_le32_16way(const uint8_t *const blocks[16], int i)
-{
-    const int off = i * 4;
-    uint32_t lanes[16] __attribute__((aligned(64))) = {
-        load_u32_unaligned(blocks[0] + off),
-        load_u32_unaligned(blocks[1] + off),
-        load_u32_unaligned(blocks[2] + off),
-        load_u32_unaligned(blocks[3] + off),
-        load_u32_unaligned(blocks[4] + off),
-        load_u32_unaligned(blocks[5] + off),
-        load_u32_unaligned(blocks[6] + off),
-        load_u32_unaligned(blocks[7] + off),
-        load_u32_unaligned(blocks[8] + off),
-        load_u32_unaligned(blocks[9] + off),
-        load_u32_unaligned(blocks[10] + off),
-        load_u32_unaligned(blocks[11] + off),
-        load_u32_unaligned(blocks[12] + off),
-        load_u32_unaligned(blocks[13] + off),
-        load_u32_unaligned(blocks[14] + off),
-        load_u32_unaligned(blocks[15] + off)
-    };
-    return _mm512_load_si512((const void *)lanes);
-}
-
-/* Write the 16 lanes of a __m512i back to the i-th element of each of 16 states */
-static inline void rmd_store_16way(uint32_t *const states[16], int i, __m512i v)
-{
-    uint32_t tmp[16] __attribute__((aligned(64)));
-    _mm512_store_si512((__m512i *)tmp, v);
-    states[0][i] = tmp[0];
-    states[1][i] = tmp[1];
-    states[2][i] = tmp[2];
-    states[3][i] = tmp[3];
-    states[4][i] = tmp[4];
-    states[5][i] = tmp[5];
-    states[6][i] = tmp[6];
-    states[7][i] = tmp[7];
-    states[8][i] = tmp[8];
-    states[9][i] = tmp[9];
-    states[10][i] = tmp[10];
-    states[11][i] = tmp[11];
-    states[12][i] = tmp[12];
-    states[13][i] = tmp[13];
-    states[14][i] = tmp[14];
-    states[15][i] = tmp[15];
-}
-
 /*
- * ripemd160_compress_avx512 — 16-way parallel RIPEMD160 compression
+ * ripemd160_compress_avx512_soa — SoA variant with pre-loaded message words.
  *
- * Perform one RIPEMD160 compression on 16 independent (state, block) pairs simultaneously
- */
-__attribute__((target("avx512f")))
-void ripemd160_compress_avx512(uint32_t *states[16], const uint8_t *blocks[16])
-{
-    /* Load 16-lane initial state */
-    __m512i al = load_state_word_16way(states, 0);
-    __m512i bl = load_state_word_16way(states, 1);
-    __m512i cl = load_state_word_16way(states, 2);
-    __m512i dl = load_state_word_16way(states, 3);
-    __m512i el = load_state_word_16way(states, 4);
-    __m512i ar = al, br = bl, cr = cl, dr = dl, er = el;
-
-    /* Save initial state */
-    __m512i s0 = al, s1 = bl, s2 = cl, s3 = dl, s4 = el;
-
-    /* Load 16-lane message words (little-endian) */
-    __m512i w0 = load_le32_16way(blocks, 0), w1 = load_le32_16way(blocks, 1);
-    __m512i w2 = load_le32_16way(blocks, 2), w3 = load_le32_16way(blocks, 3);
-    __m512i w4 = load_le32_16way(blocks, 4), w5 = load_le32_16way(blocks, 5);
-    __m512i w6 = load_le32_16way(blocks, 6), w7 = load_le32_16way(blocks, 7);
-    __m512i w8 = load_le32_16way(blocks, 8), w9 = load_le32_16way(blocks, 9);
-    __m512i w10 = load_le32_16way(blocks, 10), w11 = load_le32_16way(blocks, 11);
-    __m512i w12 = load_le32_16way(blocks, 12), w13 = load_le32_16way(blocks, 13);
-    __m512i w14 = load_le32_16way(blocks, 14), w15 = load_le32_16way(blocks, 15);
-
-    /* Left chain: rounds 0-15, F */
-    VRL_F(al, bl, cl, dl, el, w0, 11);
-    VRL_F(al, bl, cl, dl, el, w1, 14);
-    VRL_F(al, bl, cl, dl, el, w2, 15);
-    VRL_F(al, bl, cl, dl, el, w3, 12);
-    VRL_F(al, bl, cl, dl, el, w4, 5);
-    VRL_F(al, bl, cl, dl, el, w5, 8);
-    VRL_F(al, bl, cl, dl, el, w6, 7);
-    VRL_F(al, bl, cl, dl, el, w7, 9);
-    VRL_F(al, bl, cl, dl, el, w8, 11);
-    VRL_F(al, bl, cl, dl, el, w9, 13);
-    VRL_F(al, bl, cl, dl, el, w10, 14);
-    VRL_F(al, bl, cl, dl, el, w11, 15);
-    VRL_F(al, bl, cl, dl, el, w12, 6);
-    VRL_F(al, bl, cl, dl, el, w13, 7);
-    VRL_F(al, bl, cl, dl, el, w14, 9);
-    VRL_F(al, bl, cl, dl, el, w15, 8);
-    /* Left chain: rounds 16-31, G */
-    VRL_G(al, bl, cl, dl, el, w7, 7);
-    VRL_G(al, bl, cl, dl, el, w4, 6);
-    VRL_G(al, bl, cl, dl, el, w13, 8);
-    VRL_G(al, bl, cl, dl, el, w1, 13);
-    VRL_G(al, bl, cl, dl, el, w10, 11);
-    VRL_G(al, bl, cl, dl, el, w6, 9);
-    VRL_G(al, bl, cl, dl, el, w15, 7);
-    VRL_G(al, bl, cl, dl, el, w3, 15);
-    VRL_G(al, bl, cl, dl, el, w12, 7);
-    VRL_G(al, bl, cl, dl, el, w0, 12);
-    VRL_G(al, bl, cl, dl, el, w9, 15);
-    VRL_G(al, bl, cl, dl, el, w5, 9);
-    VRL_G(al, bl, cl, dl, el, w2, 11);
-    VRL_G(al, bl, cl, dl, el, w14, 7);
-    VRL_G(al, bl, cl, dl, el, w11, 13);
-    VRL_G(al, bl, cl, dl, el, w8, 12);
-    /* Left chain: rounds 32-47, H */
-    VRL_H(al, bl, cl, dl, el, w3, 11);
-    VRL_H(al, bl, cl, dl, el, w10, 13);
-    VRL_H(al, bl, cl, dl, el, w14, 6);
-    VRL_H(al, bl, cl, dl, el, w4, 7);
-    VRL_H(al, bl, cl, dl, el, w9, 14);
-    VRL_H(al, bl, cl, dl, el, w15, 9);
-    VRL_H(al, bl, cl, dl, el, w8, 13);
-    VRL_H(al, bl, cl, dl, el, w1, 15);
-    VRL_H(al, bl, cl, dl, el, w2, 14);
-    VRL_H(al, bl, cl, dl, el, w7, 8);
-    VRL_H(al, bl, cl, dl, el, w0, 13);
-    VRL_H(al, bl, cl, dl, el, w6, 6);
-    VRL_H(al, bl, cl, dl, el, w13, 5);
-    VRL_H(al, bl, cl, dl, el, w11, 12);
-    VRL_H(al, bl, cl, dl, el, w5, 7);
-    VRL_H(al, bl, cl, dl, el, w12, 5);
-    /* Left chain: rounds 48-63, I */
-    VRL_I(al, bl, cl, dl, el, w1, 11);
-    VRL_I(al, bl, cl, dl, el, w9, 12);
-    VRL_I(al, bl, cl, dl, el, w11, 14);
-    VRL_I(al, bl, cl, dl, el, w10, 15);
-    VRL_I(al, bl, cl, dl, el, w0, 14);
-    VRL_I(al, bl, cl, dl, el, w8, 15);
-    VRL_I(al, bl, cl, dl, el, w12, 9);
-    VRL_I(al, bl, cl, dl, el, w4, 8);
-    VRL_I(al, bl, cl, dl, el, w13, 9);
-    VRL_I(al, bl, cl, dl, el, w3, 14);
-    VRL_I(al, bl, cl, dl, el, w7, 5);
-    VRL_I(al, bl, cl, dl, el, w15, 6);
-    VRL_I(al, bl, cl, dl, el, w14, 8);
-    VRL_I(al, bl, cl, dl, el, w5, 6);
-    VRL_I(al, bl, cl, dl, el, w6, 5);
-    VRL_I(al, bl, cl, dl, el, w2, 12);
-    /* Left chain: rounds 64-79, J */
-    VRL_J(al, bl, cl, dl, el, w4, 9);
-    VRL_J(al, bl, cl, dl, el, w0, 15);
-    VRL_J(al, bl, cl, dl, el, w5, 5);
-    VRL_J(al, bl, cl, dl, el, w9, 11);
-    VRL_J(al, bl, cl, dl, el, w7, 6);
-    VRL_J(al, bl, cl, dl, el, w12, 8);
-    VRL_J(al, bl, cl, dl, el, w2, 13);
-    VRL_J(al, bl, cl, dl, el, w10, 12);
-    VRL_J(al, bl, cl, dl, el, w14, 5);
-    VRL_J(al, bl, cl, dl, el, w1, 12);
-    VRL_J(al, bl, cl, dl, el, w3, 13);
-    VRL_J(al, bl, cl, dl, el, w8, 14);
-    VRL_J(al, bl, cl, dl, el, w11, 11);
-    VRL_J(al, bl, cl, dl, el, w6, 8);
-    VRL_J(al, bl, cl, dl, el, w15, 5);
-    VRL_J(al, bl, cl, dl, el, w13, 6);
-
-    /* Right chain: rounds 0-15, J */
-    VRR_J(ar, br, cr, dr, er, w5, 8);
-    VRR_J(ar, br, cr, dr, er, w14, 9);
-    VRR_J(ar, br, cr, dr, er, w7, 9);
-    VRR_J(ar, br, cr, dr, er, w0, 11);
-    VRR_J(ar, br, cr, dr, er, w9, 13);
-    VRR_J(ar, br, cr, dr, er, w2, 15);
-    VRR_J(ar, br, cr, dr, er, w11, 15);
-    VRR_J(ar, br, cr, dr, er, w4, 5);
-    VRR_J(ar, br, cr, dr, er, w13, 7);
-    VRR_J(ar, br, cr, dr, er, w6, 7);
-    VRR_J(ar, br, cr, dr, er, w15, 8);
-    VRR_J(ar, br, cr, dr, er, w8, 11);
-    VRR_J(ar, br, cr, dr, er, w1, 14);
-    VRR_J(ar, br, cr, dr, er, w10, 14);
-    VRR_J(ar, br, cr, dr, er, w3, 12);
-    VRR_J(ar, br, cr, dr, er, w12, 6);
-    /* Right chain: rounds 16-31, I */
-    VRR_I(ar, br, cr, dr, er, w6, 9);
-    VRR_I(ar, br, cr, dr, er, w11, 13);
-    VRR_I(ar, br, cr, dr, er, w3, 15);
-    VRR_I(ar, br, cr, dr, er, w7, 7);
-    VRR_I(ar, br, cr, dr, er, w0, 12);
-    VRR_I(ar, br, cr, dr, er, w13, 8);
-    VRR_I(ar, br, cr, dr, er, w5, 9);
-    VRR_I(ar, br, cr, dr, er, w10, 11);
-    VRR_I(ar, br, cr, dr, er, w14, 7);
-    VRR_I(ar, br, cr, dr, er, w15, 7);
-    VRR_I(ar, br, cr, dr, er, w8, 12);
-    VRR_I(ar, br, cr, dr, er, w12, 7);
-    VRR_I(ar, br, cr, dr, er, w4, 6);
-    VRR_I(ar, br, cr, dr, er, w9, 15);
-    VRR_I(ar, br, cr, dr, er, w1, 13);
-    VRR_I(ar, br, cr, dr, er, w2, 11);
-    /* Right chain: rounds 32-47, H */
-    VRR_H(ar, br, cr, dr, er, w15, 9);
-    VRR_H(ar, br, cr, dr, er, w5, 7);
-    VRR_H(ar, br, cr, dr, er, w1, 15);
-    VRR_H(ar, br, cr, dr, er, w3, 11);
-    VRR_H(ar, br, cr, dr, er, w7, 8);
-    VRR_H(ar, br, cr, dr, er, w14, 6);
-    VRR_H(ar, br, cr, dr, er, w6, 6);
-    VRR_H(ar, br, cr, dr, er, w9, 14);
-    VRR_H(ar, br, cr, dr, er, w11, 12);
-    VRR_H(ar, br, cr, dr, er, w8, 13);
-    VRR_H(ar, br, cr, dr, er, w12, 5);
-    VRR_H(ar, br, cr, dr, er, w2, 14);
-    VRR_H(ar, br, cr, dr, er, w10, 13);
-    VRR_H(ar, br, cr, dr, er, w0, 13);
-    VRR_H(ar, br, cr, dr, er, w4, 7);
-    VRR_H(ar, br, cr, dr, er, w13, 5);
-    /* Right chain: rounds 48-63, G */
-    VRR_G(ar, br, cr, dr, er, w8, 15);
-    VRR_G(ar, br, cr, dr, er, w6, 5);
-    VRR_G(ar, br, cr, dr, er, w4, 8);
-    VRR_G(ar, br, cr, dr, er, w1, 11);
-    VRR_G(ar, br, cr, dr, er, w3, 14);
-    VRR_G(ar, br, cr, dr, er, w11, 14);
-    VRR_G(ar, br, cr, dr, er, w15, 6);
-    VRR_G(ar, br, cr, dr, er, w0, 14);
-    VRR_G(ar, br, cr, dr, er, w5, 6);
-    VRR_G(ar, br, cr, dr, er, w12, 9);
-    VRR_G(ar, br, cr, dr, er, w2, 12);
-    VRR_G(ar, br, cr, dr, er, w13, 9);
-    VRR_G(ar, br, cr, dr, er, w9, 12);
-    VRR_G(ar, br, cr, dr, er, w7, 5);
-    VRR_G(ar, br, cr, dr, er, w10, 15);
-    VRR_G(ar, br, cr, dr, er, w14, 8);
-    /* Right chain: rounds 64-79, F */
-    VRR_F(ar, br, cr, dr, er, w12, 8);
-    VRR_F(ar, br, cr, dr, er, w15, 5);
-    VRR_F(ar, br, cr, dr, er, w10, 12);
-    VRR_F(ar, br, cr, dr, er, w4, 9);
-    VRR_F(ar, br, cr, dr, er, w1, 12);
-    VRR_F(ar, br, cr, dr, er, w5, 5);
-    VRR_F(ar, br, cr, dr, er, w8, 14);
-    VRR_F(ar, br, cr, dr, er, w7, 6);
-    VRR_F(ar, br, cr, dr, er, w6, 8);
-    VRR_F(ar, br, cr, dr, er, w2, 13);
-    VRR_F(ar, br, cr, dr, er, w13, 6);
-    VRR_F(ar, br, cr, dr, er, w14, 5);
-    VRR_F(ar, br, cr, dr, er, w0, 15);
-    VRR_F(ar, br, cr, dr, er, w3, 13);
-    VRR_F(ar, br, cr, dr, er, w9, 11);
-    VRR_F(ar, br, cr, dr, er, w11, 11);
-
-    /* Merge left and right chains, update state
-     * RIPEMD160 merge order:
-     *   new[0] = h1 + cl + dr
-     *   new[1] = h2 + dl + er
-     *   new[2] = h3 + el + ar
-     *   new[3] = h4 + al + br
-     *   new[4] = h0 + bl + cr
-     */
-    __m512i new0 = _mm512_add_epi32(_mm512_add_epi32(s1, cl), dr);
-    __m512i new1 = _mm512_add_epi32(_mm512_add_epi32(s2, dl), er);
-    __m512i new2 = _mm512_add_epi32(_mm512_add_epi32(s3, el), ar);
-    __m512i new3 = _mm512_add_epi32(_mm512_add_epi32(s4, al), br);
-    __m512i new4 = _mm512_add_epi32(_mm512_add_epi32(s0, bl), cr);
-
-    rmd_store_16way(states, 0, new0);
-    rmd_store_16way(states, 1, new1);
-    rmd_store_16way(states, 2, new2);
-    rmd_store_16way(states, 3, new3);
-    rmd_store_16way(states, 4, new4);
-}
-
-/*
- * ripemd160_compress_avx512_contig — gather-optimized variant for contiguous block arrays.
- *
- * When the 16 message blocks reside in a contiguous array (e.g. blocks[16][64]),
- * this function uses _mm512_i32gather_epi32 to collect each message word from all
- * 16 blocks in a single instruction, replacing the 16-scalar-load + aligned-buffer
- * + _mm512_load_si512 path used by load_le32_16way.
+ * Accepts __m512i soa_state[5] (input/output) and pre-loaded __m512i w[16]
+ * message words. This eliminates all load_le32_contig/gather overhead and
+ * rmd_store_16way scatter overhead, keeping data in SIMD registers throughout.
  *
  * Parameters:
- *   states : array of 16 pointers to uint32_t[5] state arrays
- *   base   : pointer to blocks[0][0] (start of contiguous block memory)
- *   stride : byte distance between consecutive blocks (e.g. 64)
+ *   soa_state : __m512i[5] — input/output, each holds 16 lanes of one RIPEMD160 state word
+ *   w         : const __m512i[16] — pre-loaded message words (little-endian)
  */
-__attribute__((target("avx512f,avx512bw")))
-void ripemd160_compress_avx512_contig(uint32_t *states[16], const uint8_t *base, int stride)
+__attribute__((target("avx512f")))
+void ripemd160_compress_avx512_soa(__m512i soa_state[5], const __m512i w[16])
 {
-    /* Load 16-lane initial state */
-    __m512i al = load_state_word_16way(states, 0);
-    __m512i bl = load_state_word_16way(states, 1);
-    __m512i cl = load_state_word_16way(states, 2);
-    __m512i dl = load_state_word_16way(states, 3);
-    __m512i el = load_state_word_16way(states, 4);
+    /* Load 16-lane initial state from SoA array */
+    __m512i al = soa_state[0];
+    __m512i bl = soa_state[1];
+    __m512i cl = soa_state[2];
+    __m512i dl = soa_state[3];
+    __m512i el = soa_state[4];
     __m512i ar = al, br = bl, cr = cl, dr = dl, er = el;
 
     /* Save initial state */
     __m512i s0 = al, s1 = bl, s2 = cl, s3 = dl, s4 = el;
 
-    /* Load 16-lane message words using gather (little-endian, no byte-swap needed) */
-    __m512i w0 = load_le32_contig(base, stride, 0), w1 = load_le32_contig(base, stride, 1);
-    __m512i w2 = load_le32_contig(base, stride, 2), w3 = load_le32_contig(base, stride, 3);
-    __m512i w4 = load_le32_contig(base, stride, 4), w5 = load_le32_contig(base, stride, 5);
-    __m512i w6 = load_le32_contig(base, stride, 6), w7 = load_le32_contig(base, stride, 7);
-    __m512i w8 = load_le32_contig(base, stride, 8), w9 = load_le32_contig(base, stride, 9);
-    __m512i w10 = load_le32_contig(base, stride, 10), w11 = load_le32_contig(base, stride, 11);
-    __m512i w12 = load_le32_contig(base, stride, 12), w13 = load_le32_contig(base, stride, 13);
-    __m512i w14 = load_le32_contig(base, stride, 14), w15 = load_le32_contig(base, stride, 15);
+    /* Use pre-loaded message words directly */
+    __m512i w0 = w[0], w1 = w[1], w2 = w[2], w3 = w[3];
+    __m512i w4 = w[4], w5 = w[5], w6 = w[6], w7 = w[7];
+    __m512i w8 = w[8], w9 = w[9], w10 = w[10], w11 = w[11];
+    __m512i w12 = w[12], w13 = w[13], w14 = w[14], w15 = w[15];
 
     /* Left chain: rounds 0-15, F */
     VRL_F(al, bl, cl, dl, el, w0, 11);
@@ -535,18 +259,13 @@ void ripemd160_compress_avx512_contig(uint32_t *states[16], const uint8_t *base,
     VRR_F(ar, br, cr, dr, er, w9, 11);
     VRR_F(ar, br, cr, dr, er, w11, 11);
 
-    /* Merge left and right chains, update state */
-    __m512i new0 = _mm512_add_epi32(_mm512_add_epi32(s1, cl), dr);
-    __m512i new1 = _mm512_add_epi32(_mm512_add_epi32(s2, dl), er);
-    __m512i new2 = _mm512_add_epi32(_mm512_add_epi32(s3, el), ar);
-    __m512i new3 = _mm512_add_epi32(_mm512_add_epi32(s4, al), br);
-    __m512i new4 = _mm512_add_epi32(_mm512_add_epi32(s0, bl), cr);
-
-    rmd_store_16way(states, 0, new0);
-    rmd_store_16way(states, 1, new1);
-    rmd_store_16way(states, 2, new2);
-    rmd_store_16way(states, 3, new3);
-    rmd_store_16way(states, 4, new4);
+    /* Merge left and right chains, write back to SoA state (no rmd_store_16way!) */
+    soa_state[0] = _mm512_add_epi32(_mm512_add_epi32(s1, cl), dr);
+    soa_state[1] = _mm512_add_epi32(_mm512_add_epi32(s2, dl), er);
+    soa_state[2] = _mm512_add_epi32(_mm512_add_epi32(s3, el), ar);
+    soa_state[3] = _mm512_add_epi32(_mm512_add_epi32(s4, al), br);
+    soa_state[4] = _mm512_add_epi32(_mm512_add_epi32(s0, bl), cr);
 }
 
 #endif /* __AVX512F__ */
+
