@@ -86,7 +86,8 @@ static void rmd160_soa_to_bytes_16way(const __m512i soa_state[5], uint8_t hash16
  * registers, runs RIPEMD160 preloaded compression, and extracts hash160 bytes.
  * Eliminates sha256_state_to_bytes_16way, load_le32_contig, and rmd_store_16way.
  */
-static void hash160_16way_finalize_from_sha_soa(__m512i sha_soa_state[8], uint8_t hash160s[16][20])
+__attribute__((target("avx512f,avx512bw")))
+void hash160_16way_finalize_from_sha_soa(__m512i sha_soa_state[8], uint8_t hash160s[16][20])
 {
     /* Bridge: SHA256 SoA state -> RIPEMD160 pre-loaded message words */
     __m512i rmd_w[16];
@@ -135,7 +136,7 @@ static void hash160_16way_prepadded_sha(const uint8_t *blocks1[16],
  * 16-way parallel hash160 for compressed public keys (pre-padded, zero-copy)
  * blocks[16]: array of 64-byte block pointers with SHA256 padding already applied in-place by caller
  */
-__attribute__((target("avx512f")))
+__attribute__((target("avx512f,avx512bw")))
 void hash160_16way_compressed_prepadded(const uint8_t *blocks[16], uint8_t hash160s[16][20])
 {
     hash160_16way_prepadded_sha(blocks, NULL, hash160s);
@@ -147,7 +148,7 @@ void hash160_16way_compressed_prepadded(const uint8_t *blocks[16], uint8_t hash1
  *           buf[0..63]  = SHA256 block1 (first 64 bytes of pubkey, no padding needed)
  *           buf[64..127]= SHA256 block2 (padding already applied)
  */
-__attribute__((target("avx512f")))
+__attribute__((target("avx512f,avx512bw")))
 void hash160_16way_uncompressed_prepadded(const uint8_t *bufs[16], uint8_t hash160s[16][20])
 {
     const uint8_t *blocks2[16];

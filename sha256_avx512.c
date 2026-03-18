@@ -81,10 +81,6 @@ static inline __attribute__((always_inline)) __m512i load_be32_16way(const uint8
  * SHA256 state word.  This eliminates the costly load_state_word_16way /
  * store_16way scatter operations and allows the caller to keep data in
  * SIMD registers between pipeline stages.
- *
- * Parameters:
- *   soa_state : __m512i[8] — input/output, each holds 16 lanes of one state word
- *   blocks    : array of 16 pointers to 64-byte message blocks
  */
 __attribute__((target("avx512f")))
 void sha256_compress_avx512_soa(__m512i soa_state[8], const uint8_t *blocks[16])
@@ -102,7 +98,7 @@ void sha256_compress_avx512_soa(__m512i soa_state[8], const uint8_t *blocks[16])
     /* Save initial state for final accumulation */
     __m512i a0 = a, b0 = b, c0 = c, d0 = d, e0 = e, f0 = f, g0 = g, h0 = h;
 
-    /* Load 16-lane message words (big-endian) */
+    /* Load 16-lane message words (big-endian → host-endian) */
     __m512i w0 = load_be32_16way(blocks, 0), w1 = load_be32_16way(blocks, 1);
     __m512i w2 = load_be32_16way(blocks, 2), w3 = load_be32_16way(blocks, 3);
     __m512i w4 = load_be32_16way(blocks, 4), w5 = load_be32_16way(blocks, 5);
