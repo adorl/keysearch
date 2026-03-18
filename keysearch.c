@@ -141,14 +141,20 @@ static void *search_key(void *arg)
 
 #ifdef __AVX512IFMA__
     /*
-     * AVX-512 IFMA 16-chain buffers: each chain accumulates BATCH_SIZE steps of Jacobian points and rzr factors
-     * Three buffers total ~24MB, must be heap-allocated
-     * Allocated once before the outermost loop, freed when thread exits
+     * AVX-512 IFMA 16-chain buffers: each chain accumulates BATCH_SIZE steps of Jacobian points and rzr factors.
+     * gej_buf + rzr_buf are used for the rzr backward pass.
+     * fe_x_soa_buf + fe_y_soa_buf store affine coordinates directly in SoA layout,
+     * eliminating ge_buf and the fe_16x_load_ptrs gather in the hash160 loop.
+     * Allocated once before the outermost loop, freed when thread exits.
      */
     secp256k1_gej (*gej_buf)[BATCH_SIZE] = malloc(16 * BATCH_SIZE * sizeof(secp256k1_gej));
     secp256k1_fe (*rzr_buf)[BATCH_SIZE] = malloc(16 * BATCH_SIZE * sizeof(secp256k1_fe));
-    secp256k1_ge (*ge_buf)[BATCH_SIZE] = malloc(16 * BATCH_SIZE * sizeof(secp256k1_ge));
-    if (!gej_buf || !rzr_buf || !ge_buf) {
+    /* SoA buffers must be 64-byte aligned for AVX-512 _mm512_load_si512 / _mm512_store_si512 */
+    secp256k1_fe_16x *fe_x_soa_buf = aligned_alloc(64, BATCH_SIZE * sizeof(secp256k1_fe_16x));
+    secp256k1_fe_16x *fe_y_soa_buf = aligned_alloc(64, BATCH_SIZE * sizeof(secp256k1_fe_16x));
+    /* Work buffer for keygen_batch_normalize_rzr_16way: pre-allocated once to avoid per-batch malloc */
+    secp256k1_ge *ge_work_buf = malloc(16 * BATCH_SIZE * sizeof(secp256k1_ge));
+    if (!gej_buf || !rzr_buf || !fe_x_soa_buf || !fe_y_soa_buf || !ge_work_buf) {
         keylog_error("[Thread-%d] AVX-512 batch buffer memory allocation failed", thread_id);
         goto avx512_thread_exit;
     }
@@ -167,7 +173,8 @@ static void *search_key(void *arg)
             int ch_ok = 0;
             while (!ch_ok) {
                 if (gen_random_key(ch_privkey, &rand_ctx) != 0) {
-                    keylog_error("[Thread-%d] Failed to read random number", thread_id);                    continue;
+                    keylog_error("[Thread-%d] Failed to read random number", thread_id);
+                    continue;
                 }
 
                 int overflow = 0;
@@ -253,72 +260,26 @@ static void *search_key(void *arg)
             cur = nxt;
         }
 
-        /* Batch normalize: call keygen_batch_normalize_rzr for each chain */
-        for (int ch = 0; ch < 16; ch++) {
-            keygen_batch_normalize_rzr(gej_buf[ch], ge_buf[ch], rzr_buf[ch],
-                                       (size_t)chain_valid_steps[ch]);
-        }
+        /* Batch normalize: 16-chain lockstep with direct SoA output.
+         * Eliminates ge_buf and the fe_16x_load_ptrs gather in the hash160 loop. */
+        keygen_batch_normalize_rzr_16way((const secp256k1_gej *)gej_buf,
+                                         fe_x_soa_buf, fe_y_soa_buf,
+                                         (const secp256k1_fe *)rzr_buf,
+                                         ge_work_buf, chain_valid_steps, BATCH_SIZE);
 
         /* Iterate all steps, compute hash160 and lookup in batches of 16 */
         for (int step = 0; step < BATCH_SIZE && count < MAX_ATTEMPTS; step++) {
 
-            /* Detect infinity without copying full ge structs */
-            int has_infinity = 0;
-            for (int lane = 0; lane < 16; lane++) {
-                if (step >= chain_valid_steps[lane] || ge_buf[lane][step].infinity) {
-                    has_infinity = 1;
-                    break;  /* early exit: one infinity is enough to trigger slow path */
-                }
-            }
-
             uint8_t hash160_comp_16[16][20];
             uint8_t hash160_uncomp_16[16][20];
 
-            if (has_infinity) {
-                /* Slow path: some lanes are infinity, fall back to per-lane processing */
-                secp256k1_ge ge_16[16];
-                for (int lane = 0; lane < 16; lane++) {
-                    if (step >= chain_valid_steps[lane] || ge_buf[lane][step].infinity) {
-                        ge_16[lane].infinity = 1;
-                    } else {
-                        ge_16[lane] = ge_buf[lane][step];
-                    }
-                }
-
-                uint8_t comp_bufs[16][64];
-                uint8_t uncomp_bufs[16][128];
-                const uint8_t *comp_ptrs[16];
-                const uint8_t *uncomp_ptrs[16];
-
-                for (int lane = 0; lane < 16; lane++) {
-                    if (ge_16[lane].infinity) {
-                        memset(comp_bufs[lane], 0, 64);
-                        memset(uncomp_bufs[lane], 0, 128);
-                    } else {
-                        keygen_ge_to_pubkey_bytes(&ge_16[lane], comp_bufs[lane], uncomp_bufs[lane]);
-                    }
-                    sha256_pad_block_33(comp_bufs[lane]);
-                    sha256_pad_block2_65(uncomp_bufs[lane]);
-                    comp_ptrs[lane] = comp_bufs[lane];
-                    uncomp_ptrs[lane] = uncomp_bufs[lane];
-                }
-                hash160_16way_compressed_prepadded(comp_ptrs, hash160_comp_16);
-                hash160_16way_uncompressed_prepadded(uncomp_ptrs, hash160_uncomp_16);
-            } else {
-                /* Fast path: all lanes valid, load x/y directly from ge_buf via pointers (no copy)
-                 * Phase 1+2: fe_16x_load_ptrs → fe_to_sha256_words_16way → sha256_compress_avx512_soa_preloaded
-                 *            → RIPEMD-160 → hash160
-                 * Eliminates: fe_get_b32_16way (6.72%) + load_be32_16way (3.63%) + memcpy/padding overhead */
-                const secp256k1_fe *x_ptrs[16], *y_ptrs[16];
-                secp256k1_fe_16x fe_x_soa, fe_y_soa;
-                for (int lane = 0; lane < 16; lane++) {
-                    x_ptrs[lane] = &ge_buf[lane][step].x;
-                    y_ptrs[lane] = &ge_buf[lane][step].y;
-                }
-                fe_16x_load_ptrs(&fe_x_soa, x_ptrs);
-                fe_16x_load_ptrs(&fe_y_soa, y_ptrs);
-                hash160_16way_from_fe_soa(&fe_x_soa, &fe_y_soa, hash160_comp_16, hash160_uncomp_16);
-            }
+            /* Read pre-computed SoA affine coordinates directly (no gather).
+             * keygen_batch_normalize_rzr_16way already packed x/y into contiguous SoA
+             * layout via fe_16x_load.
+             * Invalid lanes (step >= valid_steps) are zero-filled by the normalizer,
+             * producing dummy hashes that won't match any hash table entry. */
+            hash160_16way_from_fe_soa(&fe_x_soa_buf[step], &fe_y_soa_buf[step],
+                                     hash160_comp_16, hash160_uncomp_16);
 
             const uint8_t *comp_h160_ptrs[16];
             const uint8_t *uncomp_h160_ptrs[16];
@@ -345,8 +306,6 @@ static void *search_key(void *arg)
                     if (!(hit_mask & (1u << lane)))
                         continue;
                     if (step >= chain_valid_steps[lane])
-                        continue;
-                    if (ge_buf[lane][step].infinity)
                         continue;
 
                     found_flag = 1;
@@ -387,7 +346,9 @@ static void *search_key(void *arg)
 avx512_thread_exit:
     free(gej_buf);
     free(rzr_buf);
-    free(ge_buf);
+    free(fe_x_soa_buf);
+    free(fe_y_soa_buf);
+    free(ge_work_buf);
 
 #else /* !__AVX512IFMA__ */
 

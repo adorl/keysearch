@@ -3914,16 +3914,16 @@ static void test_keygen_ge_to_pubkey_bytes_16way(void) {
  *
  * Verify end-to-end correctness of the entire 16-way concurrent pipeline under __AVX512IFMA__,
  * using the exact same interface chain as keysearch.c IFMA path:
- *   gej_add_ge_var_16way_soa  →  keygen_batch_normalize_rzr
- *   →  fe_16x_load_ptrs  →  hash160_16way_from_fe_soa
+ *   gej_add_ge_var_16way_soa  →  keygen_batch_normalize_rzr_16way
+ *   →  hash160_16way_from_fe_soa  (direct SoA read, no fe_16x_load_ptrs)
  *
  * Final hash160 (compressed/uncompressed) compared with secp256k1 API lane by lane.
  *
  * Coverage scenarios:
  *   9.1  Single batch (BATCH_SIZE=16 steps): each of 16 chains advances 16 steps,
  *        each step uses gej_add_ge_var_16way_soa (step0 normed=0, others normed=1),
- *        keygen_batch_normalize_rzr at end of batch,
- *        fe_16x_load_ptrs + hash160_16way_from_fe_soa for direct hash computation,
+ *        keygen_batch_normalize_rzr_16way at end of batch (direct SoA output),
+ *        hash160_16way_from_fe_soa for direct hash computation from SoA buffer,
  *        hash160 compared with API lane by lane, step by step.
  *   9.2  Multi-batch (3 batches): each batch with independent random base privkey,
  *        verify no state pollution between batches.
@@ -3936,10 +3936,16 @@ static void test_avx512ifma_16way_full_pipeline(void) {
 
     int all_pass = 1;
 
-    /* Same as keysearch.c: gej_buf + rzr_buf + ge_buf */
+    /* Same as keysearch.c: gej_buf + rzr_buf + SoA output buffers + work buffer */
     secp256k1_gej gej_buf[16][PIPE_STEPS];
     secp256k1_fe  rzr_buf[16][PIPE_STEPS];
-    secp256k1_ge  ge_buf[16][PIPE_STEPS];
+    secp256k1_fe_16x fe_x_soa_buf[PIPE_STEPS];
+    secp256k1_fe_16x fe_y_soa_buf[PIPE_STEPS];
+    secp256k1_ge *ge_work_buf = malloc(16 * PIPE_STEPS * sizeof(secp256k1_ge));
+    if (!ge_work_buf) {
+        printf("  [FAIL] ge_work_buf allocation failed\n");
+        return;
+    }
 
     secp256k1_scalar tweak;
     secp256k1_scalar_set_int(&tweak, 1);
@@ -4009,29 +4015,24 @@ static void test_avx512ifma_16way_full_pipeline(void) {
             chain_soa = next_soa;
         }
 
-        /* Same as keysearch.c: use keygen_batch_normalize_rzr */
-        for (int ch = 0; ch < 16; ch++) {
-            keygen_batch_normalize_rzr(gej_buf[ch], ge_buf[ch], rzr_buf[ch],
-                                       (size_t)PIPE_STEPS);
-        }
+        /* Same as keysearch.c: use keygen_batch_normalize_rzr_16way for direct SoA output */
+        int chain_valid_steps[16];
+        for (int ch = 0; ch < 16; ch++)
+            chain_valid_steps[ch] = PIPE_STEPS;
+        keygen_batch_normalize_rzr_16way((const secp256k1_gej *)gej_buf,
+                                         fe_x_soa_buf, fe_y_soa_buf,
+                                         (const secp256k1_fe *)rzr_buf,
+                                         ge_work_buf, chain_valid_steps, PIPE_STEPS);
 
         /* Verify hash160 step by step, lane by lane */
         for (int step = 0; step < PIPE_STEPS; step++) {
             /* Same as keysearch.c IFMA fast path:
-             * fe_16x_load_ptrs → hash160_16way_from_fe_soa
-             * (skip keygen_ge_to_pubkey_bytes_16way + pad + hash160_prepadded) */
-            const secp256k1_fe *x_ptrs[16], *y_ptrs[16];
-            secp256k1_fe_16x fe_x_soa, fe_y_soa;
-            for (int lane = 0; lane < 16; lane++) {
-                x_ptrs[lane] = &ge_buf[lane][step].x;
-                y_ptrs[lane] = &ge_buf[lane][step].y;
-            }
-            fe_16x_load_ptrs(&fe_x_soa, x_ptrs);
-            fe_16x_load_ptrs(&fe_y_soa, y_ptrs);
-
+             * Read SoA affine coordinates directly from keygen_batch_normalize_rzr_16way output
+             * → hash160_16way_from_fe_soa (no fe_16x_load_ptrs gather needed) */
             uint8_t avx_h160_comp[16][20];
             uint8_t avx_h160_uncomp[16][20];
-            hash160_16way_from_fe_soa(&fe_x_soa, &fe_y_soa, avx_h160_comp, avx_h160_uncomp);
+            hash160_16way_from_fe_soa(&fe_x_soa_buf[step], &fe_y_soa_buf[step],
+                                     avx_h160_comp, avx_h160_uncomp);
 
             /* Compare with API lane by lane */
             for (int lane = 0; lane < 16; lane++) {
@@ -4089,6 +4090,8 @@ static void test_avx512ifma_16way_full_pipeline(void) {
                PIPE_BATCH, PIPE_STEPS);
         pass_count++;
     }
+
+    free(ge_work_buf);
 
 #undef PIPE_STEPS
 #undef PIPE_BATCH

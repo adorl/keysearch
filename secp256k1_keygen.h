@@ -161,6 +161,25 @@ void keygen_ge_to_pubkey_bytes_16way(const secp256k1_ge ge[16],
                                      uint8_t *compressed_out[16],
                                      uint8_t *uncompressed_out[16]);
 
+/*
+ * 16-chain batch normalization with direct SoA output (eliminates fe_16x_load_ptrs).
+ *
+ * Processes 16 independent chains of Jacobian points using rzr acceleration,
+ * and outputs affine coordinates directly in SoA layout (secp256k1_fe_16x per step).
+ *
+ * Parameters:
+ *   gej_in       : flat array of 16*n Jacobian points, row-major [ch*n + step]
+ *   fe_x_soa_out : output X coordinate array in SoA layout (size n)
+ *   fe_y_soa_out : output Y coordinate array in SoA layout (size n)
+ *   rzr          : flat array of 16*n Z increment factors, row-major [ch*n + step]
+ *   ge_work      : caller-allocated work buffer for 16*n affine points (avoids malloc per call)
+ *   valid_steps  : [16] valid step count per chain
+ *   n            : max steps (must be >= max(valid_steps[ch]))
+ */
+void keygen_batch_normalize_rzr_16way(const secp256k1_gej *gej_in,
+    secp256k1_fe_16x *fe_x_soa_out, secp256k1_fe_16x *fe_y_soa_out, const secp256k1_fe *rzr,
+    secp256k1_ge *ge_work, const int *valid_steps, size_t n);
+
 #endif /* __AVX512IFMA__ */
 
 #else

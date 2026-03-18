@@ -1293,5 +1293,66 @@ void keygen_ge_to_pubkey_bytes_16way(const secp256k1_ge ge[16],
     }
 }
 
+/*
+ * keygen_batch_normalize_rzr_16way:
+ * Batch normalization for 16 chains with direct SoA output.
+ *
+ * Runs 16 independent scalar keygen_batch_normalize_rzr passes (cache-friendly
+ * sequential access per chain), then packs the affine coordinates into SoA layout
+ * step by step using fe_16x_load.
+ *
+ * This combines the benefits of:
+ *   - Cache-friendly scalar backward pass (each chain accesses gej[0..n-1] sequentially)
+ *   - Direct SoA output (eliminates ge_buf[16][N] + fe_16x_load_ptrs gather)
+ *
+ * The ge_work buffer (16*n secp256k1_ge) must be pre-allocated by the caller
+ * and reused across calls to avoid per-call malloc/free overhead.
+ *
+ * Parameters:
+ *   gej_in       : flat array of 16*n Jacobian points, row-major [ch*n + step]
+ *   fe_x_soa_out : output X coordinates in SoA layout (size n, caller-allocated, 64B aligned)
+ *   fe_y_soa_out : output Y coordinates in SoA layout (size n, caller-allocated, 64B aligned)
+ *   rzr          : flat array of 16*n Z increment factors, row-major [ch*n + step]
+ *   ge_work      : caller-allocated work buffer for 16*n affine points (avoid per-call malloc)
+ *   valid_steps  : [16] valid step count per chain
+ *   n            : max steps (= BATCH_SIZE)
+ */
+void keygen_batch_normalize_rzr_16way(const secp256k1_gej *gej_in,
+    secp256k1_fe_16x *fe_x_soa_out, secp256k1_fe_16x *fe_y_soa_out, const secp256k1_fe *rzr,
+    secp256k1_ge *ge_work, const int *valid_steps, size_t n)
+{
+    if (n == 0)
+        return;
+
+    /* Phase 1: Run 16 independent scalar backward passes (cache-friendly).
+     * Each chain accesses its own gej_in[ch*n .. ch*n+n-1] sequentially. */
+    for (int ch = 0; ch < 16; ch++) {
+        keygen_batch_normalize_rzr(
+            &gej_in[ch * n],     /* Input Jacobian points for this chain */
+            &ge_work[ch * n],    /* Output affine points for this chain */
+            &rzr[ch * n],        /* rzr factors for this chain */
+            (size_t)valid_steps[ch]);
+
+        /* Zero-fill invalid steps */
+        for (size_t s = (size_t)valid_steps[ch]; s < n; s++) {
+            memset(&ge_work[ch * n + s], 0, sizeof(secp256k1_ge));
+        }
+    }
+
+    /* Phase 2: Pack affine coordinates into SoA layout step-by-step.
+     * For each step, collect 16 chains' x/y into contiguous arrays, then fe_16x_load.
+     * ge_work[ch*n+step] has stride sizeof(secp256k1_ge)*n per chain,
+     * but we read into a tight x_arr[16]/y_arr[16] buffer first. */
+    for (size_t step = 0; step < n; step++) {
+        secp256k1_fe x_arr[16], y_arr[16];
+        for (int ch = 0; ch < 16; ch++) {
+            x_arr[ch] = ge_work[ch * n + step].x;
+            y_arr[ch] = ge_work[ch * n + step].y;
+        }
+        fe_16x_load(&fe_x_soa_out[step], x_arr);
+        fe_16x_load(&fe_y_soa_out[step], y_arr);
+    }
+}
+
 #endif /* __AVX512IFMA__ */
 
