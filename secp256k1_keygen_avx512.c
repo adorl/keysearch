@@ -82,7 +82,7 @@ void fe_16x_load_ptrs(secp256k1_fe_16x *dst, const secp256k1_fe *src_ptrs[16])
 }
 
 /*
- * fe_16x_store: convert SoA layout back to 16 secp256k1_fe elements
+ * fe_16x_store: convert SoA layout back to 16 secp256k1_fe elements (contiguous array)
  *
  * Optimized write pattern: process one limb at a time, store to a single
  * aligned buffer, then immediately scatter to destination elements.
@@ -896,9 +896,46 @@ void gej_add_ge_var_16way_soa(secp256k1_gej_16x *r_soa,
     fe_16x_add(&h, &u2, &neg_u1);
     fe_16x_normalize_weak(&h);
 
-    /* Store h early for detecting h=0 (point doubling case) */
-    secp256k1_fe h_arr[16];
-    fe_16x_store(h_arr, &h);
+    /*
+     * Detect h==0 (mod P) lanes using SIMD.
+     *
+     * After normalize_weak, each limb is in [0, 2^52) and carries are resolved.
+     * If h==0 (mod P), the representation is either exactly 0 or exactly P:
+     *   zero: all limbs == 0
+     *   P:    n[0]=0xFFFFEFFFFFC2F, n[1..3]=0xFFFFFFFFFFFFF, n[4]=0x0FFFFFFFFFFFF
+     *
+     * Check both conditions by OR-ing all limbs (==0 test) and by comparing
+     * each limb against P's constants (==P test). This avoids the carry
+     * propagation that secp256k1_fe_impl_normalizes_to_zero performs.
+     */
+    __mmask8 h_zero_mask_lo, h_zero_mask_hi;
+    __m512i P0 = _mm512_set1_epi64((int64_t)0xFFFFEFFFFFC2FULL);
+    __m512i P1 = _mm512_set1_epi64((int64_t)0xFFFFFFFFFFFFFULL);
+    __m512i P4 = _mm512_set1_epi64((int64_t)0x0FFFFFFFFFFFFULL);
+
+    for (int half = 0; half < 2; half++) {
+        __m512i n0 = h.n[0][half], n1 = h.n[1][half],
+                n2 = h.n[2][half], n3 = h.n[3][half], n4 = h.n[4][half];
+
+        /* Test ==0: OR all limbs, then compare to zero */
+        __m512i z = _mm512_or_si512(_mm512_or_si512(n0, n1),
+                        _mm512_or_si512(_mm512_or_si512(n2, n3), n4));
+        __mmask8 is_zero = _mm512_cmpeq_epi64_mask(z, _mm512_setzero_si512());
+
+        /* Test ==P: AND per-limb equality masks */
+        __mmask8 is_P = _mm512_cmpeq_epi64_mask(n0, P0)
+                        & _mm512_cmpeq_epi64_mask(n1, P1)
+                        & _mm512_cmpeq_epi64_mask(n2, P1)
+                        & _mm512_cmpeq_epi64_mask(n3, P1)
+                        & _mm512_cmpeq_epi64_mask(n4, P4);
+
+        if (half == 0)
+            h_zero_mask_lo = is_zero | is_P;
+        else
+            h_zero_mask_hi = is_zero | is_P;
+    }
+    /* Combined 16-bit mask: lo in bits 0..7, hi in bits 8..15 */
+    uint16_t h_zero_mask = (uint16_t)h_zero_mask_lo | ((uint16_t)h_zero_mask_hi << 8);
 
     /* i = s1 - s2 */
     secp256k1_fe_16x neg_s2;
@@ -962,30 +999,31 @@ void gej_add_ge_var_16way_soa(secp256k1_gej_16x *r_soa,
         fe_16x_store(rzr_out, &rzr_16x);
     }
 
-    /* Fixup: for lanes where h=0 (point doubling case), overwrite with scalar result */
-    /* Note: infinity fixup is not needed here since the caller handles initial loading
+    /* Fixup: for lanes where h=0 (point doubling case), overwrite with scalar result.
+     * h_zero_mask was computed above using SIMD normalizes_to_zero.
+     * This is extremely rare (h=0 means a==b), so the scalar fallback is acceptable.
+     * Note: infinity fixup is not needed here since the caller handles initial loading
      * through gej_16x_load which only processes non-infinity points */
-    if (r_aos_ptrs != NULL) {
-        for (int i = 0; i < 16; i++) {
-            if (secp256k1_fe_normalizes_to_zero(&h_arr[i])) {
-                secp256k1_fe rzr_scalar;
-                /* Need to reconstruct AoS input for this lane */
-                secp256k1_gej a_lane;
-                secp256k1_fe ax_arr[16], ay_arr[16], az_arr[16];
-                fe_16x_store(ax_arr, &a_soa->x);
-                fe_16x_store(ay_arr, &a_soa->y);
-                fe_16x_store(az_arr, &a_soa->z);
-                a_lane.x = ax_arr[i];
-                a_lane.y = ay_arr[i];
-                a_lane.z = az_arr[i];
-                a_lane.infinity = 0;
-                secp256k1_gej_add_ge_var(r_aos_ptrs[i], &a_lane, b,
-                                         rzr_out != NULL ? &rzr_scalar : NULL);
-                if (rzr_out != NULL) {
-                    rzr_out[i] = rzr_scalar;
-                }
-                /* Update SoA for the fixed-up lane as well */
-                /* This is rare (h=0 means a==b), so scalar update is acceptable */
+    if (h_zero_mask != 0 && r_aos_ptrs != NULL) {
+        /* Reconstruct AoS only once for all fixup lanes (lazy, only if needed) */
+        secp256k1_fe ax_arr[16], ay_arr[16], az_arr[16];
+        fe_16x_store(ax_arr, &a_soa->x);
+        fe_16x_store(ay_arr, &a_soa->y);
+        fe_16x_store(az_arr, &a_soa->z);
+        uint16_t mask = h_zero_mask;
+        while (mask) {
+            int i = __builtin_ctz(mask);
+            mask &= mask - 1;
+            secp256k1_fe rzr_scalar;
+            secp256k1_gej a_lane;
+            a_lane.x = ax_arr[i];
+            a_lane.y = ay_arr[i];
+            a_lane.z = az_arr[i];
+            a_lane.infinity = 0;
+            secp256k1_gej_add_ge_var(r_aos_ptrs[i], &a_lane, b,
+                                     rzr_out != NULL ? &rzr_scalar : NULL);
+            if (rzr_out != NULL) {
+                rzr_out[i] = rzr_scalar;
             }
         }
     }

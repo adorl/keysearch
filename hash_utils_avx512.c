@@ -26,12 +26,10 @@ void ripemd160_compress_avx512_soa(__m512i soa_state[5], const __m512i w[16]);
 static inline __attribute__((always_inline)) void
 sha256_soa_to_rmd160_words(const __m512i sha_state[8], __m512i w[16])
 {
-    /* Byte-swap mask: reverse bytes within each 32-bit lane (big-endian → little-endian) */
-    const __m512i bswap = _mm512_set_epi8(
-        12,13,14,15, 8,9,10,11, 4,5,6,7, 0,1,2,3,
-        12,13,14,15, 8,9,10,11, 4,5,6,7, 0,1,2,3,
-        12,13,14,15, 8,9,10,11, 4,5,6,7, 0,1,2,3,
-        12,13,14,15, 8,9,10,11, 4,5,6,7, 0,1,2,3);
+    /* Byte-swap mask: reverse bytes within each 32-bit lane (big-endian → little-endian)
+     * Using _mm512_set4_epi32 for GCC 8 compatibility (_mm512_set_epi8 requires GCC 9+) */
+    const __m512i bswap = _mm512_set4_epi32(
+        0x0C0D0E0F, 0x08090A0B, 0x04050607, 0x00010203);
 
     /* SHA256 outputs 8 big-endian uint32 words → byte-swap for RIPEMD160 LE input */
     w[0] = _mm512_shuffle_epi8(sha_state[0], bswap);
