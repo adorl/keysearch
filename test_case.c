@@ -4773,6 +4773,7 @@ int main(void) {
     }
 #endif
     test_specialized_interfaces();
+    test_bech32();
 #ifndef USE_PUBKEY_API_ONLY
     /* Initialize global generator G (for use by test_keygen_internal / test_search_key_privkey_pubkey) */
     if (keygen_init_generator(secp_ctx, &G_affine) != 0) {
