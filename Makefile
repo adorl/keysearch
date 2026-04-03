@@ -42,8 +42,8 @@ else
 endif
 
 # Source file lists
-SRCS_MAIN = keysearch.c keylog.c hash_utils.c sha256.c ripemd160.c $(SIMD_SRCS) rand_key.c secp256k1_keygen.c
-SRCS_TEST = test_case.c test_gpu.c keylog.c hash_utils.c sha256.c ripemd160.c $(SIMD_SRCS) rand_key.c secp256k1_keygen.c
+SRCS_MAIN = keysearch.c keylog.c hash_utils.c sha256.c ripemd160.c $(SIMD_SRCS) rand_key.c secp256k1_keygen.c bech32.c
+SRCS_TEST = test_case.c test_gpu.c keylog.c hash_utils.c sha256.c ripemd160.c $(SIMD_SRCS) rand_key.c secp256k1_keygen.c bech32.c
 
 OBJS_MAIN = $(SRCS_MAIN:.c=.o) $(SECP256K1_OBJ) $(GPU_OBJS)
 OBJS_TEST = $(SRCS_TEST:.c=.o) $(SECP256K1_OBJ)

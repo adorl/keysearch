@@ -2126,6 +2126,279 @@ static void test_specialized_interfaces(void) {
     }
 }
 
+/* ===================== Bech32 Encode/Decode Tests ===================== */
+
+static void test_bech32(void) {
+    printf("\n=== Bech32 Encode/Decode Tests ===\n");
+
+    int witness_ver;
+    uint8_t witness_prog[40];
+    size_t witness_len;
+    char encoded[90];
+    int ret;
+
+    /* ------------------------------------------------------------------ */
+    /* 7.1 Decode a known P2WPKH address (witness v0, 20-byte program)    */
+    /* Address: bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4                */
+    /* Expected witness program: 751e76e8199196d454941c45d1b3a323f1433bd6  */
+    /* ------------------------------------------------------------------ */
+    {
+        const char *addr = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+        ret = bech32_decode_witness(addr, &witness_ver, witness_prog, &witness_len);
+        if (ret != 0) {
+            printf("  [FAIL] 7.1 bech32_decode P2WPKH: decode returned %d\n", ret);
+            fail_count++;
+        } else if (witness_ver != 0 || witness_len != 20) {
+            printf("  [FAIL] 7.1 bech32_decode P2WPKH: witness_ver=%d, witness_len=%zu (expected 0, 20)\n",
+                   witness_ver, witness_len);
+            fail_count++;
+        } else {
+            check("7.1 bech32_decode P2WPKH witness program",
+                  "751e76e8199196d454941c45d1b3a323f1433bd6",
+                  witness_prog, 20);
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 7.2 Encode the same witness program back and verify round-trip     */
+    /* ------------------------------------------------------------------ */
+    {
+        const uint8_t prog[20] = {
+            0x75, 0x1e, 0x76, 0xe8, 0x19, 0x91, 0x96, 0xd4, 0x54, 0x94,
+            0x1c, 0x45, 0xd1, 0xb3, 0xa3, 0x23, 0xf1, 0x43, 0x3b, 0xd6
+        };
+        ret = bech32_encode_witness("bc", 0, prog, 20, encoded);
+        if (ret != 0) {
+            printf("  [FAIL] 7.2 bech32_encode P2WPKH: encode returned %d\n", ret);
+            fail_count++;
+        } else if (strcmp(encoded, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4") == 0) {
+            printf("  [PASS] 7.2 bech32_encode P2WPKH round-trip\n");
+            pass_count++;
+        } else {
+            printf("  [FAIL] 7.2 bech32_encode P2WPKH round-trip\n");
+            printf("         expected: bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4\n");
+            printf("         actual:   %s\n", encoded);
+            fail_count++;
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 7.3 Decode a known P2WSH address (witness v0, 32-byte program)     */
+    /* Address: bc1qwqdg6squsna38e46795at95yu9atm8azzmyvckulcc7kytlcckxswvvzej */
+    /* Expected witness program:                                          */
+    /*   701a8d401c84fb13e6baf169d59684e17abd9fa216c8cc5b9fc63d622ff8c58d  */
+    /* ------------------------------------------------------------------ */
+    {
+        const char *addr = "bc1qwqdg6squsna38e46795at95yu9atm8azzmyvckulcc7kytlcckxswvvzej";
+        ret = bech32_decode_witness(addr, &witness_ver, witness_prog, &witness_len);
+        if (ret != 0) {
+            printf("  [FAIL] 7.3 bech32_decode P2WSH: decode returned %d\n", ret);
+            fail_count++;
+        } else if (witness_ver != 0 || witness_len != 32) {
+            printf("  [FAIL] 7.3 bech32_decode P2WSH: witness_ver=%d, witness_len=%zu (expected 0, 32)\n",
+                   witness_ver, witness_len);
+            fail_count++;
+        } else {
+            check("7.3 bech32_decode P2WSH witness program (32 bytes)",
+                  "701a8d401c84fb13e6baf169d59684e17abd9fa216c8cc5b9fc63d622ff8c58d",
+                  witness_prog, 32);
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 7.4 Decode + re-encode round-trip for another P2WPKH address       */
+    /* Address: bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq                */
+    /* Expected witness program: e8df018c7e28e1b9b1a763a89f5971ec7963153c  */
+    /* (This is a well-known Bitcoin address)                              */
+    /* ------------------------------------------------------------------ */
+    {
+        const char *addr = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+        ret = bech32_decode_witness(addr, &witness_ver, witness_prog, &witness_len);
+        if (ret != 0) {
+            printf("  [FAIL] 7.4 bech32_decode P2WPKH #2: decode returned %d\n", ret);
+            fail_count++;
+        } else if (witness_ver != 0 || witness_len != 20) {
+            printf("  [FAIL] 7.4 bech32_decode P2WPKH #2: witness_ver=%d, witness_len=%zu\n",
+                   witness_ver, witness_len);
+            fail_count++;
+        } else {
+            check("7.4 bech32_decode P2WPKH #2 witness program",
+                  "e8df018c7e326cc253faac7e46cdc51e68542c42",
+                  witness_prog, 20);
+
+            /* Re-encode and verify */
+            ret = bech32_encode_witness("bc", 0, witness_prog, 20, encoded);
+            if (ret != 0) {
+                printf("  [FAIL] 7.4 bech32_encode P2WPKH #2: encode returned %d\n", ret);
+                fail_count++;
+            } else if (strcmp(encoded, addr) == 0) {
+                printf("  [PASS] 7.4 bech32_encode P2WPKH #2 round-trip\n");
+                pass_count++;
+            } else {
+                printf("  [FAIL] 7.4 bech32_encode P2WPKH #2 round-trip\n");
+                printf("         expected: %s\n", addr);
+                printf("         actual:   %s\n", encoded);
+                fail_count++;
+            }
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 7.5 Encode from raw hash160 bytes and decode back (full round-trip)*/
+    /* Use all-zero 20-byte witness program                               */
+    /* ------------------------------------------------------------------ */
+    {
+        const uint8_t zero_prog[20] = {0};
+        ret = bech32_encode_witness("bc", 0, zero_prog, 20, encoded);
+        if (ret != 0) {
+            printf("  [FAIL] 7.5 bech32_encode all-zero P2WPKH: encode returned %d\n", ret);
+            fail_count++;
+        } else {
+            /* Decode back */
+            ret = bech32_decode_witness(encoded, &witness_ver, witness_prog, &witness_len);
+            if (ret != 0) {
+                printf("  [FAIL] 7.5 bech32 round-trip all-zero: decode returned %d\n", ret);
+                fail_count++;
+            } else if (witness_ver != 0 || witness_len != 20) {
+                printf("  [FAIL] 7.5 bech32 round-trip all-zero: witness_ver=%d, witness_len=%zu\n",
+                       witness_ver, witness_len);
+                fail_count++;
+            } else {
+                check("7.5 bech32 round-trip all-zero P2WPKH",
+                      "0000000000000000000000000000000000000000",
+                      witness_prog, 20);
+            }
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 7.6 Encode from all-0xFF 20-byte witness program and decode back   */
+    /* ------------------------------------------------------------------ */
+    {
+        const uint8_t ff_prog[20] = {
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
+        };
+        ret = bech32_encode_witness("bc", 0, ff_prog, 20, encoded);
+        if (ret != 0) {
+            printf("  [FAIL] 7.6 bech32_encode all-0xFF P2WPKH: encode returned %d\n", ret);
+            fail_count++;
+        } else {
+            ret = bech32_decode_witness(encoded, &witness_ver, witness_prog, &witness_len);
+            if (ret != 0) {
+                printf("  [FAIL] 7.6 bech32 round-trip all-0xFF: decode returned %d\n", ret);
+                fail_count++;
+            } else {
+                check("7.6 bech32 round-trip all-0xFF P2WPKH",
+                      "ffffffffffffffffffffffffffffffffffffffff",
+                      witness_prog, 20);
+            }
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 7.7 Error case: invalid checksum should return -2                  */
+    /* ------------------------------------------------------------------ */
+    {
+        /* Corrupt the last character of a valid address */
+        const char *bad_addr = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5";
+        ret = bech32_decode_witness(bad_addr, &witness_ver, witness_prog, &witness_len);
+        if (ret == -2) {
+            printf("  [PASS] 7.7 bech32_decode invalid checksum correctly rejected (ret=%d)\n", ret);
+            pass_count++;
+        } else {
+            printf("  [FAIL] 7.7 bech32_decode invalid checksum: expected ret=-2, got ret=%d\n", ret);
+            fail_count++;
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 7.8 Error case: non-bc HRP should return -1                        */
+    /* ------------------------------------------------------------------ */
+    {
+        const char *tb_addr = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
+        ret = bech32_decode_witness(tb_addr, &witness_ver, witness_prog, &witness_len);
+        if (ret == -1) {
+            printf("  [PASS] 7.8 bech32_decode non-bc HRP correctly rejected (ret=%d)\n", ret);
+            pass_count++;
+        } else {
+            printf("  [FAIL] 7.8 bech32_decode non-bc HRP: expected ret=-1, got ret=%d\n", ret);
+            fail_count++;
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 7.9 Error case: empty string should return -1                      */
+    /* ------------------------------------------------------------------ */
+    {
+        ret = bech32_decode_witness("", &witness_ver, witness_prog, &witness_len);
+        if (ret == -1) {
+            printf("  [PASS] 7.9 bech32_decode empty string correctly rejected (ret=%d)\n", ret);
+            pass_count++;
+        } else {
+            printf("  [FAIL] 7.9 bech32_decode empty string: expected ret=-1, got ret=%d\n", ret);
+            fail_count++;
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 7.10 Error case: mixed case should return -1                       */
+    /* ------------------------------------------------------------------ */
+    {
+        const char *mixed = "bc1qW508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+        ret = bech32_decode_witness(mixed, &witness_ver, witness_prog, &witness_len);
+        if (ret == -1 || ret == -2) {
+            printf("  [PASS] 7.10 bech32_decode mixed case correctly rejected (ret=%d)\n", ret);
+            pass_count++;
+        } else {
+            printf("  [FAIL] 7.10 bech32_decode mixed case: expected ret=-1 or -2, got ret=%d\n", ret);
+            fail_count++;
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 7.11 Encode with invalid parameters should return -1               */
+    /* ------------------------------------------------------------------ */
+    {
+        const uint8_t prog[20] = {0};
+        /* witness_ver out of range */
+        ret = bech32_encode_witness("bc", 17, prog, 20, encoded);
+        if (ret == -1) {
+            printf("  [PASS] 7.11 bech32_encode invalid witness_ver=17 rejected (ret=%d)\n", ret);
+            pass_count++;
+        } else {
+            printf("  [FAIL] 7.11 bech32_encode invalid witness_ver=17: expected ret=-1, got ret=%d\n", ret);
+            fail_count++;
+        }
+
+        /* witness_len too small */
+        ret = bech32_encode_witness("bc", 0, prog, 1, encoded);
+        if (ret == -1) {
+            printf("  [PASS] 7.11 bech32_encode witness_len=1 rejected (ret=%d)\n", ret);
+            pass_count++;
+        } else {
+            printf("  [FAIL] 7.11 bech32_encode witness_len=1: expected ret=-1, got ret=%d\n", ret);
+            fail_count++;
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 7.12 Decode uppercase bech32 address (BIP173 allows all-uppercase) */
+    /* ------------------------------------------------------------------ */
+    {
+        const char *upper_addr = "BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4";
+        ret = bech32_decode_witness(upper_addr, &witness_ver, witness_prog, &witness_len);
+        if (ret != 0) {
+            printf("  [FAIL] 7.12 bech32_decode uppercase: decode returned %d\n", ret);
+            fail_count++;
+        } else {
+            check("7.12 bech32_decode uppercase P2WPKH",
+                  "751e76e8199196d454941c45d1b3a323f1433bd6",
+                  witness_prog, 20);
+        }
+    }
+}
+
 /* ===================== keygen Internal Interface Correctness Tests ===================== */
 
 #ifndef USE_PUBKEY_API_ONLY

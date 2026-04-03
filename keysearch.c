@@ -21,6 +21,7 @@
 #include "sha256.h"
 #include "ripemd160.h"
 #include "hash_utils.h"
+#include "bech32.h"
 #include "rand_key.h"
 
 #ifdef USE_GPU
@@ -326,6 +327,10 @@ static void *search_key(void *arg)
                         keylog_info("Compressed address: %s", address_compressed);
                         keylog_info("Uncompressed address: %s", address_uncompressed);
                     }
+                    char bech32_addr[90];
+                    if (privkey_to_bech32_p2wpkh(privkey, bech32_addr) == 0) {
+                        keylog_info("Bech32 P2WPKH address: %s", bech32_addr);
+                    }
                 }
             }
 
@@ -516,6 +521,10 @@ avx512_thread_exit:
                         keylog_info("Compressed address: %s", address_compressed);
                         keylog_info("Uncompressed address: %s", address_uncompressed);
                     }
+                    char bech32_addr[90];
+                    if (privkey_to_bech32_p2wpkh(privkey, bech32_addr) == 0) {
+                        keylog_info("Bech32 P2WPKH address: %s", bech32_addr);
+                    }
                 }
             }
 
@@ -613,6 +622,10 @@ avx512_thread_exit:
                         keylog_info("Compressed address: %s", address_compressed);
                         keylog_info("Uncompressed address: %s", address_uncompressed);
                     }
+                    char bech32_addr[90];
+                    if (privkey_to_bech32_p2wpkh(privkey, bech32_addr) == 0) {
+                        keylog_info("Bech32 P2WPKH address: %s", bech32_addr);
+                    }
                 }
             }
 
@@ -664,6 +677,10 @@ avx512_thread_exit:
                 if (privkey_to_address(privkey, address_compressed, address_uncompressed) == 0) {
                     keylog_info("Compressed address: %s", address_compressed);
                     keylog_info("Uncompressed address: %s", address_uncompressed);
+                }
+                char bech32_addr[90];
+                if (privkey_to_bech32_p2wpkh(privkey, bech32_addr) == 0) {
+                    keylog_info("Bech32 P2WPKH address: %s", bech32_addr);
                 }
             }
 
@@ -729,6 +746,10 @@ thread_exit:
                     keylog_info("Compressed address: %s", address_compressed);
                     keylog_info("Uncompressed address: %s", address_uncompressed);
                 }
+                char bech32_addr[90];
+                if (privkey_to_bech32_p2wpkh(privkey, bech32_addr) == 0) {
+                    keylog_info("Bech32 P2WPKH address: %s", bech32_addr);
+                }
             }
 
             if (--progress_counter == 0) {
@@ -771,9 +792,10 @@ static int load_target_addresses(const char *filename)
         return -1;
     }
 
-    char line[ADDRESS_LEN + 2];
+    char line[128]; /* bech32 address max 90 chars, sufficient buffer */
     int count = 0;
     int skip_count = 0;
+    int bech32_count = 0;
     while (fgets(line, sizeof(line), f)) {
         /* Strip newline characters */
         size_t len = strlen(line);
@@ -787,16 +809,43 @@ static int load_target_addresses(const char *filename)
             break;
         }
 
-        /* Decode address to 20-byte hash160 and insert into hash table */
         uint8_t h160[20];
-        int ret = base58check_decode(line, h160);
-        if (ret != 0) {
-            keylog_warn("Address decode failed (ret=%d), skipping: %s", ret, line);
+
+        /* Only support P2WPKH bech32 address (starts with bc1q / BC1Q) */
+        if (strncasecmp(line, "bc1q", 4) == 0) {
+            int witness_ver = -1;
+            uint8_t witness_prog[40];
+            size_t witness_len = 0;
+            int ret = bech32_decode_witness(line, &witness_ver, witness_prog, &witness_len);
+            if (ret != 0) {
+                keylog_warn("P2WPKH bech32 address decode failed, skipping: %s", line);
+                skip_count++;
+                continue;
+            }
+            if (witness_ver != 0 || witness_len != 20) {
+                skip_count++;
+                continue;
+            }
+            /* P2WPKH witness program is the hash160 */
+            memcpy(h160, witness_prog, 20);
+            ht_insert(h160);
+            count++;
+            bech32_count++;
+        } else if (line[0] == '1') {
+            /* Only support P2PKH address (starts with '1') */
+            int ret = base58check_decode(line, h160);
+            if (ret != 0) {
+                keylog_warn("P2PKH address decode failed (ret=%d), skipping: %s", ret, line);
+                skip_count++;
+                continue;
+            }
+            ht_insert(h160);
+            count++;
+        } else {
+            /* Unsupported address format, skip silently */
             skip_count++;
             continue;
         }
-        ht_insert(h160);
-        count++;
     }
 
     fclose(f);
@@ -806,7 +855,8 @@ static int load_target_addresses(const char *filename)
         return -1;
     }
     address_count = count;
-    keylog_info("Successfully loaded %d addresses (skipped %d invalid)", count, skip_count);
+    keylog_info("Successfully loaded %d addresses (%d bech32/P2WPKH, skipped %d invalid)",
+                count, bech32_count, skip_count);
 
     return 0;
 }

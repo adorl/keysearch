@@ -276,6 +276,25 @@ int privkey_to_address(const uint8_t *privkey,
     return 0;
 }
 
+/*
+ * Compute P2WPKH (bech32) address from a private key
+ * Uses compressed public key's hash160 as the witness program
+ */
+int privkey_to_bech32_p2wpkh(const uint8_t *privkey, char *bech32_out)
+{
+    uint8_t hash160_compressed[20];
+
+    /* Compute hash160 of compressed public key */
+    if (privkey_to_hash160(privkey, hash160_compressed, NULL) != 0)
+        return -1;
+
+    /* Encode as bech32 address: witness version 0, 20-byte witness program */
+    if (bech32_encode_witness("bc", 0, hash160_compressed, 20, bech32_out) != 0)
+        return -1;
+
+    return 0;
+}
+
 struct ht_slot *ht_slots = NULL;
 uint32_t ht_mask = 0;
 

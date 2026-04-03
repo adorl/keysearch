@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "bech32.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -57,6 +58,14 @@ void pubkey_bytes_to_hash160(const uint8_t *pubkey_bytes, size_t len,
 int privkey_to_address(const uint8_t *privkey,
                        char *compressed_out,
                        char *uncompressed_out);
+
+/*
+ * Compute P2WPKH (bech32) address from a private key
+ * Uses compressed public key's hash160 as the witness program
+ * bech32_out : output buffer, at least 90 bytes
+ * Return value: 0 on success, -1 on failure
+ */
+int privkey_to_bech32_p2wpkh(const uint8_t *privkey, char *bech32_out);
 
 #if defined(__AVX2__) || defined(__AVX512F__)
 /*
